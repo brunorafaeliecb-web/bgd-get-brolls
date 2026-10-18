@@ -2,7 +2,7 @@
 type: reference
 status: current
 created: 2026-09-17
-updated: 2026-09-17
+updated: 2026-09-25
 tags: [get-brolls, fontes, provedores]
 ---
 
@@ -15,9 +15,9 @@ tags: [get-brolls, fontes, provedores]
 Antes de sair buscando, consulte o que já se sabe:
 
 ```sh
-python3 scripts/gb.py rules --project <projeto>
-python3 scripts/gb.py references --project <projeto>
-python3 scripts/gb.py library --search "termo" --project <projeto>
+python3 scripts/gb.py rules --project PROJETO
+python3 scripts/gb.py references --project PROJETO
+python3 scripts/gb.py library --search "termo" --project PROJETO
 ```
 
 A biblioteca pessoal (`~/.getbrolls/library`, desligável com `GB_LIBRARY=off`) lembra que busca rendeu, que fonte falhou e que trecho já serviu. Ela é ponteiro editorial e nada além disso: `rights_not_transferable` vem em toda resposta e nenhuma pista dela aprova nem permite nada. A biblioteca mistura projetos — não cole o texto dela na conversa com um cliente. As pistas anexadas ao `search` (`library_hints[]`) já vêm sem o motivo escrito noutro projeto; o texto completo só aparece quando você pede `library --search` de propósito.
@@ -27,9 +27,9 @@ As regras valem em camadas: `~/.getbrolls/RULES.md` → `GB_RULES_FILE` → `RUL
 Depois de uma decisão útil, guarde-a:
 
 ```sh
-python3 scripts/gb.py learn --from-candidate <ID> --project <projeto>
-python3 scripts/gb.py learn --query "..." --provider <fonte> --outcome hit --project <projeto>
-python3 scripts/gb.py learn --preference "frase da pessoa" --project <projeto>
+python3 scripts/gb.py learn --from-candidate ID --project PROJETO
+python3 scripts/gb.py learn --query "..." --provider FONTE --outcome hit --project PROJETO
+python3 scripts/gb.py learn --preference "frase da pessoa" --project PROJETO
 ```
 
 ## YouTube
@@ -37,14 +37,15 @@ python3 scripts/gb.py learn --preference "frase da pessoa" --project <projeto>
 Sem API key — usa yt-dlp.
 
 ```sh
-python3 scripts/gb.py search --provider youtube --query "entidade ação" --intent literal --project <projeto>
-python3 scripts/gb.py resolve --url <URL> --shot <beat.id> --project <projeto>
+python3 scripts/gb.py search --provider youtube --query "entidade ação" --intent literal --project PROJETO
+python3 scripts/gb.py resolve --url URL --shot BEAT_ID --project PROJETO
 ```
 
 Detalhe operacional na seção [YouTube](../docs/GUIDE.md#provedor--youtube) do guia.
 
-`--shot <beat.id>` também funciona no `search`: ele liga cada candidato ao beat do
-BRIEF.md na hora, sem precisar re-registrar por URL depois. E `--dry-run` lista o que
+`--shot BEAT_ID` também funciona no `search`: ele liga cada candidato ao beat do
+BRIEF.md na hora, sem precisar re-registrar por URL depois — e só aceita as fontes de
+`allowed_sources` daquele beat (fora da lista, a busca é recusada com a lista certa). E `--dry-run` lista o que
 a fonte devolveu **sem gravar nada** no projeto — use-o para sondar uma query antes de
 sujar as contagens do `status` com material que você não vai usar.
 
@@ -63,15 +64,15 @@ Veja [TikTok](../docs/GUIDE.md#provedor--tiktok).
 ## Bancos genéricos (só sob pedido)
 
 ```sh
-python3 scripts/gb.py search --provider pexels --query "..." --project <projeto>
-python3 scripts/gb.py search --provider pixabay --query "..." --project <projeto>
+python3 scripts/gb.py search --provider pexels --query "..." --project PROJETO
+python3 scripts/gb.py search --provider pixabay --query "..." --project PROJETO
 ```
 
 Chaves de Pexels/Pixabay são opcionais e ficam no ambiente ou num `.env` apontado com `--env-file`. Veja [Bancos](../docs/GUIDE.md#bancos--busca-prévia-e-coleta).
 
 ## Domínio público e arquivo
 
-Wikimedia Commons e NASA não pedem chave e costumam ser a rota literal mais rápida para fato histórico, espaço e ciência: `--provider commons` ou `--provider nasa`. Quando você já tem o link do item, `resolve --url` registra direto: `https://images.nasa.gov/details/<id>` no acervo da NASA e `https://commons.wikimedia.org/wiki/File:<nome>` no Commons — vídeo ou imagem estática nos dois. Para um beat de foto, peça imagem à fonte: `search --provider commons --media image` (ou `--provider nasa`); `--media` aceita `image`, `video` e `any` (padrão), e só NASA e Commons publicam os dois tipos — YouTube e os bancos ignoram a flag. Arquivo local entra com `resolve --file --source-url --creator --shot`.
+Wikimedia Commons e NASA não pedem chave e costumam ser a rota literal mais rápida para fato histórico, espaço e ciência: `--provider commons` ou `--provider nasa`. Quando você já tem o link do item, `resolve --url` registra direto: `https://images.nasa.gov/details/<id>` no acervo da NASA e `https://commons.wikimedia.org/wiki/File:<nome>` no Commons — vídeo ou imagem estática nos dois. Para um beat de foto, peça imagem à fonte: `search --provider commons --media image` (ou `--provider nasa`); `--media` aceita `image`, `video` e `any` (padrão), e só NASA e Commons publicam os dois tipos — YouTube e os bancos ignoram a flag. Foto não tem trecho: pule o `inspect` e rode `preview --candidate ID` sem `--start` nem `--end` — a imagem vem para o cache privado, a prévia é o cartaz dela, e o `fetch` depois do `approve` e do `permit` copia exatamente esses bytes. Arquivo local entra com `resolve --file --source-url --creator --shot`.
 
 Panorama completo em [Fontes e transportes](../docs/GUIDE.md#fontes-e-transportes).
 
@@ -84,10 +85,10 @@ Insert isolado não exige roteiro completo. Para roteiro completo, o padrão edi
 Quando `inspect` não devolve janela nenhuma — vídeo sem legenda, sem capítulo e sem tempo escrito na descrição —, varra o vídeo inteiro num contact sheet de baixa resolução:
 
 ```sh
-python3 scripts/gb.py preview --scan --candidate <ID> --project <projeto>
+python3 scripts/gb.py preview --scan --candidate ID --project PROJETO
 ```
 
-O `--scan` não define intervalo: ele só mostra o vídeo todo, um quadro a cada N segundos (N = duração/12), com teto de `GB_SCAN_MAX_SECONDS` (padrão 900 s). **Ele baixa mídia de trabalho** — até esse teto — e por isso pode levar minutos num vídeo longo; rode em segundo plano se o seu shell tiver limite de tempo. A resposta traz `scan.downloaded_seconds`, `scan.start_s`/`scan.end_s` e um `note` dizendo que trecho da fonte entrou na grade — os rótulos de `frame_times_s` são tempo da fonte, mesmo quando a mídia de trabalho começa depois do zero. **Prefira `inspect --query` primeiro:** ele responde de graça, sem baixar nada, e só quando não sobrar pista é que a varredura (que baixa o vídeo inteiro até o teto) compensa. A varredura ignora o intervalo já escolhido no candidato: ela é exploratória e não define nem invalida segmento. Escolha o `--start/--end` olhando o resultado.
+O `--scan` não define intervalo: ele só mostra o vídeo todo, um quadro a cada N segundos (N = duração/12), com teto de `GB_SCAN_MAX_SECONDS` (padrão 900 s). **Ele baixa mídia de trabalho** — até esse teto — e por isso pode levar minutos num vídeo longo; rode em segundo plano se o seu shell tiver limite de tempo. A resposta traz `scan.downloaded_seconds`, `scan.start_s`/`scan.end_s` e um `note` dizendo que trecho da fonte entrou na grade — os rótulos de `frame_times_s` são tempo da fonte, mesmo quando a mídia de trabalho começa depois do zero. **Prefira `inspect --query` primeiro:** ele responde de graça, sem baixar nada (Commons e bancos incluídos: a duração vem dos metadados da fonte; a exceção é vídeo da NASA, que não publica a duração — ali o `inspect` baixa o arquivo uma vez para o cache privado e avisa o tamanho em `warnings`), e só quando não sobrar pista é que a varredura (que baixa o vídeo inteiro até o teto) compensa. A varredura ignora o intervalo já escolhido no candidato: ela é exploratória e não define nem invalida segmento. Escolha o `preview --start` e o `--end` olhando o resultado.
 
 Quando `inspect` não encontra nada que case com a frase, ele ainda devolve janelas com
 `score: 0` e a `source` que as gerou (capítulo, legenda ou espaçamento pelo relógio):
@@ -111,11 +112,11 @@ Quando o beat pede a tela real de um produto, de um painel ou de um site — nã
 vídeo dele —, a rota é capturar a página e registrar o arquivo como candidato:
 
 ```sh
-python3 scripts/gb.py browser-plan --url <URL_PUBLICA> --project <projeto>
+python3 scripts/gb.py browser-plan --url URL_PUBLICA --project PROJETO
 # execute os passos devolvidos (open / resize / snapshot / screenshot) e então:
-python3 scripts/gb.py resolve --file <CAMINHO_DO_PNG> --source-url <URL_PUBLICA> \
-  --asset-type web_screenshot --shot <beat.id> --project <projeto>
-python3 scripts/gb.py preview --reference-only --candidate <ID> --project <projeto>
+python3 scripts/gb.py resolve --file CAMINHO_DO_PNG --source-url URL_PUBLICA \
+  --asset-type web_screenshot --shot BEAT_ID --project PROJETO
+python3 scripts/gb.py preview --reference-only --candidate ID --project PROJETO
 ```
 
 `--source-url` é obrigatório para print: sem ele a origem se perde e `resolve` recusa.
@@ -125,7 +126,7 @@ se a tela que interessa só aparece em outra largura, use a que mostra o que a n
 cita e diga isso na revisão.
 
 `--reference-only` vale também para vídeo cuja fonte não libera o trecho: rode-o
-**sozinho**, sem `--start/--end`, e a skill gera só o cartaz estático (miniatura da
+**sozinho**, sem `preview --start` e `--end`, e a skill gera só o cartaz estático (miniatura da
 fonte ou primeiro quadro), o bastante para a pessoa decidir.
 
 **Aviso de cookies antes de capturar.** Muita página abre com uma faixa de consentimento
@@ -147,6 +148,21 @@ achado com `search --provider youtube`, localizado com `inspect --query` e confi
 `preview`. A rota (1) mostra a tela real dele e é sempre a melhor quando ele pode mandar; a
 rota (2) é material de terceiro e passa pelo `permit` como qualquer outro. O que não vale é
 recriar a interface de memória.
+
+## Fontes de plugin
+
+`providers` marca com `plugin` a fonte que vem de um plugin habilitado, e com `route` a que entrega o arquivo por uma rota do plugin. O fluxo é o mesmo das outras fontes, com uma diferença: rota que consome licença ou cota só baixa no `fetch`. Se o `preview` responder que a fonte só entrega no `fetch`, gere a referência e siga os portões:
+
+```sh
+python3 scripts/gb.py preview --candidate ID --start INICIO --end FIM --reference-only --project PROJETO
+# numa foto, no lugar da linha acima (foto não tem trecho):
+python3 scripts/gb.py preview --candidate ID --reference-only --project PROJETO
+python3 scripts/gb.py approve --candidate ID --by NOME --channel chat --statement "frase exata" --project PROJETO
+python3 scripts/gb.py permit --candidate ID --evidence "condições reais" --project PROJETO
+python3 scripts/gb.py fetch --candidate ID --project PROJETO
+```
+
+A licença que a rota registrar aparece em `rights.evidence` como evidência a mais; o `permit` humano continua obrigatório. Plugins também trazem rotinas próprias: `x --list` mostra quais, e `x PLUGIN COMANDO --project PROJETO` roda uma — elas só leem o projeto. Instalar, habilitar ou atualizar plugin é decisão da pessoa: mostre o preview de `plugins --action install`, `enable` ou `update` e só rode com `--yes` depois do ok dela — `install`/`update` (e o `enable` de um plugin `suspended`, cuja prévia mostra o que mudou) também pedem `--expect SHA256`, igual ao valor que a prévia mostrou.
 
 ## Quando não há fonte
 

@@ -2,11 +2,11 @@
 type: documentation
 status: current
 created: 2026-09-15
-updated: 2026-09-17
+updated: 2026-09-26
 tags: [get-brolls, guide, installation, providers, storyboard]
 ---
 
-# Guia completo — Get B-rolls
+# Guia completo — getbrolls
 
 Este é o manual operacional único do **GET B-ROLLS — ENGENHEIRO DE VÍDEO**: instalação, compatibilidade, fluxo editorial, provedores, navegador, Instagram, tipos de asset e Storyboard.
 
@@ -17,6 +17,7 @@ Este é o manual operacional único do **GET B-ROLLS — ENGENHEIRO DE VÍDEO**:
 - [Fluxo editorial](#fluxo-editorial)
 - [Estado do projeto e progresso](#estado-do-projeto-e-progresso)
 - [Fontes e transportes](#fontes-e-transportes)
+- [Plugins](#plugins)
 - [Tipos de assets](#tipos-de-assets-e-formatos)
 - [Captura pelo navegador](#captura-de-notícias-e-páginas-pelo-navegador)
 - [Instagram](#instagram--navegadorplaywright-dois-streams-e-mp4)
@@ -25,7 +26,7 @@ Este é o manual operacional único do **GET B-ROLLS — ENGENHEIRO DE VÍDEO**:
 
 ## Instalação
 
-Instale a stack inteira antes de rodar o instalador: Python 3.11+, FFmpeg/ffprobe com libfreetype (`drawtext`), Node 22+ com npm/npx, curl e Git. O README traz o comando por sistema; `doctor` confirma com `summary.missing` vazio e `contact_sheet.labels: true`.
+Instale a stack inteira antes de rodar o instalador: Python 3.11+, FFmpeg/ffprobe com libfreetype (`drawtext`), Node 22+ com npm/npx, curl e Git. O README traz o comando por sistema; `doctor` confirma com `ready: true` (só depende de `summary.missing` vazio) e, com a stack inteira, `contact_sheet.labels: true` — opcional: sem libfreetype ou fonte TrueType o `ready` continua `true`, só o contact sheet sai sem número e timecode.
 
 ### Dependências por capacidade
 
@@ -39,6 +40,20 @@ Instale a stack inteira antes de rodar o instalador: Python 3.11+, FFmpeg/ffprob
 | curl | Baixar os dois streams Instagram capturados |
 | Bash e awk | Somente os helpers opcionais em `scripts/getbrolls/tools/youtube/`; a CLI principal não depende deles |
 | FFmpeg com `drawtext` (libfreetype) + fonte DejaVu, Liberation ou Arial | Índice por célula e banner (título, ID, janela) no contact sheet da CLI e dos helpers Bash; use `GB_FONT_FILE` para indicar outra fonte TrueType. Sem `drawtext`, o sheet sai sem rótulos e o Storyboard imprime a legenda de tempos; `doctor` mostra o estado em `contact_sheet` |
+
+### Instalar como pacote
+
+Além do checkout e do plugin, o getbrolls instala como comando: `uv tool install git+https://github.com/engenheirodevideo/get-brolls@v2.6.0` (ou `pipx install git+https://github.com/engenheirodevideo/get-brolls@v2.6.0`), seguido de `getbrolls setup` e `getbrolls doctor`. `python -m getbrolls` também funciona. Os exemplos deste guia usam o comando `getbrolls …`. Num clone, sem instalar o pacote, `python3 scripts/gb.py …` roda os mesmos comandos (no Windows, `python scripts/gb.py …`; de outra pasta, use o caminho absoluto de `scripts/gb.py`). No plugin do Claude Code nada muda: o agente roda a CLI pela raiz do plugin. No pacote não existe `.env` de checkout: use `$GB_HOME/.env`. O runtime (yt-dlp e Playwright) fica em `$GB_RUNTIME_DIR` ou, sem ela, em `$GB_HOME/runtime/<versão das dependências>/`.
+
+`getbrolls setup` instala esse runtime, sem perguntar nada:
+
+- **yt-dlp:** uma venv criada com o Python que roda o getbrolls, com o `requirements.txt` fixado, em `.venv/`.
+- **Playwright CLI:** `npm ci --ignore-scripts` a partir do `package.json`/`package-lock.json` fixados, em `.tools/`; precisa de Node 22+ e npm no `PATH` (sem eles, essa parte fica de fora, com a dica de instalação).
+- **Onde:** cada parte numa pasta própria, `$GB_HOME/runtime/<versão>/`, com a versão calculada dos arquivos de dependência dela; com `GB_RUNTIME_DIR`, as duas vão para essa pasta. `getbrolls setup --where` mostra os caminhos e qual está em uso, sem instalar nada.
+- **Sistema:** FFmpeg, ffprobe, curl e Node só são conferidos, com o comando do sistema operacional (`brew install ffmpeg`, `sudo apt install ffmpeg`, `winget install Gyan.FFmpeg`).
+- **Idempotente:** rodar de novo não refaz o que está pronto; uma instalação interrompida é refeita na próxima. Nunca mexe no projeto nem na pasta da instalação.
+- **Depois de atualizar o getbrolls, rode `getbrolls setup` de novo:** só a parte cuja versão das dependências mudou é instalada. `getbrolls setup --upgrade ytdlp` atualiza o yt-dlp além da versão fixada.
+- **Saída:** progresso no stderr, JSON no stdout; código `0` pronto, `4` se ainda falta algo. `getbrolls setup --check` só confere. No Windows, os comandos sugeridos pela ferramenta não prometem funcionar com caminho que contenha `$`, `%` ou `"` ao copiar e colar no PowerShell ou no cmd.
 
 Git é opcional. API key YouTube não é necessária. Pexels/Pixabay usam apenas suas próprias chaves opcionais. `curl-cffi` é extra opcional do yt-dlp, não requisito universal.
 
@@ -57,11 +72,11 @@ bash scripts/install.sh --check
 bash scripts/install.sh
 ```
 
-O instalador cria `.venv` e instala `yt-dlp[default]`/EJS do PyPI via `requirements.txt`; instala também `@playwright/cli@0.1.21` do npm em `.tools`. Valida Python 3.11+, Node 22+, npm/npx e os executáveis base. Essas pastas de dependências ficam somente na máquina de quem instala e não fazem parte do repositório. Não instala executáveis do sistema nem altera a instalação do agente. A CLI procura primeiro o yt-dlp da `.venv`, depois o `PATH`. Ativar a venv é opcional:
+O instalador confere Python 3.11+, Node 22+, npm/npx e os executáveis base e delega ao `setup` do clone (`python3 scripts/gb.py setup`, que também pode ser rodado direto): `yt-dlp[default]`/EJS do PyPI via `requirements.txt` e `@playwright/cli@0.1.21` do npm vão para `$GB_HOME/runtime/<versão>/` (ou `GB_RUNTIME_DIR`), compartilhados entre instalações e versões do plugin, fora do repositório. No fim ele roda o `doctor` e sai com o código dele (`4` = faltam itens, listados). Não instala executáveis do sistema nem altera a instalação do agente. Uma `.venv`/`.tools` antiga na pasta da skill continua valendo enquanto o runtime compartilhado não existe. A CLI procura o yt-dlp do runtime em uso, depois o `PATH`; o `setup --where` do clone mostra qual é (o `getbrolls` do `PATH`, se houver, pode ser outra instalação):
 
 ```sh
-source .venv/bin/activate
-python scripts/gb.py doctor
+python3 scripts/gb.py setup --where
+python3 scripts/gb.py doctor
 ```
 
 ### Windows
@@ -74,7 +89,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install.ps1
 python scripts/gb.py doctor
 ```
 
-O instalador usa `.venv\Scripts\python.exe` e o launcher `.cmd` do Playwright; não exige Git Bash nem WSL. Se a política local já permite scripts, também é possível executar `& .\scripts\install.ps1`. Os helpers `.sh` de YouTube são opcionais; no Windows, use `search`, `preview`, `fetch` e `verify` pela CLI principal.
+O instalador delega ao `python scripts/gb.py setup`, com o runtime em `$GB_HOME\runtime` (layout `.venv\Scripts`), e o launcher `.cmd` do Playwright; não exige Git Bash nem WSL. Se a política local já permite scripts, também é possível executar `& .\scripts\install.ps1`. Os helpers `.sh` de YouTube são opcionais; no Windows, use `search`, `preview`, `fetch` e `verify` pela CLI principal.
 
 Linux continua compatível como plataforma secundária. Em Ubuntu/Debian, instale `python3`, `python3-venv`, `ffmpeg` e `curl`, além de Node 22+, e use `scripts/install.sh` como no macOS.
 
@@ -116,32 +131,51 @@ Referências de instalação: [yt-dlp/EJS](https://github.com/yt-dlp/yt-dlp/wiki
 
 ### Configuração
 
-Copiar `.env.example` para `.env` é opcional (`cp .env.example .env` no macOS; `Copy-Item .env.example .env` no PowerShell). O mesmo arquivo existe comentado em português, `.env.example.pt-BR`: as variáveis e os valores são idênticos, só os comentários mudam de língua. O `.env` pertence à raiz da skill, independentemente da pasta atual. Ambiente do processo prevalece. `--env-file` é opção da raiz do parser e vem antes do subcomando: `python3 scripts/gb.py --env-file CAMINHO <subcomando> …`. Nunca distribua `.env`, cookies, configs CDN ou perfis do navegador.
+Copiar `.env.example` para `.env` é opcional (`cp .env.example .env` no macOS; `Copy-Item .env.example .env` no PowerShell). O mesmo arquivo existe comentado em português, `.env.example.pt-BR`: as variáveis e os valores são idênticos, só os comentários mudam de língua. O `.env` que vale é, do mais forte ao mais fraco: `--env-file`, `GB_ENV_FILE` (só no ambiente do processo), o `.env` da raiz da skill (checkout ou plugin, independentemente da pasta atual) e `$GB_HOME/.env`. Só um é lido: havendo dois, vale o de cima e todo comando avisa `ENV_FILE_SHADOWED`; o `doctor` mostra o escolhido em `install.env_file`. `GB_HOME` dentro de `$GB_HOME/.env` é recusado e, em outro `.env`, sai com o aviso `DEPRECATED` (a leitura some na 2.7). Ambiente do processo prevalece. Além das variáveis do core, o `.env` aceita as de `permissions.env` de cada plugin instalado que ficam no espaço de nomes dele — o id em maiúsculas seguido de `_` (ex.: `BANCO_HTTP_TOKEN` do `banco_http`); qualquer outro nome é recusado. Essas variáveis de plugin chegam só ao plugin, por `api.env`: nunca vão para o ambiente do processo nem para ffmpeg, yt-dlp, git ou qualquer outro subprocesso. `--env-file` é opção da raiz do parser e vem antes do subcomando: `getbrolls --env-file CAMINHO <subcomando> …`. Nunca distribua `.env`, cookies, configs CDN ou perfis do navegador.
 
 #### Caminhos explícitos de ferramentas
 
-Quatro variáveis opcionais fixam onde cada ferramenta está, úteis quando há mais de uma instalação na máquina, quando o `PATH` do agente difere do seu ou quando a venv fica fora da pasta da skill. Valem pelo ambiente do processo, pelo `.env` da skill ou por `python3 scripts/gb.py --env-file CAMINHO <subcomando> …`, como as demais `GB_*`.
+Quatro variáveis opcionais fixam onde cada ferramenta está, úteis quando há mais de uma instalação na máquina, quando o `PATH` do agente difere do seu ou quando a venv fica fora da pasta da skill. Valem pelo ambiente do processo, pelo `.env` da skill ou por `getbrolls --env-file CAMINHO <subcomando> …`, como as demais `GB_*`.
 
 | Variável | Fixa | Descoberta padrão quando ausente |
 |---|---|---|
-| `GB_YTDLP_PATH` | Executável do yt-dlp | `.venv/Scripts/yt-dlp.exe`, `.venv/Scripts/yt-dlp`, `.venv/bin/yt-dlp` e depois o `PATH` |
-| `GB_VENV_PATH` | Pasta `.venv` usada para localizar o yt-dlp | `.venv/` na raiz da skill |
+| `GB_YTDLP_PATH` | Executável do yt-dlp | `.venv/Scripts/yt-dlp.exe`, `.venv/Scripts/yt-dlp`, `.venv/bin/yt-dlp` da venv em uso e depois o `PATH` |
+| `GB_VENV_PATH` | Pasta `.venv` usada para localizar o yt-dlp | a do runtime (`setup --where venv`) |
 | `GB_FFMPEG_PATH` | Executável do FFmpeg | `ffmpeg` no `PATH` |
 | `GB_FFPROBE_PATH` | Executável do ffprobe | `ffprobe` no `PATH` |
 
 Precedência: a variável explícita vence a descoberta. Ausente ou vazia, o comportamento é exatamente o anterior. O valor é resolvido para caminho absoluto antes de qualquer validação, então um pin relativo não muda de significado conforme a pasta atual. Definida e apontando para um caminho inexistente, para algo que não é arquivo executável, sem permissão de execução ou — no caso de `GB_VENV_PATH` — que não seja diretório, o comando falha nomeando a variável e o caminho, em vez de voltar em silêncio à descoberta. `GB_VENV_PATH` apontando para uma venv **sem** yt-dlp também falha nomeando a variável, a pasta e os layouts procurados: o pin é uma promessa, não uma sugestão, e não há queda silenciosa para o `PATH`. `doctor` lista os pins ativos em `tool_paths`, uma linha por variável, mostra `{}` quando nenhum está definido e publica em `resolved` o executável absoluto realmente usado por ferramenta. Um pin inválido não derruba o `doctor`: ele aparece em `summary.missing` com a mensagem do erro, para que o diagnóstico continue legível. Não existe variável para o interpretador Python: a skill não reinvoca o Python em nenhum ponto.
 
 ```sh
-GB_FFMPEG_PATH=/opt/homebrew/bin/ffmpeg python3 scripts/gb.py doctor
+GB_FFMPEG_PATH=/opt/homebrew/bin/ffmpeg getbrolls doctor
 ```
 
 #### Brief e regras fora da pasta do projeto
 
 `GB_BRIEF_FILE` e `GB_RULES_FILE` podem apontar para **qualquer lugar** da máquina — fora do projeto e fora da pasta da skill: um cofre de notas, um repositório de cliente, uma pasta sincronizada. Caminho relativo é resolvido a partir da pasta atual, e `~` é expandido. Como qualquer `GB_*`, valem pelo ambiente do processo, pelo `.env` da skill ou por `--env-file`.
 
-`init-brief` escreve exatamente no arquivo que o `brief` vai ler, `GB_BRIEF_FILE` incluído, e **cria as pastas-mãe** que faltarem: `GB_BRIEF_FILE=~/clientes/acme/briefs/reel-01.md python3 scripts/gb.py init-brief --project .` funciona mesmo que `~/clientes/acme/briefs/` ainda não exista.
+`init-brief` escreve exatamente no arquivo que o `brief` vai ler, `GB_BRIEF_FILE` incluído, e **cria as pastas-mãe** que faltarem: `GB_BRIEF_FILE=~/clientes/acme/briefs/reel-01.md getbrolls init-brief --project .` funciona mesmo que `~/clientes/acme/briefs/` ainda não exista.
 
 `GB_RULES_FILE` é outra coisa: não é o RULES.md do projeto, é uma **camada intermediária** entre o RULES.md global (`~/.getbrolls/RULES.md`) e o do projeto, e vem de fora do projeto — por isso os campos de responsabilidade (quem assina, a declaração) são descartados dela, com aviso. Ela precisa existir: apontando para um arquivo inexistente, o comando falha nomeando a variável. `init-rules` sempre grava o `RULES.md` da pasta do projeto (criando as pastas-mãe que faltarem), nunca o arquivo de `GB_RULES_FILE` — para preparar essa camada, copie `docs/RULES.md` para lá à mão e edite o bloco ```json.
+
+### Perfil do workspace (`getbrolls.toml`)
+
+Em vez de um script que exporta `GB_HOME`, `GB_CACHE_DIR`, `GB_VENV_PATH`, `GB_YTDLP_PATH`, `GB_FFMPEG_PATH`, `GB_FFPROBE_PATH` e `GB_PLUGINS`, um `getbrolls.toml` na raiz do workspace fixa os mesmos valores para quem trabalha ali:
+
+```toml
+requires = "==2.6.0"
+home = ".getbrolls"
+cache_dir = ".cache/getbrolls"
+plugins = []
+
+[tools]
+venv = "/caminho/do/workspace/tools/beta/.venv"
+ytdlp = "/caminho/do/workspace/tools/beta/.venv/bin/yt-dlp"
+ffmpeg = "/usr/local/bin/ffmpeg"
+ffprobe = "/usr/local/bin/ffprobe"
+```
+
+Como migrar: escreva o arquivo, rode `getbrolls profile --action trust` (mostra o que ele fixaria e o sha256), confira e rode `getbrolls profile --action trust --yes --expect <sha256>`; depois compare `getbrolls profile --action show` com o `doctor` do script antigo. A precedência é flag > ambiente (e `.env`) > perfil > padrão, então um `GB_*` exportado ainda ganha do arquivo. O perfil não habilita plugin nem aceita caminho relativo em `[tools]`. Num repositório compartilhado, prefira um `home` absoluto fora dele (o `.env` e o `plugins.json` de lá não entram no sha do perfil; com o `home` dentro da pasta do toml, o `profile --action trust` avisa). Referência completa em [MANUAL.md](MANUAL.md#-perfil-do-workspace-getbrollstoml).
 
 ### Codex e Claude Code
 
@@ -163,11 +197,11 @@ Defina `GB_SKILL_DIR` e `GB_PROJECT` com os caminhos reais. A trava de projeto u
 
 ### Verificação e atualização
 
-Após instalar, confirme `yt-dlp` e `playwright-cli` em `doctor`. Para a CLI Playwright local, execute `bash scripts/playwright.sh --version` no macOS ou `& .\scripts\playwright.ps1 --version` no Windows. Um status positivo indica disponibilidade, não que todas as URLs serão acessíveis.
+Após instalar, confirme `yt-dlp` e `playwright-cli` em `doctor`. Para a CLI Playwright local, execute `bash scripts/playwright.sh --version` no macOS ou `& .\scripts\playwright.ps1 --version` no Windows; os dois (e os helpers de YouTube) acham o runtime por `setup --where tools` (ou `venv`). Um status positivo indica disponibilidade, não que todas as URLs serão acessíveis.
 
-O conjunto de referência é yt-dlp 2026.08.19, EJS 0.8.0 e Playwright CLI 0.1.21. A partir da 2.3.5, `requirements.txt` fixa também as dependências Python transitivas nas versões instaladas pela CI macOS/Windows da 2.3.4. `package.json` e `package-lock.json` registram o conjunto npm; o instalador copia esses manifestos para `.tools/` e executa `npm ci --ignore-scripts`. Nenhuma biblioteca é incluída no repositório. Os executáveis Python, Node, FFmpeg e curl continuam sendo instalados pelo usuário.
+O conjunto de referência é yt-dlp 2026.08.19, EJS 0.8.0 e Playwright CLI 0.1.21. A partir da 2.3.5, `requirements.txt` fixa também as dependências Python transitivas nas versões instaladas pela CI macOS/Windows da 2.3.4. `package.json` e `package-lock.json` registram o conjunto npm; o `setup` copia esses manifestos para a `.tools/` do runtime e executa `npm ci --ignore-scripts`. Nenhuma biblioteca é incluída no repositório. Os executáveis Python, Node, FFmpeg e curl continuam sendo instalados pelo usuário.
 
-Atualizações de dependências devem entrar por PR, com instalação completa e testes; o Dependabot está configurado para propor essas mudanças semanalmente. Preserve configurações privadas antes de atualizar a skill e repita um ensaio da rota utilizada se as dependências mudarem. Se você personalizou `.tools/node_modules`, `npm ci` substituirá essa árvore pela versão registrada no lockfile; mantenha ferramentas próprias fora da pasta gerenciada da skill.
+Atualizações de dependências devem entrar por PR, com instalação completa e testes; o Dependabot está configurado para propor essas mudanças semanalmente. Preserve configurações privadas antes de atualizar a skill e repita um ensaio da rota utilizada se as dependências mudarem. Se você personalizou a `.tools/node_modules` do runtime, `npm ci` substituirá essa árvore pela versão registrada no lockfile; mantenha ferramentas próprias fora da pasta gerenciada da skill.
 
 Se `--check` falhar, instale o executável/versão apontado. Se a extração falhar, confirme primeiro que a URL abre no navegador autorizado; confira instalação, sessão e disponibilidade do post. Não peça chave YouTube. Para URL CDN Instagram expirada, recapture os dois canais e siga o guia de recuperação. Os testes reais documentados estão em [Qualidade e evidências](QUALITY.md).
 
@@ -198,12 +232,12 @@ A partir da 2.3.6, o repositório também é um marketplace de plugin do Claude 
 
 ```text
 /plugin marketplace add engenheirodevideo/get-brolls
-/plugin install get-brolls@engenheirodevideo
+/plugin install getbrolls@engenheirodevideo
 ```
 
-Na primeira sessão, execute `/get-brolls-setup`: o comando em `commands/get-brolls-setup.md` roda `scripts/install.sh --check`, o instalador completo do sistema e o `doctor` pela raiz do plugin, e devolve o veredito em uma linha. A skill é acionada pelo contexto do pedido; a forma explícita é `/get-brolls:get-brolls`.
+Na primeira sessão, execute `/getbrolls:get-brolls-setup`: o comando em `commands/get-brolls-setup.md` roda `setup --check`, `setup` e `doctor` pela raiz do plugin, e devolve o veredito em uma linha. A skill é acionada pelo contexto do pedido; a forma explícita é `/getbrolls:get-brolls`.
 
-A skill do plugin fica em `skills/get-brolls/SKILL.md` e referencia os arquivos por `${CLAUDE_PLUGIN_ROOT}`, a raiz do plugin instalado — um diretório de cache versionado (`~/.claude/plugins/cache/engenheirodevideo/get-brolls/<versão>/`). Execute o instalador e o `doctor` pelo caminho absoluto dessa pasta, de qualquer cwd. As dependências ficam em `.venv/` e `.tools/` dentro da pasta do plugin: repita o instalador após cada `/plugin update` ou reinstalação, e prefira variáveis de ambiente ou um `.env` fora da pasta gerenciada para as chaves opcionais, apontado na raiz do parser: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/gb.py" --env-file CAMINHO <subcomando> …`. O fluxo clone-como-skill continua suportado sem mudanças para Codex e instalações manuais, com o SKILL.md da raiz como fonte canônica.
+A skill do plugin fica em `skills/get-brolls/SKILL.md` e referencia os arquivos por `${CLAUDE_PLUGIN_ROOT}`, a raiz do plugin instalado — um diretório de cache versionado (`~/.claude/plugins/cache/engenheirodevideo/getbrolls/<versão>/`). Execute o instalador e o `doctor` pelo caminho absoluto dessa pasta, de qualquer cwd. As dependências ficam em `$GB_HOME/runtime`, fora da pasta do plugin, e sobrevivem ao `/plugin update`: rode o `setup` de novo só se o `doctor` apontar yt-dlp ou Playwright ausentes (a versão das dependências mudou). Prefira variáveis de ambiente ou um `.env` fora da pasta gerenciada para as chaves opcionais, apontado na raiz do parser: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/gb.py" --env-file CAMINHO <subcomando> …`. O fluxo clone-como-skill continua suportado sem mudanças para Codex e instalações manuais, com o SKILL.md da raiz como fonte canônica.
 
 #### Permissões (opcional)
 
@@ -240,11 +274,11 @@ Coleta B-roll dirigida pelo contrato de edição. Confirma no navegador antes de
 >
 > **Meta editorial: 8+ clipes literais por roteiro quando o conteúdo comportar.** Se os beats óbvios não fecham 8, amplie: mais empresas/pessoas citadas, cobertura de telejornal do mesmo fato, produto nomeado, pregão/mercado real ou segmentos extras da mesma fonte forte. Prefira 1080p quando disponível e confirme com ffprobe; não faça upscale para simular qualidade.
 1. **plan** — dos beats de `BRIEF.md` (substituiu `clips[].bloco_roteiro` na 2.4) ou da fala do roteiro, derive N beats visuais (query em inglês). Prefira **entidade literal nomeada** (pessoa/produto/logo do que a fala cita: Sam Altman, OpenAI, SoftBank, Codex…) — é onde o YouTube dá material real e limpo. Beats abstratos (back-office, "dev", "automação") caem em tutorial/vlog/stock/desenho; use no máximo um demo de produto real (ex.: dashboard ERP) ou deixe no rosto do talento.
-2. **search** — candidato registrado no projeto, sem baixar: `python3 scripts/gb.py search --project <PROJETO> --query "<query>" --intent literal`. Acrescente `--shot <beat.id>` para já ligar cada candidato ao beat do `BRIEF.md` (mesma semântica do `resolve --shot`: o beat vira sufixo do id). Para sondar uma query sem sujar as contagens do projeto, use `--dry-run`: a fonte responde, a lista sai, e nada é gravado.
-3. **confirm** — preview por **contact sheet** (não um frame solto): `python3 scripts/gb.py preview --project <PROJETO> --candidate <ID> --start <INICIO> --end <FIM> --narration "<fala>" --reason "<motivo>"` amostra quadros igualmente espaçados numa grade numerada para ler movimento, sequência e overlays antes de baixar. **Gate: o usuário ou revisor aprova antes do corte final** (`review`/`import-review` ou `approve --channel chat`).
-4. **download** — segmento trimado 1080p, após aprovação e `permit`: `python3 scripts/gb.py fetch --project <PROJETO> --candidate <ID>`.
-5. **verify** — `python3 scripts/gb.py verify --project <PROJETO>` (tabela ffprobe + tamanho).
-6. **deliver** — `python3 scripts/gb.py deliver --project <PROJETO>` organiza o que já foi coletado em `entrega/`, uma pasta por beat (`NN-<beat.id>-<slug do alvo>`) com o `.mp4`, o contact sheet e um `ORIGEM.md` (fonte, autor, intervalo, direitos, sha256), mais um `entrega/README.md` com a tabela de tudo. A pasta é derivada e regenerável: o `verify` a refaz sozinho ao terminar, `brolls/` continua sendo a verdade e nada lá é apagado ou renomeado. Os arquivos entram por **hardlink** (symlink e depois cópia, quando o sistema não deixar), então não ocupam disco duas vezes — mas hardlink é o *mesmo* arquivo com outro nome: **editar em `entrega/` é editar o original**. Por isso a mídia entregue nasce somente-leitura, e o `README.md` e cada `ORIGEM.md` dizem isso. Para receber cópias independentes e editáveis, rode com `GB_DELIVERY_COPY=1`. Rodar de novo é seguro: nada muda, links órfãos somem, e o que você criou dentro de `entrega/` é preservado e listado em `kept`. Um arquivo entregue que você editou não é sobrescrito — o comando termina o resto e falha no fim nomeando todos os conflitos. `--dry-run` mostra o plano sem escrever nada (nem na pasta, nem no manifesto) e reporta o método como `planned`.
+2. **search** — candidato registrado no projeto, sem baixar: `getbrolls search --project <PROJETO> --query "<query>" --intent literal`. Acrescente `--shot <beat.id>` para já ligar cada candidato ao beat do `BRIEF.md` (mesma semântica do `resolve --shot`: o beat vira sufixo do id). Quando o beat existe num `BRIEF.md` válido, a busca fica nas fontes de `allowed_sources` dele: `--provider` fora da lista é recusado com a lista permitida, e `auto` só consulta as fontes do beat. Para sondar uma query sem sujar as contagens do projeto, use `--dry-run`: a fonte responde, a lista sai, e nada é gravado.
+3. **confirm** — preview por **contact sheet** (não um frame solto): `getbrolls preview --project <PROJETO> --candidate <ID> --start <INICIO> --end <FIM> --narration "<fala>" --reason "<motivo>"` amostra quadros igualmente espaçados numa grade numerada para ler movimento, sequência e overlays antes de baixar. **Gate: o usuário ou revisor aprova antes do corte final** (`review`/`import-review` ou `approve --channel chat`).
+4. **download** — segmento trimado 1080p, após aprovação e `permit`: `getbrolls fetch --project <PROJETO> --candidate <ID>`.
+5. **verify** — `getbrolls verify --project <PROJETO>` (tabela ffprobe + tamanho).
+6. **deliver** — `getbrolls deliver --project <PROJETO>` organiza o que já foi coletado em `entrega/`, uma pasta por beat (`NN-<beat.id>-<slug do alvo>`) com o `.mp4`, o contact sheet e um `ORIGEM.md` (fonte, autor, intervalo, direitos, sha256), mais um `entrega/README.md` com a tabela de tudo. A pasta é derivada e regenerável: o `verify` a refaz sozinho ao terminar, `brolls/` continua sendo a verdade e nada lá é apagado ou renomeado. Os arquivos entram por **hardlink** (symlink e depois cópia, quando o sistema não deixar), então não ocupam disco duas vezes — mas hardlink é o *mesmo* arquivo com outro nome: **editar em `entrega/` é editar o original**. Por isso a mídia entregue nasce somente-leitura, e o `README.md` e cada `ORIGEM.md` dizem isso. Para receber cópias independentes e editáveis, rode com `GB_DELIVERY_COPY=1`. Rodar de novo é seguro: nada muda, links órfãos somem, e o que você criou dentro de `entrega/` é preservado e listado em `kept`. Um arquivo entregue que você editou não é sobrescrito — o comando termina o resto e falha no fim nomeando todos os conflitos; o `ORIGEM.md`, que é derivado, é refeito a cada rodada, o contact sheet que o `deliver` deixou dá lugar à prévia nova (um sheet que você editou também fica e vira conflito), e o link (ou a cópia intocada) de uma revisão anterior do clipe dá lugar à revisão nova. `--dry-run` mostra o plano sem escrever nada (nem na pasta, nem no manifesto) e reporta o método como `planned`.
 
 ### Imagens de notícia (manchete/dado)
 - **Rota completa do print de tela** (capturar, registrar, revisar) em [`references/providers.md`](../references/providers.md).
@@ -253,28 +287,28 @@ Coleta B-roll dirigida pelo contrato de edição. Confirma no navegador antes de
 - **Estático** = entregar **lista de links + o que grifar** num `BROLL-MAP.md`, pro humano printar. Alguns sites (PYMNTS) caem em Cloudflare; Benzinga abre normal.
 
 ### Engine
-Motor: `yt-dlp` + FFmpeg pela CLI (`scripts/gb.py`). Capturas de página usam a integração de navegador autorizada ou o launcher Playwright do sistema. Os helpers `.sh` que existiam antes da CLI unificada continuam disponíveis só como utilitários avulsos — ver [Apêndice — utilitários legados](#apêndice--utilitários-legados).
+Motor: `yt-dlp` + FFmpeg pela CLI (`getbrolls`). Capturas de página usam a integração de navegador autorizada ou o launcher Playwright do sistema. Os helpers `.sh` que existiam antes da CLI unificada continuam disponíveis só como utilitários avulsos — ver [Apêndice — utilitários legados](#apêndice--utilitários-legados).
 
 ### Saída
 `<PROJETO>/brolls/NN_entity_context.mp4`. Registrar no ledger (`step: get-brolls`, outputs = arquivos baixados).
 
 ### Medição editorial deste fluxo
 
-Se a pergunta é "esse fluxo está achando fonte literal de verdade?", a resposta não vem da suíte de testes: vem dos **testes cegos** em [eval/README.md](../eval/README.md). Um agente executor recebe só o roteiro, roda `search` → `preview` → `review` e para na revisão humana; outro agente (ou o humano) pontua cada beat pela rubrica — alcance literal, literalidade do asset, qualidade da prévia e disciplina (nada de stock sem pedido, nada aprovado sozinho). Os relatórios ficam em `eval/runs/`, e o comando `/get-brolls-eval` roda um caso do corpus de ponta a ponta.
+Se a pergunta é "esse fluxo está achando fonte literal de verdade?", a resposta não vem da suíte de testes: vem dos **testes cegos** em [eval/README.md](../eval/README.md). Um agente executor recebe só o roteiro, roda `search` → `preview` → `review` e para na revisão humana; outro agente (ou o humano) pontua cada beat pela rubrica — alcance literal, literalidade do asset, qualidade da prévia e disciplina (nada de stock sem pedido, nada aprovado sozinho). Os relatórios ficam em `eval/runs/`, e o comando `/getbrolls:get-brolls-eval` roda um caso do corpus de ponta a ponta.
 
 ## Estado do projeto e progresso
 
 `status` responde "onde estamos?" para um projeto, sem alterar nada. Ele lê o que já está gravado — manifesto, candidatos, decisões e journal — e devolve contagem e lista de IDs por etapa: candidatos encontrados, prévias geradas, decisões pendentes/aprovadas/rejeitadas, itens com `permit` registrado, itens entregues e itens verificados.
 
 ```sh
-python3 scripts/gb.py status --project /caminho/meu-video
+getbrolls status --project /caminho/meu-video
 ```
 
 O JSON segue a convenção dos demais comandos e traz, como no `doctor`, um objeto `summary` na frente: `line` (uma frase com as contagens), `stages` (rótulo, contagem e IDs de cada etapa) e `next` (o próximo passo real do fluxo). Abaixo dele vêm `counts`, `stages`, `items` (um resumo por candidato: estado, aprovação, direitos, prévia e arquivo final), `references`, `review_page` e `journal` (eventos registrados, último evento e se houve recuperação de gravação).
 
 `status` é somente leitura: não grava manifesto, candidatos, prévias, clipes nem eventos, e não cria a árvore `brolls/` — num projeto inexistente ele responde "Projeto não encontrado em …; nenhum arquivo foi criado." sem escrever nada. O único arquivo tocado num projeto existente é o `brolls/diagnostics.jsonl` da auditoria. Também **não pega a trava exclusiva do projeto**: pode ser executado enquanto um `fetch` longo está em andamento, sem esperar nem falhar. Uma regressão offline compara o conteúdo e o mtime de todos os arquivos do projeto antes e depois da execução.
 
-Mensagens de erro de `yt-dlp`, `curl`, `ffmpeg`/`ffprobe` e HTTP agora trazem o código de saída/HTTP e as últimas linhas do stderr/corpo da resposta (sempre redigidas: sem URL assinada, chave ou token) em vez de uma frase genérica — use esse trecho para diagnosticar antes de repetir o comando. Um bug interno (não um problema de dados/rede) sai com `error_code: "INTERNAL_ERROR"` e a mensagem pede para reportar `brolls/diagnostics.jsonl`, onde ficam `type`, `repr` e o traceback (também redigido) daquela execução; qualquer exceção não tratada na CLI também vira esse mesmo envelope JSON, nunca um traceback cru no terminal.
+Mensagens de erro de `yt-dlp`, `curl`, `ffmpeg`/`ffprobe` e HTTP agora trazem o código de saída/HTTP e as últimas linhas do stderr/corpo da resposta (sempre redigidas: sem URL assinada, chave ou token) em vez de uma frase genérica — use esse trecho para diagnosticar antes de repetir o comando. Um bug interno (não um problema de dados/rede) sai com `error_code: "INTERNAL_ERROR"` e a mensagem pede para reportar `brolls/diagnostics.jsonl`, onde ficam `type`, `repr` e o traceback (também redigido) daquela execução — sem projeto, em `$GB_HOME/diagnostics.jsonl`. Nenhum erro, de nenhum comando, mostra traceback ou `repr` no terminal: qualquer exceção não tratada na CLI também vira esse mesmo envelope JSON, com código de saída 3. Códigos de saída, `error_code` e avisos, um por um: [CLI_CONTRACT.md](CLI_CONTRACT.md).
 
 Como só lê, `status` nunca completa uma gravação interrompida: quando existe `.pending-transaction.json`, ele reporta `journal.recovered_write: "pending"`, avisa na linha do resumo e deixa a pendência para o próximo comando de escrita. Pelo mesmo motivo ele não aplica `sync_formats`: se as regras editoriais passaram a mirar outro formato, o relatório traz `format_pending` (total e por item) e `next` avisa quantas aprovações o próximo comando invalidará. `RULES.md` ilegível vira `rules_error` no lugar de uma falha, e `events.jsonl` ou `references.json` corrompidos degradam para contagem com `error`, preservando os arquivos.
 
@@ -324,31 +358,31 @@ Desde a 2.4.0, `resolve --url` de um post do TikTok faz **um** pedido de metadad
 
 PEXELS_API_KEY no ambiente. API de vídeos, poster e variante MP4. Reconsulta ID no fetch. Verifique licença e requisitos da API. https://www.pexels.com/api/documentation/
 
-Diagnóstico: `python3 scripts/gb.py providers`. Falha de credencial não ativa scraping ou outra conta.
+Diagnóstico: `getbrolls providers`. Falha de credencial não ativa scraping ou outra conta.
 
 ## Provedor — Pixabay
 
 PIXABAY_API_KEY no ambiente. Busca de vídeos com cache 24 horas. Reconsulta ID no fetch. Verifique licença e autoria. https://pixabay.com/api/docs/
 
-Diagnóstico: `python3 scripts/gb.py providers`. Falha de credencial não ativa scraping ou outra conta.
+Diagnóstico: `getbrolls providers`. Falha de credencial não ativa scraping ou outra conta.
 
 ## Provedor — Wikimedia Commons
 
-Action API pública filtra vídeos, preserva autor e licença por arquivo. Licença desconhecida nunca vira domínio público. https://commons.wikimedia.org/wiki/Commons:API/MediaWiki
+Action API pública filtra vídeos ou fotos (`--media video|image|any`), preserva autor e licença por arquivo. Foto tem prévia estática sem intervalo: `preview --candidate ID` baixa a imagem para o cache privado e gera o cartaz; o `fetch` copia esses mesmos bytes, com a extensão real do arquivo. Licença desconhecida nunca vira domínio público. https://commons.wikimedia.org/wiki/Commons:API/MediaWiki
 
-Diagnóstico: `python3 scripts/gb.py providers`. Falha de credencial não ativa scraping ou outra conta.
+Diagnóstico: `getbrolls providers`. Falha de credencial não ativa scraping ou outra conta.
 
 ## Provedor — NASA
 
-Images API pública consulta vídeos e assets MP4. Autoria de terceiros e condições precisam de verificação antes de permit. https://images.nasa.gov/docs/images.nasa.gov_api_docs.pdf
+Images API pública consulta vídeos (assets MP4) e fotos (JPG/PNG/TIFF); foto segue a mesma prévia estática sem intervalo do Commons. Autoria de terceiros e condições precisam de verificação antes de permit. https://images.nasa.gov/docs/images.nasa.gov_api_docs.pdf
 
-Diagnóstico: `python3 scripts/gb.py providers`. Falha de credencial não ativa scraping ou outra conta.
+Diagnóstico: `getbrolls providers`. Falha de credencial não ativa scraping ou outra conta.
 
 ## Provedor — arquivo local
 
 Importe com resolve --file. Sem upload. Verifique direitos e aprove intervalo antes do corte. Hash detecta alteração da fonte.
 
-Diagnóstico: `python3 scripts/gb.py providers`. Falha de credencial não ativa scraping ou outra conta.
+Diagnóstico: `getbrolls providers`. Falha de credencial não ativa scraping ou outra conta.
 
 ## Bancos — busca, prévia e coleta
 
@@ -358,16 +392,62 @@ Bancos são rota opcional, acionada **somente quando o usuário pedir stock expl
 
 Também pode obter o original pela página oficial e usar resolve --file --source-url --creator. Nesse caso o ID local é novo. API indisponível não autoriza inventar candidato ou afirmar teste bem-sucedido.
 
+## Plugins
+
+> **Experimental:** `sdk_api` 1 pode mudar em versão minor; plugins declaram
+> `requires_getbrolls`.
+
+Além dos provedores nativos, o getbrolls aceita fontes, rotas de download,
+comandos e presets de licença via plugins locais, instalados em
+`$GB_HOME/plugins/<id>/` (por padrão, `~/.getbrolls/plugins/`) com opt-in
+explícito. O comando `plugins` gerencia esse ciclo:
+
+- `environment --action list` — as pontes de ambiente que vêm com o getbrolls (hoje o HyperFrames), com versão, `sha256` do pin e estado; não roda código delas. `GB_PLUGINS` ou o `plugins` do perfil podem desligá-las; nenhuma ação de `plugins` mexe nelas.
+- `plugins --action list` — inventário dos plugins instalados (os oficiais vêm à parte, em `official`), com status (`disabled`, `enabled`, `suspended`, `incompatible`, `invalid`), o motivo (`reason`) e o que cada um contribui. Com `GB_PLUGINS` no ambiente (`off` ou uma lista de ids), quem ficou de fora aparece `disabled` com o motivo "desligado por GB_PLUGINS": o `enable` não muda isso, a variável é que escolhe os plugins da sessão. Quando a seleção veio do `plugins` de um `getbrolls.toml` confiável, o motivo é "desligado pelo perfil do workspace (getbrolls.toml `plugins`)" e `selection` vale `profile`. A variável só filtra os plugins já habilitados com pin válido: ela nunca carrega um plugin que não foi habilitado nem um cujo conteúdo mudou. O status do `list` é pré-carga (manifesto + pin); o resultado real do `register()` sai no `doctor`.
+- `plugins --action enable --id <id>` — mostra o manifesto e as permissões declaradas, sem habilitar; rode de novo com `--yes` para confirmar e gravar o pin de hash da pasta (com o sha256 de cada arquivo). Plugin `suspended` porque o conteúdo mudou desde o pin: a prévia do `enable` traz o `diff` (arquivos adicionados, removidos e alterados) e confirmar exige `--yes --expect <sha256>` com o valor da prévia, como no install/update — também depois de um `disable`, que guarda o último pin. Plugin instalado por `install`: prefira `update`, que compara com a origem.
+- `plugins --action disable --id <id>` — desliga um plugin habilitado.
+- `plugins --action check --path <pasta>` — valida o manifesto, roda `register()` contra um registro descartável e confere o contrato de cada contribuição, sem instalar nada. **Executa o código da pasta** com as suas permissões: é ferramenta de quem escreve o plugin, não uma checagem segura de um download que você ainda não revisou. Recusa o mesmo que o `install` recusaria (link simbólico, bytecode, pasta de controle de versão aninhada) e avisa, em `warnings`, sobre `permissions.env`/`permissions.paths` que não vão valer.
+- `plugins --action install --source <pasta-ou-url-git>` — mostra id, versão, permissões, origem, commit e o `sha256` do conteúdo materializado; com `--yes --expect <sha256>` (o mesmo valor da prévia) instala em `plugins/<id>`, habilita com pin de hash e grava a origem.
+- `plugins --action update --id <id>` — mostra a diferença de versão, permissões e arquivos contra a origem gravada; com `--yes --expect <sha256>` troca a pasta e refaz o pin.
+- `plugins --action new --id <id> --kind provider|route|command|exporter [--path <pasta>]` — gera um plugin mínimo que já passa no próprio teste e no `check`.
+
+Fonte de plugin aparece em `providers` com `plugin` (e `route`, quando o
+arquivo vem por uma rota do plugin). Rota `stage="fetch"` só baixa no `fetch`:
+para revisar antes, use `preview --candidate ID --start ... --end ...
+--reference-only` (numa foto, `preview --candidate ID --reference-only`, sem
+`--start/--end`), depois `approve`, `permit` e `fetch`. Comandos de plugin
+rodam com `x --list` e `x <plugin> <comando> --project <projeto> [--arg
+chave=valor]`; eles só leem o projeto.
+
+`doctor` lista cada plugin em `plugins[]` com status e motivo, e o `summary`
+ganha a linha `plugins` quando algum está `failed`, `suspended`, `invalid` ou
+`incompatible`. `doctor --live` também testa as fontes de plugin: fonte
+só-metadados sai `search_ok` com `refresh: "no_media_url (fonte só-metadados)"`,
+fonte com rota sai `refresh: "route"`, e o texto de um `PluginError` (ex.:
+"Configure PASTA_LOCAL_DIR…") aparece no `detail`.
+
+Escrever ou revisar um plugin começa pelo caminho curto em
+[PLUGIN_DEV_QUICKSTART.md](PLUGIN_DEV_QUICKSTART.md) e a referência completa fica
+em [SDK.md](SDK.md) — manifesto, contrato de `Provider`/`Route`, `PluginApi`,
+o que o core reescreve nos candidatos e o modelo de confiança (não é uma caixa
+de areia). O exportador de exemplo está em
+[`examples/plugins/exporter_example`](../examples/plugins/exporter_example/README.md)
+(lista de cortes em CSV). Os outros exemplos funcionais estão em
+[`examples/plugins/pasta_local`](../examples/plugins/pasta_local/README.md)
+(acervo local, rota de prévia e comando) e
+[`examples/plugins/banco_http`](../examples/plugins/banco_http/README.md)
+(API autenticada, rota de `fetch`).
+
 ## Tipos de assets e formatos
 
 | Tipo | Origem implementada | Prévia | Entrega final |
 |---|---|---|---|
 | `video` | Arquivo local; busca de vídeos nos provedores configurados | GIF ou poster/sheet; remoto pode ser só referência | MP4 do intervalo aprovado |
-| `image` | PNG/JPG/JPEG/WebP/BMP/TIFF local | Imagem estática | Original estático copiado após aprovação |
+| `image` | PNG/JPG/JPEG/WebP/BMP/TIFF local; foto da NASA e do Commons (`search --media image`, `resolve --url`) | Imagem estática, sem `--start/--end` | Original estático copiado após aprovação |
 | `news_screenshot` | Captura Playwright importada localmente com URL | Imagem estática | PNG/JPG original com procedência no ledger |
 | `web_screenshot` | Captura de página importada localmente com URL | Imagem estática | Original estático com procedência |
 
-Busca de imagens via API, áudio isolado como asset final e SVG não estão implementados. Download social usa os transportes do ROUTER. Não anuncie a capacidade só porque existe um nome de tipo. GIF animado é a prévia de um vídeo; não substitui o arquivo final de edição.
+Busca de imagens fora da NASA e do Commons, áudio isolado como asset final e SVG não estão implementados. Download social usa os transportes do ROUTER. Não anuncie a capacidade só porque existe um nome de tipo. GIF animado é a prévia de um vídeo; não substitui o arquivo final de edição.
 
 ### Formato editorial
 
@@ -382,19 +462,58 @@ No storyboard, imagem/GIF mantém proporção. Captura móvel padrão é 390×84
 ```text
 video-01/
 ├── RULES.md
+├── BRIEF.md                 # plano do vídeo; com roteiro, os beats cNN vêm do sync
+├── ROTEIRO.md               # opcional: cenas, diretivas e fala (roteiro --action new)
+├── aroll/                   # apresentador, UGC e narração: cNN.mp4 ou cNN-<take>.mp4 (+ .transcript.json)
+├── assets/                  # componentes do projeto (não é o assets/ da instalação)
+│   └── marca/  lettering/  sfx/  musica/  imagem/  composicao/  outros/
 ├── output/playwright/       # screenshots e snapshots de trabalho
+├── entrega/                 # uma pasta NN-<beat>-<alvo> por beat, gerada pelo deliver
+├── exports/                 # export --to <exporter>: <exporter>/001/ (com getbrolls-plan.json), 002/… e LATEST; o core nunca apaga
+├── renders/                 # vídeos renderizados pelo HyperFrames (-o), fora do export
 └── brolls/
     ├── manifest.json        # tipo, formato, contexto e procedência
     ├── references.json      # referências explícitas e seus motivos
     ├── events.jsonl
+    ├── roteiro-reviews.jsonl  # revisões humanas do roteiro (só acrescenta)
+    ├── roteiro-state.json   # ids de cena já usados; nenhum volta
     ├── candidates/
     ├── previews/            # poster, contact sheet, GIF
-    ├── clips/               # vídeo ou imagem final
+    ├── clips/               # vídeo ou imagem final (layout 0; no layout 1, em broll/)
     ├── credits.md
     └── review.html
 ```
 
+`brolls/` é a pasta de estado do getbrolls no projeto: manifesto, eventos, logs e o estado do roteiro moram nela, inclusive quando o projeto não coleta b-roll nenhum. `aroll/` e `assets/` só nascem com `roteiro --action new`: projeto sem roteiro não ganha pasta nova, e `assets --action list|where` não cria nada. `exports/` nasce no primeiro `export` (o `--dry-run` não cria nada), e `renders/` com o `mkdir -p renders` do `EXPORT.md`.
+
+Num projeto de layout 1 (com `project.json`, criado por `init` ou adotado por `migrate --action apply`), os clipes finais ficam em `broll/`, na raiz, e a análise de mídia em `analysis/`; `brolls/` continua com o manifesto, as prévias e os logs. As árvores dos dois layouts, o papel de cada log e o formato de cada arquivo estão em [SCHEMAS.md](SCHEMAS.md#layouts-de-projeto).
+
+### Roteiro e componentes
+
+Para quem quer o conteúdo pronto (hoje, reels 9:16), o `ROTEIRO.md` descreve o vídeo por cenas: `## Título`, um layout por cena (`[A-ROLL]` ou `[A-ROLL: take]`, `[BROLL: alvo]`, `[SPLIT: esquerda | direita]`, `[FULL: alvo]`, `[UGC: descrição]`), camadas (`[LETTERING: "texto" | estilo]`, `[SFX]`, `[MUSICA]`, `[COMP]`, `[<plugin>:<nome>]` de plugin habilitado) e a fala. Comentário HTML só vale como o id `<!-- cNN -->` que o sync põe no fim do título; ao duplicar uma cena, não copie esse comentário. Comentário do Obsidian (`%%`) depois do frontmatter, elemento HTML no corpo, caractere invisível ou de direção de texto e CR solto são erro: esconderiam texto da revisão. Só conta o `ROTEIRO.md` com `type: roteiro` no frontmatter; um roteiro que a pessoa escreveu por conta própria não muda o brief.
+
+O fluxo: `roteiro --action new --genero reels --tema "..."` cria o esqueleto (e, sem `RULES.md` no projeto, um no formato do roteiro; sem `RULES.md`, o `check` usa o aspecto do roteiro); `init-brief` com o roteiro no projeto já nasce no formato dele e com `"beats": []`; com ele no projeto, a entrevista do brief pergunta só vídeo, fontes e direitos e grava `"beats": []`. `check` valida e mostra o plano de cena (componentes, onde cada camada entra na fala, duração); `review --by NOME --channel chat --statement "frase exata" --expect <sha256>` registra a revisão humana, ligada ao conteúdo: o `--expect` é o `review.sha256` que `check` e `plan` mostram, e o `review` recusa se o roteiro mudou depois da versão mostrada; `plan` mostra o sync sem gravar; `sync` grava os ids de cena e os beats `cNN`, `cNN-a` e `cNN-b` no `BRIEF.md`. Enquanto o `BRIEF.md` não reflete o roteiro (nunca houve sync, há cena sem id, ou as cenas pedem beats diferentes dos ativos), `status` aponta o degrau `roteiro-check` (roteiro sem revisão válida: o sync recusaria) e, revisado, o `roteiro-sync`; em dia, a coleta segue normal com `brief --beat cNN`, e um roteiro sem cena de b-roll só avisa que não pede b-roll.
+
+Só mudar o alvo de um beat já aprovado pede `--confirm-target-change` (as aprovações voltam a pendente); mudar a fala é aviso. Ids de cena nunca são reaproveitados. Cena removida deixa o beat aposentado (`"retired": true`): ele continua no `BRIEF.md`, fica fora de `brief`, `status` e `deliver` (que o lista em `retired`), e candidatos e clipes ficam intactos. Antes de gravar, o sync copia `ROTEIRO.md` e `BRIEF.md` para `*.sync.bak`; `new --force` guarda o roteiro anterior em `ROTEIRO.md.bak`.
+
+Componentes resolvem pelo nome, primeiro em `assets/<tipo>/` do projeto, depois (num projeto com `project.json` de cliente registrado) em `<pasta do cliente>/assets/<tipo>/`, e por fim na biblioteca pessoal `$GB_HOME/assets/<tipo>/` (padrão `~/.getbrolls/assets/<tipo>/`); `assets --action list|where` mostra onde cada um está. Música, SFX e marca registram a licença em `<nome>.licenca.json` (`origem`, `licenca`, `credito`) ao lado do arquivo. Quem monta o vídeo aponta para a pasta dos clipes finais — `broll/` num projeto de layout 1 (com `project.json`), `brolls/clips/` no layout 0 —, não para `entrega/`, que é renumerada quando a ordem muda. Projeto de layout 1 exige getbrolls 2.6 ou mais novo, e o Storyboard dele só mostra os clipes finais aberto com `serve`. Guia do agente, com o formato completo: [`references/roteiro.md`](../references/roteiro.md).
+
+Roteiro revisado e sincronizado vira projeto de edição com `export --to <exporter> --project <projeto>`, por um exporter de plugin de terceiros; `export --to hyperframes|davinci` recusa, porque esta versão ainda não tem comando que monte a timeline no HyperFrames ou no DaVinci. Cada export é uma pasta nova, `exports/<exporter>/001/`, `002/`…, com `LATEST` guardando o número da mais nova, e o core nunca apaga, sobrescreve nem mescla uma pasta de export: o que você edita lá dentro é seu. `--dry-run` mostra o que seria gravado. Clipe já congelado pelo `deliver` entra por hardlink (não edite no lugar); ainda gravável, por clone ou cópia, como A-ROLL e componentes. A duração de cada cena vem do A-ROLL gravado; a legenda palavra a palavra, de `aroll/<nome do vídeo>.transcript.json`, gerado pelo `transcribe` do HyperFrames numa pasta temporária, nunca dentro do export. O render vai para `renders/` do projeto, fora do export; o primeiro `check` ou `render` baixa o GSAP e a fonte Inter. Passo a passo, portões e o comando do `transcribe`: [`references/roteiro.md`](../references/roteiro.md#export-do-roteiro-ao-projeto-de-edição).
+
 A memória é por projeto. Para consultar referências de outro projeto, use `references --project /caminho/anterior` com autorização do usuário. Os exemplos orientam a próxima busca; nunca transferem aprovação/licença automaticamente.
+
+### Clientes e receitas
+
+Um cliente é uma pasta sua, registrada com `client --action add --slug cliente-exemplo --root <pasta>`: ela ganha `client.json`, `assets/<tipo>/` (a marca, os SFX e as trilhas que o cliente reusa em todo projeto), `recipes/` e `projetos/`. Num projeto criado com `init --client cliente-exemplo`, cada componente resolve primeiro no projeto, depois em `assets/` do cliente e por fim na biblioteca pessoal; A-ROLL é sempre do projeto.
+
+Uma **receita** é o formato de um vídeo pronto, selado numa versão imutável do cliente:
+
+1. **Selar.** A versão vai para `<pasta do cliente>/recipes/<slug>/<N>/`, com a ref `cat:getbrolls/recipe/cliente-exemplo.<slug>@<N>`: `getbrolls-recipe.json` (títulos das cenas, diretivas de layout e camadas, com a fala virando `{fala da cena}` e o texto entre aspas `{texto}`), `components.json` e os bytes dos componentes em `assets/<tipo>/`, cada um com o sha256. Nunca entram `.licenca.json`, aprovações, A-ROLL, `brolls/` nem clipes. O sha256 do `getbrolls-recipe.json` fica fora dele, no `getbrolls-recipe.sha256` ao lado, e a lista `files` cita todo arquivo da versão: editar ou acrescentar um arquivo à mão deixa a versão não íntegra. A versão fica somente leitura; mudou, sele de novo (`N+1`).
+2. **Conferir.** `recipe --action list` lista as versões; `recipe --action show --ref cliente-exemplo.<slug>@1` confere cada arquivo pelo sha256 e responde `intact` com os `problems` (sem `@N`, a última versão). Os dois só leem.
+3. **Criar o projeto.** `init --recipe <slug>@1 --client cliente-exemplo --tema "Tema do vídeo" --project <pasta nova>` só roda com a receita íntegra: grava `project.json` (cliente, ref, quadro e fps da receita, ou os de `--canvas`/`--fps`), um `ROTEIRO.md` em rascunho com uma cena por cena da receita e os componentes. O que a pasta do cliente já tem (mesmo nome, mesmo sha256) fica lá; o resto é copiado para `assets/<tipo>/` **sem licença**, com o aviso `LICENCE_NOT_TRANSFERRED` para marca, sfx, música e imagem. Nenhum manifesto, candidato, clipe ou aprovação nasce da receita.
+4. **Lock.** O `recipe.lock.json` na raiz do projeto guarda a ref, o sha256 do `getbrolls-recipe.json` e, por item, o nível (`client` ou `project`), o caminho e o sha256. `status` e `export` avisam com `RECIPE_LOCK_DRIFT` quando o item achado hoje tem outro sha256, sumiu ou o lock não bate com o `project.json`. Tamanho e mtime de cada item são só cache: iguais aos do arquivo, o `status` não recalcula o sha256.
+
+Formatos: [`schemas/recipe.schema.json`](../schemas/recipe.schema.json), [`schemas/components.schema.json`](../schemas/components.schema.json) e [`schemas/recipe_lock.schema.json`](../schemas/recipe_lock.schema.json).
 
 ## Captura de notícias e páginas pelo navegador
 
@@ -403,17 +522,17 @@ Workflow opcional do agente com [Playwright CLI oficial](https://github.com/micr
 ### Preparar
 
 ```sh
-python3 scripts/gb.py rules --project ./video-01
-python3 scripts/gb.py references --project ./video-01
-python3 scripts/gb.py browser-plan --url https://www.nasa.gov/news/recently-published/ --project ./video-01
+getbrolls rules --project ./video-01
+getbrolls references --project ./video-01
+getbrolls browser-plan --url https://www.nasa.gov/news/recently-published/ --project ./video-01
 ```
 
 Windows PowerShell:
 
 ```powershell
-python scripts/gb.py rules --project .\video-01
-python scripts/gb.py references --project .\video-01
-python scripts/gb.py browser-plan --url https://www.nasa.gov/news/recently-published/ --project .\video-01
+getbrolls rules --project .\video-01
+getbrolls references --project .\video-01
+getbrolls browser-plan --url https://www.nasa.gov/news/recently-published/ --project .\video-01
 ```
 
 Leia primeiro as regras editoriais e referências aprovadas/rejeitadas. Priorize `preferred_domains` nas pesquisas do navegador e não use `blocked_domains`. Exemplos de queries: assunto + entidade + site preferido. Confira a URL real encontrada; não invente resultados.
@@ -454,12 +573,12 @@ Windows PowerShell:
 - Confira o screenshot visualmente antes de importar. Não transforme banner de erro/cookies em asset aprovado.
 
 ```sh
-python3 scripts/gb.py resolve --file ./video-01/output/playwright/news.png --asset-type news_screenshot --source-url URL_REAL --title "Manchete real" --creator "Autor informado" --captured-at "2026-09-15T12:00:00-03:00" --shot news-01 --project ./video-01
-python3 scripts/gb.py preview --candidate ID --narration "Fala do roteiro" --reason "Notícia comprova o evento citado" --project ./video-01
-python3 scripts/gb.py review --project ./video-01
+getbrolls resolve --file ./video-01/output/playwright/news.png --asset-type news_screenshot --source-url URL_REAL --title "Manchete real" --creator "Autor informado" --captured-at "2026-09-15T12:00:00-03:00" --shot news-01 --project ./video-01
+getbrolls preview --candidate ID --narration "Fala do roteiro" --reason "Notícia comprova o evento citado" --project ./video-01
+getbrolls review --project ./video-01
 ```
 
-No Windows, use `python` e caminhos PowerShell, por exemplo `python scripts/gb.py resolve --file "$env:GB_PROJECT\output\playwright\news.png" ... --project "$env:GB_PROJECT"`.
+No Windows, use caminhos PowerShell, por exemplo `getbrolls resolve --file "$env:GB_PROJECT\output\playwright\news.png" ... --project "$env:GB_PROJECT"`.
 
 Substitua os metadados de exemplo pelos dados reais. Imagem estática não exige `--start/--end`. Se apenas `web_screenshot` estiver habilitado, use esse tipo. Revisão, decisão de direitos, fetch e referência seguem o fluxo normal.
 
@@ -467,7 +586,7 @@ Não execute `close-all` nem feche abas de outros projetos. Encerre somente a se
 
 ## Instagram — navegador/Playwright, dois streams e MP4
 
-O fluxo Instagram usa o módulo `scripts/getbrolls/instagram_pairs.py`. A captura acontece na sessão do navegador autorizada pelo usuário; o módulo consome os pares de vídeo e áudio capturados. Consulte também [recuperação e auditoria](#instagram--recuperação-e-auditoria).
+O fluxo Instagram usa o módulo `scripts/getbrolls/instagram_pairs.py` (no pacote instalado: `python -P -m getbrolls.instagram_pairs`, com os mesmos argumentos). A captura acontece na sessão do navegador autorizada pelo usuário; o módulo consome os pares de vídeo e áudio capturados. Consulte também [recuperação e auditoria](#instagram--recuperação-e-auditoria).
 
 ### 1. Abrir o Reel e capturar as fontes
 
@@ -586,16 +705,16 @@ Em batch, mantenha o gate de hash de áudio. Dois Reels podem ter áudio igual l
 Cem Reels de uma vez, sem pausa, são o jeito mais rápido de perder a conta. A CLI não dorme: ela diz **quanto** esperar e o agente espera. O estado fica em `<projeto>/work/queue.json` (privado, gravação atômica, permissão 0600) e nunca contém URL assinada — só a URL pública normalizada de cada post.
 
 ```sh
-python3 "$GB_SKILL_DIR/scripts/gb.py" queue --action add --provider instagram --project "$GB_PROJECT" "$REEL_URL_1" "$REEL_URL_2" --url "$REEL_URL_3"
-python3 "$GB_SKILL_DIR/scripts/gb.py" queue --action next --project "$GB_PROJECT"
+getbrolls queue --action add --provider instagram --project "$GB_PROJECT" "$REEL_URL_1" "$REEL_URL_2" --url "$REEL_URL_3"
+getbrolls queue --action next --project "$GB_PROJECT"
 # {"item": {...}} → capture os pares desse Reel e rode instagram_pairs.py
 # {"item": null, "wait_seconds": 83, "resume_at": "..."} → aguarde 83 s e chame next de novo
-python3 "$GB_SKILL_DIR/scripts/gb.py" queue --action mark --id instagram:CODIGO --done --project "$GB_PROJECT"
-python3 "$GB_SKILL_DIR/scripts/gb.py" queue --action mark --id instagram:CODIGO --failed --reason "curl 22 HTTP 429" --project "$GB_PROJECT"
-python3 "$GB_SKILL_DIR/scripts/gb.py" queue --action status --project "$GB_PROJECT"
+getbrolls queue --action mark --id instagram:CODIGO --done --project "$GB_PROJECT"
+getbrolls queue --action mark --id instagram:CODIGO --failed --reason "curl 22 HTTP 429" --project "$GB_PROJECT"
+getbrolls queue --action status --project "$GB_PROJECT"
 ```
 
-Windows PowerShell usa os mesmos argumentos com `python "$env:GB_SKILL_DIR\scripts\gb.py"` e `$env:GB_PROJECT`.
+Windows PowerShell usa os mesmos argumentos com `$env:GB_PROJECT`.
 
 - `add` aceita `--provider instagram|tiktok|youtube`, URLs posicionais e `--url` repetido; a URL é normalizada pelo mesmo resolvedor de `resolve` e repetidas são ignoradas. Cada item nasce `pending`.
 - `next` devolve um item quando o ritmo permite ou quando já existe um item `active` aguardando `mark` — nesse segundo caso ele repete o mesmo item, sem reiniciar o relógio (`reason: "active"`). Ao devolver um item novo, marca-o `active`. Quando não há nada para devolver, responde `wait_seconds`, `resume_at` e `reason` com saída 0 e `item: null`; `reason` pode ser `pace`, `cooldown`, `max_per_hour`, `max_per_day` (aguarde) ou `empty` (fila sem pendentes, nada a esperar). `--provider` limita a fila a uma fonte.
@@ -619,12 +738,12 @@ Para as rotas yt-dlp, o comando base já inclui `--sleep-requests 1 --sleep-inte
 ### 4. Entrar no fluxo comum de B-roll
 
 ```sh
-python3 "$GB_SKILL_DIR/scripts/gb.py" resolve --file "$GB_PROJECT/sources/instagram/01_REEL.mp4" --source-url "$REEL_URL" --creator "$CREATOR" --shot instagram-01 --project "$GB_PROJECT"
-python3 "$GB_SKILL_DIR/scripts/gb.py" preview --candidate "$LOCAL_ID" --start 0 --end 5 --reason "Trecho do Reel selecionado para revisão" --project "$GB_PROJECT"
-python3 "$GB_SKILL_DIR/scripts/gb.py" review --project "$GB_PROJECT"
+getbrolls resolve --file "$GB_PROJECT/sources/instagram/01_REEL.mp4" --source-url "$REEL_URL" --creator "$CREATOR" --shot instagram-01 --project "$GB_PROJECT"
+getbrolls preview --candidate "$LOCAL_ID" --start 0 --end 5 --reason "Trecho do Reel selecionado para revisão" --project "$GB_PROJECT"
+getbrolls review --project "$GB_PROJECT"
 ```
 
-Windows PowerShell usa os mesmos argumentos com `python "$env:GB_SKILL_DIR\scripts\gb.py"`, `$env:GB_PROJECT`, `$env:REEL_URL` e `$env:CREATOR`.
+Windows PowerShell usa os mesmos argumentos com `$env:GB_PROJECT`, `$env:REEL_URL` e `$env:CREATOR`.
 
 Use o ID local retornado e um intervalo que caiba no vídeo. Confira visualmente sincronização, identidade e conteúdo; áudio presente não comprova que é o áudio correto. O candidato fica pendente; não se autoaprove. Aprovação vem sempre de uma pessoa: pelo Storyboard (`import-review`) ou por fala explícita no chat (`approve --by NOME --channel chat --statement "frase"`, com `--statement` obrigatório no canal chat). Nunca inferir de silêncio. O download das partes para inspecionar a mídia é preparação, distinta do corte final aprovado.
 
@@ -638,7 +757,7 @@ Em 15/09/2026, a sessão Chrome indicada pelo usuário abriu o Reel `DcMXl1IPNtB
 
 ## Instagram — recuperação e auditoria
 
-Baixar e organizar Reels no fluxo Get B-rolls: capturar URLs diretas de CDN como pares `*_video.conf` + `*_audio.conf`, baixar as partes separadas, mesclar com `ffmpeg` e validar que o MP4 final tem vídeo e áudio corretos.
+Baixar e organizar Reels no fluxo getbrolls: capturar URLs diretas de CDN como pares `*_video.conf` + `*_audio.conf`, baixar as partes separadas, mesclar com `ffmpeg` e validar que o MP4 final tem vídeo e áudio corretos.
 
 ### Quando usar
 
@@ -767,7 +886,7 @@ Não ler nem imprimir cookies, `.env`, browser credential stores ou tokens. Usar
 
 ## Storyboard
 
-Entregável de revisão independente da landing page. `gb.py review` gera `brolls/review.html` com CSS e JavaScript próprios incorporados; a tipografia usa fontes do sistema; imagens/GIF ficam em `previews/`.
+Entregável de revisão independente da landing page. `getbrolls review` gera `brolls/review.html` com CSS e JavaScript próprios incorporados; a tipografia usa fontes do sistema; imagens/GIF ficam em `previews/`.
 
 1. Resolva o original autorizado e use um `--shot` distinto por insert.
 2. Execute `preview` com intervalo, `--narration` (fala exata, quando fornecida; omita se ausente) e `--reason` (motivo da fonte).
@@ -782,13 +901,13 @@ Configuração padrão: `GB_GIF_SCOPE=broll`. O print opcional da pessoa permane
 
 ## Apêndice — utilitários legados
 
-O fluxo principal é `python3 scripts/gb.py <subcomando>` (ver [Fluxo editorial](#fluxo-editorial)). Os scripts abaixo, em `${GB_SKILL_DIR}/scripts/getbrolls/tools/youtube/`, são anteriores à CLI unificada e continuam no repositório como utilitários avulsos de linha de comando — não fazem parte do caminho recomendado nem do fluxo revisado pelo Storyboard:
+O fluxo principal é `getbrolls <subcomando>` (ver [Fluxo editorial](#fluxo-editorial)). Os scripts abaixo, em `${GB_SKILL_DIR}/scripts/getbrolls/tools/youtube/`, são anteriores à CLI unificada e continuam no repositório como utilitários avulsos de linha de comando — não fazem parte do caminho recomendado nem do fluxo revisado pelo Storyboard:
 
 - `search.sh "<query>" [n]` → `ID | DURATION | TITLE` no YouTube, sem baixar.
 - `contact.sh <id> <START-END> <out.jpg> [interval_seg=1.5] [cols=4]` gera um contact sheet manual.
 - `frame.sh` extrai um still isolado (fallback do contact sheet).
 - `fetch.sh <id> <START-END> <NN_entity_context> <PROJETO>/brolls` baixa o segmento trimado direto, fora do ledger/revisão da CLI.
 - `verify.sh <PROJETO>/brolls` roda ffprobe/tamanho manualmente.
-- `vertical.sh <in>` reformata um clipe existente para 9:16 com fundo borrado; não tem equivalente em `gb.py`.
+- `vertical.sh <in>` reformata um clipe existente para 9:16 com fundo borrado; não tem equivalente em `getbrolls`.
 
-Dependências: `yt-dlp` + FFmpeg. Usar esses scripts pula o registro em `events.jsonl`, a assinatura de revisão e o `permit`; prefira `gb.py` para qualquer material que vá para `clips/` ou para o Storyboard.
+Dependências: `yt-dlp` + FFmpeg. Usar esses scripts pula o registro em `events.jsonl`, a assinatura de revisão e o `permit`; prefira `getbrolls` para qualquer material que vá para `clips/` ou para o Storyboard.

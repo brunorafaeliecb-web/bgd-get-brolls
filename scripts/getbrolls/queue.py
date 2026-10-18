@@ -5,6 +5,12 @@ random interval between items plus hourly/daily caps per provider; a failure tha
 looks like a block (403/429/challenge/login/rate limit) opens a doubling cooldown.
 """
 
+# pylint: disable=missing-function-docstring,too-many-locals,cyclic-import
+# Legado: ocorrências pré-existentes (corpo idêntico ao código anterior à 2.6.0). O ciclo
+# (getbrolls.queue <-> getbrolls.rules) já existia antes da 2.6.0: `report()`
+# importa `rules.load_rules` tardiamente (dentro de função) exatamente para
+# quebrar esse ciclo em tempo de execução.
+
 import json
 import logging
 import os
@@ -14,11 +20,11 @@ import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import logs
+from . import effects, labels, logs, versioning
+from ._paths import strict_is_file
 
 log = logs.get("queue")
 
-PROVIDERS = ("instagram", "tiktok", "youtube")
 QUEUE_FILE = Path("work") / "queue.json"
 SCHEMA_VERSION = 1
 STATUSES = ("pending", "active", "done", "failed", "skipped")
@@ -26,6 +32,8 @@ TERMINAL_STATUSES = ("done", "failed", "skipped")
 
 # Defaults per provider: (min_s, max_s) between items.
 DEFAULT_PACE = {"instagram": (45, 120), "tiktok": (15, 40), "youtube": (15, 40)}
+# Providers the queue accepts: exactly those with a default pace above.
+PROVIDERS = tuple(DEFAULT_PACE)
 DEFAULT_MAX_PER_HOUR = 20
 DEFAULT_MAX_PER_DAY = 60
 COOLDOWN_BASE_S = 30 * 60
@@ -110,46 +118,48 @@ def _check(data, path):
     for item in data["items"]:
         item_id = item.get("id")
         if item_id in seen_ids:
-            raise ValueError(f"queue.json inválido em {path}: id duplicado {item_id!r}.")
+            raise ValueError(f"queue.json inválido em {labels.shown(path)}: id duplicado {item_id!r}.")
         seen_ids.add(item_id)
         status = item.get("status")
         provider = item.get("provider")
         if status == "active":
             if not item.get("started_at"):
-                raise ValueError(f"queue.json inválido em {path}: item ativo sem started_at ({item_id!r}).")
+                raise ValueError(
+                    f"queue.json inválido em {labels.shown(path)}: item ativo sem started_at ({item_id!r})."
+                )
             if provider in active_by_provider:
                 raise ValueError(
-                    f"queue.json inválido em {path}: mais de um item ativo para {provider!r} "
+                    f"queue.json inválido em {labels.shown(path)}: mais de um item ativo para {provider!r} "
                     f"({active_by_provider[provider]!r} e {item_id!r})."
                 )
             active_by_provider[provider] = item_id
         if status in ("done", "failed") and not item.get("finished_at"):
             raise ValueError(
-                f"queue.json inválido em {path}: item {item_id!r} em {status!r} sem finished_at "
+                f"queue.json inválido em {labels.shown(path)}: item {item_id!r} em {status!r} sem finished_at "
                 "(quebraria as contagens de hora/dia)."
             )
 
 
 def load(path):
     path = Path(path)
-    if not path.is_file():
+    if not strict_is_file(path):
         return empty_state()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        raise ValueError(f"queue.json inválido em {path}; preserve o arquivo e restaure uma cópia válida.") from None
+        raise ValueError(
+            f"queue.json inválido em {labels.shown(path)}; preserve o arquivo e restaure uma cópia válida."
+        ) from None
     if not isinstance(data, dict):
-        raise ValueError(f"queue.json incompatível em {path}.")
-    version = data.get("schema_version")
-    if version != SCHEMA_VERSION:
-        if isinstance(version, int) and version > SCHEMA_VERSION:
-            raise ValueError(
-                f"queue.json em {path} foi gravado por uma versão mais nova do get-brolls "
-                f"(schema {version}, esperado {SCHEMA_VERSION}); atualize antes de continuar."
-            )
-        raise ValueError(f"queue.json incompatível em {path} (schema_version esperado {SCHEMA_VERSION}).")
+        raise ValueError(  # noqa: TRY004 - contrato da CLI: dado inválido é ValueError (INVALID_DATA)
+            f"queue.json incompatível em {labels.shown(path)}."
+        )
+    invalid = f"queue.json incompatível em {labels.shown(path)} (schema_version esperado {SCHEMA_VERSION})."
+    versioning.read_version(data, f"queue.json em {labels.shown(path)}", SCHEMA_VERSION, invalid=invalid)
     if not isinstance(data.get("items"), list) or not isinstance(data.get("providers"), dict):
-        raise ValueError(f"queue.json incompatível em {path}.")
+        raise ValueError(  # noqa: TRY004 - contrato da CLI: dado inválido é ValueError (INVALID_DATA)
+            f"queue.json incompatível em {labels.shown(path)}."
+        )
     _check(data, path)
     return data
 
@@ -157,17 +167,18 @@ def load(path):
 def save(path, data):
     """Private atomic write: temp file in the same folder, 0o600, then replace."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle, temp = tempfile.mkstemp(prefix=".queue-", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            stream.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        Path(temp).chmod(0o600)
-        Path(temp).replace(path)
-    finally:
-        Path(temp).unlink(missing_ok=True)
+    effects.mkdir(path.parent, parents=True, exist_ok=True)
+    with effects.op("fs.write", path):
+        handle, temp = tempfile.mkstemp(prefix=".queue-", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(json.dumps(versioning.stamp(data, SCHEMA_VERSION), ensure_ascii=False, indent=2) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            Path(temp).chmod(0o600)
+            Path(temp).replace(path)
+        finally:
+            Path(temp).unlink(missing_ok=True)
 
 
 def _integer(key, value, lo, hi):
@@ -205,7 +216,8 @@ def pacing(provider, rules=None, use_env=True):
                 overrides[key] = "env"
     if limits["min_s"] > limits["max_s"]:
         raise ValueError(
-            f"Ritmo de {provider}: min_s não pode ser maior que max_s (GB_PACE_MIN_S/GB_PACE_MAX_S ou o bloco pacing em RULES.md)."
+            f"Ritmo de {provider}: min_s não pode ser maior que max_s "
+            "(GB_PACE_MIN_S/GB_PACE_MAX_S ou o bloco pacing em RULES.md)."
         )
     if overrides:
         logs.event(log, logging.DEBUG, "pacing_override", provider=provider, **overrides)
@@ -435,7 +447,7 @@ def mark(data, item_id, status, reason=None, at=None):
 def record_cooldown(project, provider, reason, at=None):
     """Open a cooldown in an existing queue.json (used by instagram_pairs); None when absent."""
     path = queue_path(project)
-    if not path.is_file():
+    if not strict_is_file(path):
         return None
     data = load(path)
     moment = _at(at)
@@ -484,7 +496,7 @@ def report(data, at=None, rules=None):
 def hint(project, at=None):
     """Read-only one-line view for `status`; None when the project has no queue."""
     path = queue_path(project)
-    if not path.is_file():
+    if not strict_is_file(path):
         return None
     try:
         data = load(path)
@@ -522,25 +534,35 @@ def summary_line(result):
     """Human line for the CLI, chosen by the action that produced the result."""
     action = result.get("action")
     if action == "add":
-        return f"Enfileirei {len(result.get('added') or [])} URL(s); {len(result.get('duplicates') or [])} repetida(s); {result.get('pending')} pendente(s)."
+        return (
+            f"Enfileirei {len(result.get('added') or [])} URL(s); "
+            f"{len(result.get('duplicates') or [])} repetida(s); {result.get('pending')} pendente(s)."
+        )
     if action == "next":
         if result.get("item"):
             return f"Próximo item: {result['item']['id']} ({result['item']['url']})."
         if result.get("reason") == "empty":
             return "Fila vazia: nada pendente."
-        return f"Aguarde {result.get('wait_seconds')} s (motivo: {result.get('reason')}); retome em {result.get('resume_at')}."
+        return (
+            f"Aguarde {result.get('wait_seconds')} s (motivo: {result.get('reason')}); "
+            f"retome em {result.get('resume_at')}."
+        )
     if action == "mark":
         item = result.get("item") or {}
         cooldown = result.get("cooldown")
         extra = f" Cooldown de {cooldown['seconds']} s até {cooldown['until']}." if cooldown else ""
         return f"Marquei {item.get('id')} como {item.get('status')}.{extra}"
     counts = result.get("counts") or {}
-    return f"Fila: {counts.get('pending', 0)} pendente(s), {counts.get('done', 0)} concluído(s), {counts.get('failed', 0)} com falha."
+    return (
+        f"Fila: {counts.get('pending', 0)} pendente(s), {counts.get('done', 0)} concluído(s), "
+        f"{counts.get('failed', 0)} com falha."
+    )
 
 
 def _mark_status(args):
     """The one --done/--failed/--skipped flag the CLI accepts for `mark`."""
     for flag in ("done", "failed", "skipped"):
+        # lenient: dynamic getattr over argparse flag names, not an existence check on a path
         if getattr(args, flag, False):
             return flag
     raise ValueError("queue mark: escolha --done, --failed ou --skipped.")

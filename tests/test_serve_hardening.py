@@ -4,10 +4,13 @@ everything else, including directory listings and dotfiles, answers 404), privat
 `.serve.pid`/`.serve.log` files, a secret-free environment for the detached
 background server, and a validated ping target."""
 
+import errno
 import http.client
+import io
 import json
 import os
 import re
+import shutil
 import stat
 import tempfile
 import threading
@@ -19,10 +22,10 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 # A pasta pessoal da skill vai para um temporário: nenhum teste toca ~/.getbrolls.
-import _isolation  # noqa: F401  (efeito de import: define GB_HOME)
+import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _cli import run_cli
 from _media import skip_unless_ffmpeg, synth_video
-from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)
+from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
 
 from getbrolls import serve
 
@@ -80,8 +83,11 @@ class SecurityHeadersTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = _project_with_review(Path(tmp))
             with _serving(root) as (_server, port):
-                with self.assertRaises(urllib.error.HTTPError) as ctx:
-                    urllib.request.urlopen(f"http://127.0.0.1:{port}/manifest.json", timeout=5)
+                with (
+                    self.assertRaises(urllib.error.HTTPError) as ctx,
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/manifest.json", timeout=5),
+                ):
+                    pass
                 self.assertEqual(404, ctx.exception.code)
                 headers = ctx.exception.headers
                 self.assertEqual("DENY", headers.get("X-Frame-Options"))
@@ -106,6 +112,76 @@ class SecurityHeadersTests(unittest.TestCase):
                 self.assertEqual("DENY", headers.get("X-Frame-Options"))
                 self.assertEqual("nosniff", headers.get("X-Content-Type-Options"))
                 self.assertIn("frame-ancestors 'none'", headers.get("Content-Security-Policy", ""))
+
+
+def _post_save(server, port):
+    """POST de decisões com o token da sessão; devolve (status, corpo JSON)."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        body = json.dumps({"items": []}).encode()
+        conn.request(
+            "POST",
+            serve.SAVE_PATH,
+            body=body,
+            headers={"Content-Type": "application/json", serve.TOKEN_HEADER: server.save_token or ""},
+        )
+        response = conn.getresponse()
+        return response.status, json.loads(response.read().decode("utf-8"))
+    finally:
+        conn.close()
+
+
+class SaveFailureTests(unittest.TestCase):
+    """Quando a gravação das decisões falha, a página recebe um erro JSON, não uma conexão caída."""
+
+    @unittest.skipIf(os.name == "nt", "symlinks sem privilégio não são criáveis no Windows")
+    def test_save_failure_answers_a_json_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _project_with_review(Path(tmp) / "proj")
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir()
+            (root / "brolls" / serve.REVIEWS_DIR).symlink_to(elsewhere, target_is_directory=True)
+            with _serving(root) as (server, port):
+                status, payload = _post_save(server, port)
+            self.assertEqual(409, status)
+            self.assertIn("link simbólico", payload["error"])
+            self.assertEqual([], list(elsewhere.iterdir()))
+
+    def test_a_disk_error_while_saving_answers_500(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _project_with_review(Path(tmp))
+            full = OSError(errno.ENOSPC, "No space left on device")
+            with _serving(root) as (server, port), patch.object(serve, "save_review", side_effect=full):
+                status, payload = _post_save(server, port)
+            self.assertEqual(500, status)
+            self.assertIn("Não consegui gravar as decisões", payload["error"])
+
+    def test_a_failed_write_leaves_no_partial_decisions_file(self):
+        real_fdopen = os.fdopen
+
+        class FullDisk:
+            """O arquivo de verdade, com a escrita falhando como num disco cheio.
+
+            O `with` fecha o descritor, como o arquivo real faria: no Windows, o `unlink`
+            de um arquivo ainda aberto falha (WinError 32) e o arquivo ficaria na pasta."""
+
+            def __init__(self, fd, *args, **kwargs):
+                self.stream = real_fdopen(fd, *args, **kwargs)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                self.stream.close()
+
+            def write(self, _data):
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _project_with_review(Path(tmp))
+            with patch.object(serve.os, "fdopen", side_effect=FullDisk), self.assertRaises(OSError):
+                serve.save_review(root / "brolls", {"items": []})
+            self.assertEqual([], list((root / "brolls" / serve.REVIEWS_DIR).iterdir()))
 
 
 def _project_with_previewed_candidate(tmp):
@@ -160,16 +236,25 @@ class AllowlistTests(unittest.TestCase):
                     ".hidden",
                 ]
                 for path in blocked:
-                    with self.assertRaises(urllib.error.HTTPError) as ctx:
-                        urllib.request.urlopen(f"http://127.0.0.1:{port}/{path}", timeout=5)
+                    with (
+                        self.assertRaises(urllib.error.HTTPError) as ctx,
+                        urllib.request.urlopen(f"http://127.0.0.1:{port}/{path}", timeout=5),
+                    ):
+                        pass
                     self.assertEqual(404, ctx.exception.code, path)
 
                 # Listagem de diretório.
-                with self.assertRaises(urllib.error.HTTPError) as ctx:
-                    urllib.request.urlopen(f"http://127.0.0.1:{port}/previews/", timeout=5)
+                with (
+                    self.assertRaises(urllib.error.HTTPError) as ctx,
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/previews/", timeout=5),
+                ):
+                    pass
                 self.assertEqual(404, ctx.exception.code)
-                with self.assertRaises(urllib.error.HTTPError) as ctx:
-                    urllib.request.urlopen(f"http://127.0.0.1:{port}/reviews/", timeout=5)
+                with (
+                    self.assertRaises(urllib.error.HTTPError) as ctx,
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/reviews/", timeout=5),
+                ):
+                    pass
                 self.assertEqual(404, ctx.exception.code)
 
 
@@ -250,10 +335,10 @@ class EncodedPathAllowlistTests(unittest.TestCase):
             previews.mkdir()
             (previews / "poster.jpg").write_bytes(b"poster")
 
-            def permissive(base, parts, relative):
-                del relative
-                folder = (base / parts[0]).resolve()
-                return folder, folder / "anything"
+            def permissive(folder, served_parent, candidate):
+                del served_parent, candidate
+                real = folder.resolve()
+                return real, real / "anything"
 
             with patch.object(serve, "_resolve_allowed_target", side_effect=permissive), _serving(root) as (_s, port):
                 self.assertEqual(404, self._status(port, "/previews/%00x.jpg"))
@@ -287,8 +372,11 @@ class SymlinkEscapeTests(unittest.TestCase):
                 previews.mkdir(parents=True)
                 (previews / "escape.jpg").symlink_to(outside)
                 with _serving(root) as (_server, port):
-                    with self.assertRaises(urllib.error.HTTPError) as ctx:
-                        urllib.request.urlopen(f"http://127.0.0.1:{port}/previews/escape.jpg", timeout=5)
+                    with (
+                        self.assertRaises(urllib.error.HTTPError) as ctx,
+                        urllib.request.urlopen(f"http://127.0.0.1:{port}/previews/escape.jpg", timeout=5),
+                    ):
+                        pass
                     self.assertEqual(404, ctx.exception.code)
             finally:
                 outside.unlink(missing_ok=True)
@@ -306,12 +394,14 @@ class SymlinkEscapeTests(unittest.TestCase):
             try:
                 (root / "brolls" / "previews").symlink_to(outside, target_is_directory=True)
                 with _serving(root) as (_server, port):
-                    with self.assertRaises(urllib.error.HTTPError) as ctx:
-                        urllib.request.urlopen(f"http://127.0.0.1:{port}/previews/secret.txt", timeout=5)
+                    with (
+                        self.assertRaises(urllib.error.HTTPError) as ctx,
+                        urllib.request.urlopen(f"http://127.0.0.1:{port}/previews/secret.txt", timeout=5),
+                    ):
+                        pass
                     self.assertEqual(404, ctx.exception.code)
             finally:
                 (root / "brolls" / "previews").unlink()
-                import shutil
 
                 shutil.rmtree(outside)
 
@@ -423,6 +513,87 @@ class BackgroundEnvironmentTests(unittest.TestCase):
             self.assertEqual(4242, result["pid"])
 
 
+class MissingStoryboardMessageTests(unittest.TestCase):
+    def test_the_storyboard_of_the_project_is_named_under_the_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "brolls").mkdir()
+            for call in (serve.start, serve.start_background):
+                with self.subTest(call=call.__name__), self.assertRaises(ValueError) as caught:
+                    call(root)
+                self.assertIn("<projeto>/brolls/review.html", str(caught.exception))
+                self.assertNotIn(str(root), str(caught.exception))
+
+
+class ServeLogRedactionTests(unittest.TestCase):
+    """O que o servidor de fundo escreve em `.serve.log` passa pela mesma redação do `getbrolls.log`."""
+
+    def test_the_child_environment_asks_for_the_filter(self):
+        self.assertEqual("1", serve._child_environment({}, None)[serve.CHILD_ENV])
+
+    def test_a_foreground_process_is_left_alone(self):
+        before = (serve.sys.stdout, serve.sys.stderr)
+        self.assertFalse(serve.filter_output({}))
+        self.assertEqual(before, (serve.sys.stdout, serve.sys.stderr))
+
+    def test_every_line_of_the_child_is_redacted_before_it_is_written(self):
+        raw = io.StringIO()
+        stream = serve.RedactedStream(raw)
+        stream.write("login password=hunter2 falhou em /Volumes/Externo/pessoa/a.mp4: sem acesso\n")
+        stream.write("par")
+        stream.write("cial token=abc")
+        stream.write("defghijk\nFim /Volumes/pessoa/b c.mp4")
+        self.assertEqual(2, raw.getvalue().count("\n"))  # the last line has no break yet
+        stream.finish()
+        out = raw.getvalue()
+        for word in ("hunter2", "Externo", "pessoa", "abcdefghijk", "b c"):
+            self.assertNotIn(word, out)
+        self.assertIn("password=[REDACTED]", out)
+        self.assertIn(": sem acesso", out)
+        self.assertEqual(3, out.count("\n"))
+        self.assertFalse(stream.isatty())
+
+    def test_an_endless_line_is_omitted_not_kept(self):
+        raw = io.StringIO()
+        stream = serve.RedactedStream(raw)
+        stream.write("x" * (serve.labels.INPUT_MAX + 1))
+        self.assertIn("<texto omitido:", raw.getvalue())
+        self.assertNotIn("xxxx", raw.getvalue())
+
+    def test_the_urls_line_stays_readable_for_the_parent_and_names_the_folder_by_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _project_with_review(Path(tmp).resolve())
+            raw = io.StringIO()
+            stream = serve.RedactedStream(raw)
+            closed = []
+            fake = MagicMock()
+            fake.server_close.side_effect = lambda: closed.append(True)
+            fake.session_id = "sessao"
+            with (
+                patch.object(serve, "start", return_value=(fake, 4321)),
+                patch.object(serve.effects, "serve"),
+                patch.object(serve.sys, "stdout", stream),
+            ):
+                serve.run(root, port=0)
+            payload = json.loads(raw.getvalue())
+            self.assertEqual(
+                ["http://localhost:4321/review.html", "http://127.0.0.1:4321/review.html"], payload["urls"]
+            )
+            self.assertNotIn(str(root), raw.getvalue())
+            self.assertTrue(payload["directory"])
+
+    def test_the_real_child_writes_no_machine_path_in_its_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _project_with_review(Path(tmp).resolve())
+            started = serve.start_background(root, port=0)
+            try:
+                text = (root / "brolls" / serve.LOG_FILE).read_text(encoding="utf-8")
+            finally:
+                serve.stop(root)
+            self.assertIn(str(started["port"]), text)
+            self.assertNotIn(str(root), text)
+
+
 class PingTargetValidationTests(unittest.TestCase):
     """Item 5: o `urlopen` do ping só abre um alvo http local, nunca outro esquema/host."""
 
@@ -447,11 +618,11 @@ class SessionComparisonTests(unittest.TestCase):
     def test_ping_treats_a_non_string_session_as_a_mismatch_not_a_crash(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _project_with_review(Path(tmp))
-            with (
-                _serving(root) as (server, port),
-                patch.object(serve.json, "loads", return_value={"session": 12345, "port": port}),
-            ):
-                self.assertFalse(serve._ping(port, server.session_id, timeout=2.0))
+            # Aninhado de propósito: combinar os dois `with` faz o pylint reportar
+            # "used-before-assignment" de `port` (falso positivo).
+            with _serving(root) as (server, port):  # noqa: SIM117
+                with patch.object(serve.json, "loads", return_value={"session": 12345, "port": port}):
+                    self.assertFalse(serve._ping(port, server.session_id, timeout=2.0))
 
 
 if __name__ == "__main__":

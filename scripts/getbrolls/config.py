@@ -1,7 +1,20 @@
 """Explicit .env loading: no interpolation, evaluation or secret output."""
 
+# pylint: disable=missing-function-docstring,cyclic-import
+# Legado: ocorrência pré-existente em `settings` (corpo idêntico ao código anterior à 2.6.0).
+# `cyclic-import` vem do ciclo (getbrolls.config -> getbrolls.runtime ->
+# getbrolls.http): o import de `runtime.record_warning` é tardio (dentro de
+# função) de propósito, seguindo a mesma convenção já usada em runtime.py para
+# quebrar ciclos em tempo de execução (ver "avoids a runtime<->http/logs import
+# cycle" nesse arquivo); o pylint só permite suprimir R0401 no módulo (a
+# mensagem é reportada uma vez por todo o projeto, não por linha).
+
 import os
 from pathlib import Path
+
+from . import labels
+from ._paths import strict_exists, strict_is_dir, strict_is_file
+from .errors import EnvReadError, UsageError
 
 # Folga de ponto flutuante ao comparar um intervalo com o teto de prévia. `16.1 - 6.1`
 # dá 10.000000000000002 em binário: sem a folga, o `--end` que o próprio `inspect`
@@ -17,6 +30,9 @@ KEYS = {
     "GB_HOME",
     # `off` desliga leitura e escrita da biblioteca global.
     "GB_LIBRARY",
+    # Lista de ids de plugin separados por vírgula: só filtra os habilitados com
+    # pin válido em plugins.json (nunca carrega sem pin). `off` desliga todos.
+    "GB_PLUGINS",
     "PEXELS_API_KEY",
     "PIXABAY_API_KEY",
     "YOUTUBE_API_KEY",
@@ -31,6 +47,9 @@ KEYS = {
     "GB_STATIC_FRAMES",
     "GB_YTDLP_PATH",
     "GB_VENV_PATH",
+    # Pasta com `.venv/` (yt-dlp) e `.tools/` (Playwright); padrão
+    # `$GB_HOME/runtime/<versão das dependências>/`, e o checkout usa os da própria pasta.
+    "GB_RUNTIME_DIR",
     "GB_FFMPEG_PATH",
     "GB_FFPROBE_PATH",
     # Fonte TrueType para rotular o contact sheet (CLI e helpers Bash de YouTube).
@@ -52,7 +71,18 @@ KEYS = {
     "GB_LOG_LEVEL",
     # `1` espelha as linhas do getbrolls.log em stderr, antes do envelope JSON.
     "GB_LOG_STDERR",
+    # `json` força a saída de máquina; hoje toda saída já é JSON, e outro valor não muda nada.
+    "GB_OUTPUT",
 }
+
+# Só do ambiente do processo; nunca num .env. `GB_PROFILE` (caminho do getbrolls.toml ou
+# `off`) e `GB_PROFILE_SHA256` (o sha que o processo pai conferiu) passam o perfil já
+# ativado aos filhos: vindos de um .env, forjariam a confiança no perfil.
+PROCESS_ONLY_KEYS = frozenset({"GB_ENV_FILE", "GB_PROFILE", "GB_PROFILE_SHA256"})
+
+# Sufixos que marcam uma variável como segredo: nenhuma delas tem por que alcançar um
+# processo filho que nunca fala com um provedor.
+SECRET_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET")
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
@@ -65,11 +95,208 @@ TOOL_PATH_KEYS = {
 PATH_KEYS = (*TOOL_PATH_KEYS.values(), "GB_VENV_PATH")
 
 
-def load_env(path):
-    path = Path(path)
-    if not path.is_file():
-        return
-    for number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+# Um plugin só pode receber do `.env` variáveis do próprio espaço de nomes,
+# `<ID_EM_MAIÚSCULAS>_...` (ex.: `BANCO_HTTP_TOKEN` do plugin `banco_http`), nunca uma do
+# core (`KEYS`, `GB_*`). E essas variáveis NUNCA vão para `os.environ`: ficam num mapa do
+# core (`_PLUGIN_ENV`) que só `api.env` do plugin dono lê, por `plugin_env_value`. Subprocessos (ffmpeg, yt-dlp,
+# git, playwright), OpenSSL e o `ssl` do Python não enxergam valor de `.env` de plugin —
+# o que tira do caminho toda a classe `GIT_SSH_COMMAND`/`XDG_CONFIG_HOME`/`OPENSSL_CONF`,
+# não só uma lista de nomes.
+_PLUGIN_ENV: dict[str, tuple[str, str]] = {}
+
+# Variáveis que ferramentas do sistema leem. Não são mais recusadas (o valor nunca chega
+# ao ambiente); só geram aviso na prévia de enable/install/check e ao ler o `.env`.
+TOOLCHAIN_ENV_PREFIXES = (
+    "LD_",
+    "DYLD_",
+    "GIT_",
+    "PYTHON",
+    "NODE_",
+    "NPM_",
+    "PIP_",
+    "HTTP_",
+    "HTTPS_",
+    "SSL_",
+    "SSH_",
+    "GPG_",
+    "JAVA_",
+    "CURL_",
+    "REQUESTS_",
+    "PERL",
+    "RUBY",
+    "BASH_",
+    "ZSH",
+    "LUA_",
+    "GEM_",
+    "BUNDLE_",
+    "CARGO_",
+    "RUSTUP_",
+    "DOCKER_",
+    "FFMPEG_",
+    "YTDLP_",
+    "YT_DLP_",
+    "OPENSSL_",
+    "XDG_",
+    "PLAYWRIGHT_",
+    "DENO_",
+    "FONTCONFIG_",
+)
+TOOLCHAIN_ENV_KEYS = frozenset(
+    {
+        "ENV",
+        "BASH_ENV",
+        "SSLKEYLOGFILE",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "FTP_PROXY",
+        "FFREPORT",
+        "PATH",
+        "HOME",
+        "SHELL",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "IFS",
+        "PS4",
+        "EDITOR",
+        "VISUAL",
+        "PAGER",
+        "BROWSER",
+    }
+)
+
+
+def core_env_key(key):
+    """Variável reconhecida pelo core (`GB_*` ou listada em `KEYS`)."""
+    return key in KEYS or key.startswith("GB_")
+
+
+def toolchain_env_key(key):
+    """Variável que uma ferramenta do sistema lê (`GIT_SSH_COMMAND`, `XDG_CONFIG_HOME`,
+    `OPENSSL_CONF`, `HTTPS_PROXY`...). Só gera aviso: vinda do `.env` de um plugin ela
+    nunca chega ao ambiente, então não muda o comportamento de ferramenta nenhuma."""
+    return key in TOOLCHAIN_ENV_KEYS or key.startswith(TOOLCHAIN_ENV_PREFIXES)
+
+
+def plugin_env_value(plugin_id, key):
+    """Valor que o `.env` guardou para `key`, só se `plugin_id` for o dono; senão `None`."""
+    owner, value = _PLUGIN_ENV.get(key, (None, None))
+    return value if owner == plugin_id else None
+
+
+def env_is_set(key, owner=None):
+    """A variável da fonte tem valor? Para `doctor`/`providers`/BRIEF dizerem se uma
+    fonte está configurada. Vale o ambiente do processo; o `.env` de plugin só conta
+    quando `owner` (o dono da fonte que declara `key`) é o mesmo plugin dono do valor
+    — um plugin que declara como `env_key` uma variável do espaço de nomes de outro
+    não aparece "configurado" com o segredo alheio."""
+    return bool(os.environ.get(key)) or (owner is not None and bool(plugin_env_value(owner, key)))
+
+
+def env_namespace_owner(key, plugin_ids):
+    """Id do plugin cujo prefixo `<ID>_` contém `key` (o mais longo vence), ou `None`."""
+    owner = None
+    for plugin_id in plugin_ids:
+        if key.startswith(plugin_id.upper() + "_") and (owner is None or len(plugin_id) > len(owner)):
+            owner = plugin_id
+    return owner
+
+
+def installed_env():
+    """`{id: [nomes de permissions.env]}` dos plugins em `plugins/`, só pelo manifesto."""
+    from .sdk import loader
+    from .sdk.manifest import read_manifest
+
+    try:
+        # lenient: inside try/except OSError, which 3.11 also reaches: no plugin env keys
+        folders = [p for p in loader.plugins_root().iterdir() if p.is_dir() and not p.name.startswith((".", "_"))]
+    except OSError:
+        return {}
+    installed = {}
+    for folder in folders:
+        try:
+            manifest = read_manifest(folder)
+        except (ValueError, OSError):
+            continue
+        installed[manifest["id"]] = list(manifest["permissions"]["env"])
+    return installed
+
+
+def plugin_env_owners():
+    """`{variável: id do plugin}` que o `.env` aceita para plugins instalados: só as do
+    espaço de nomes do próprio plugin, nunca uma variável do core."""
+    installed = installed_env()
+    return {
+        key: plugin_id
+        for plugin_id, keys in installed.items()
+        for key in keys
+        if not core_env_key(key) and env_namespace_owner(key, installed) == plugin_id
+    }
+
+
+def plugin_env_keys():
+    """Nomes de `permissions.env` dos plugins instalados que o `.env` aceita."""
+    return frozenset(plugin_env_owners())
+
+
+def _refused_plugin_key(number, key, installed):
+    """Mensagem para uma chave do `.env` que nenhum plugin pode receber, ou `None`."""
+    declared_by = sorted(plugin_id for plugin_id, keys in installed.items() if key in keys)
+    if declared_by:
+        prefix = declared_by[0].upper() + "_"
+        return (
+            f".env: a variável {key} (linha {number}) é pedida pelo plugin {declared_by[0]}, mas o .env só "
+            f"entrega a um plugin variáveis do espaço de nomes dele ({prefix}...), nunca uma do core ou de "
+            "outro plugin. Tire a linha do .env; se o plugin precisa dela, defina-a no ambiente do processo."
+        )
+    from .sdk import loader
+
+    try:
+        state = loader.read_state()
+    except (ValueError, OSError):
+        return None
+    known = set(state.get("enabled", {})) | set(state.get("last_pins", {})) | set(state.get("sources", {}))
+    owner = env_namespace_owner(key, known - set(installed))
+    if owner is None:
+        return None
+    return (
+        f".env: a variável {key} (linha {number}) é do plugin {owner}, que não está mais em plugins/. "
+        f"Tire a linha do .env, ou reinstale o plugin {owner}."
+    )
+
+
+def _typed_env(source, path):
+    """O `.env` como a pessoa o escreveu (`--env-file`, `GB_ENV_FILE`), ou `None` quando foi o getbrolls que o achou."""
+    if source == "GB_ENV_FILE":
+        return os.environ.get("GB_ENV_FILE") or str(path)
+    return str(path) if source == "flag" else None
+
+
+def _env_shown(path, typed):
+    return typed if typed is not None else labels.shown(path)
+
+
+def _read_env_text(path, typed=None):
+    """Texto do `.env` em UTF-8, com ou sem BOM (o "UTF-8 com BOM" do Bloco de Notas).
+
+    Outra codificação (UTF-16, cp1252 com acento) é erro de uso em português, com o motivo
+    `env_encoding`, em vez do erro de codec do Python. O arquivo que existe mas não abre é
+    `EnvReadError`, com o caminho dele."""
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        error = EnvReadError(exc.errno, exc.strerror, str(path))
+        error.shown = _env_shown(path, typed)  # a mensagem do IO_ERROR nomeia o arquivo assim
+        raise error from None
+    except UnicodeDecodeError:
+        raise UsageError(
+            f".env: {_env_shown(path, typed)} não está em UTF-8. Salve o arquivo como UTF-8 e repita.",
+            reason="env_encoding",
+        ) from None
+
+
+def _parse_env(path, typed=None):
+    for number, raw_line in enumerate(_read_env_text(path, typed).splitlines(), 1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -78,15 +305,196 @@ def load_env(path):
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip()
-        if key not in KEYS:
-            raise ValueError(
-                f".env: variável desconhecida na linha {number}: {key}. Aceitas: " + ", ".join(sorted(KEYS)) + "."
-            )
         if value[:1] in ('"', "'"):
             if len(value) < 2 or value[-1] != value[0]:  # noqa: PLR2004 - a pair of quotes: opening + closing
                 raise ValueError(f".env: aspas inválidas na linha {number}.")
             value = value[1:-1]
-        os.environ.setdefault(key, value)
+        yield number, key, value
+
+
+_CACHE_DIR_DEPRECATED = (
+    "GETBROLLS_CACHE_DIR ainda vale, mas deixa de ser lido na 2.7. Defina GB_CACHE_DIR no lugar dela."
+)
+
+
+def cache_dir_alias_in_use():
+    """`GETBROLLS_CACHE_DIR` é quem decide a pasta do cache (`GB_CACHE_DIR` ausente ou vazia)."""
+    return not os.environ.get("GB_CACHE_DIR") and bool(os.environ.get("GETBROLLS_CACHE_DIR"))
+
+
+# Chave do core → valor que um `.env` pôs no ambiente deste processo (nunca o que já estava lá).
+_ENV_APPLIED: dict[str, str] = {}
+
+_ENV_SHADOWED = (
+    "Há dois .env: usei o da pasta da instalação e ignorei o de $GB_HOME (os dois nunca se misturam). "
+    "Deixe só um; veja install.env_file no doctor."
+)
+_GB_HOME_IN_ENV_DEPRECATED = (
+    "GB_HOME definido num .env ainda vale, mas deixa de ser lido na 2.7. "
+    "Defina GB_HOME no ambiente do processo e tire a linha do .env."
+)
+
+
+# `.env` cuja linha GB_HOME perdeu para o `home` do perfil (aviso `ENV_GB_HOME_IGNORED`).
+_HOME_IGNORED: list[str] = []
+_GB_HOME_IGNORED = (
+    "GB_HOME do .env ({path}) foi ignorado: o `home` do perfil getbrolls.toml confiável vale para a pasta "
+    "pessoal, porque é ele que decide qual .env é lido. Tire a linha do .env ou o `home` do perfil."
+)
+
+
+def _home_from_profile(value):
+    """O `GB_HOME` em vigor veio do `home` do perfil e o `.env` pede outro?"""
+    from . import _paths  # tardio: o `_paths` importa este módulo dentro de funções
+
+    return _paths.from_profile("GB_HOME") and os.environ.get("GB_HOME") != value
+
+
+def _note_home_ignored(entries, path, typed=None):
+    """Guarda o `.env` cuja linha `GB_HOME` vai perder para o `home` do perfil (antes de exportar nada)."""
+    _HOME_IGNORED.clear()
+    if any(key == "GB_HOME" and _home_from_profile(value) for _number, key, value in entries):
+        _HOME_IGNORED.append(_env_shown(path, typed))
+
+
+def _is_home_env(path, gb_home_value):
+    """O arquivo é o `.env` da pasta pessoal: a atual ou a que a própria linha `GB_HOME` apontaria.
+
+    Compara caminhos resolvidos, não a rota que trouxe o arquivo: `$GB_HOME/.env` lido por
+    `GB_ENV_FILE` ou `--env-file` continua sendo o `.env` de `$GB_HOME`.
+    """
+    from . import _paths  # tardio: o `_paths` importa este módulo dentro de funções
+
+    target = Path(path).resolve()
+    homes = (_paths.gb_home(), Path(gb_home_value).expanduser()) if gb_home_value else (_paths.gb_home(),)
+    return any(target == (home / ".env").resolve() for home in homes)
+
+
+def _refuse_env_entries(entries, source, path=None):
+    """Recusa, antes de exportar qualquer coisa, chaves que um `.env` não pode definir."""
+    for number, key, value in entries:
+        if key in PROCESS_ONLY_KEYS:
+            raise UsageError(
+                f".env: {key} (linha {number}) só vale no ambiente do processo; tire a linha do .env.",
+                reason="env_process_only_key",
+            )
+        if key == "GB_HOME" and (source == "gb_home" or (path is not None and _is_home_env(path, value))):
+            raise UsageError(
+                f".env de $GB_HOME: GB_HOME (linha {number}) não pode ser definido aqui; a pasta pessoal vem "
+                "do ambiente do processo ou do padrão ~/.getbrolls. Tire a linha.",
+                reason="env_gb_home",
+            )
+
+
+def load_env(path, *, source=None):
+    """Lê o `.env`: chaves do core (`KEYS`) vão para o ambiente do processo, como
+    sempre; as de `permissions.env` de plugins instalados ficam só em `_PLUGIN_ENV`,
+    lidas por `api.env` do plugin dono, nunca exportadas. As do core entram primeiro —
+    `GB_HOME` no próprio `.env` decide em qual `plugins/` procurar os manifestos
+    (menos no `.env` de `$GB_HOME`, onde ele é recusado: `source == "gb_home"`).
+    Chave que ninguém declara é erro. Devolve as chaves do core que valeram deste arquivo
+    (as que o ambiente do processo já tinha ficam de fora: o processo vence)."""
+    _PLUGIN_ENV.clear()
+    path = Path(path)
+    if not strict_is_file(path):
+        return frozenset()
+    typed = _typed_env(source, path)
+    entries = list(_parse_env(path, typed))
+    _refuse_env_entries(entries, source, path)
+    applied = set()
+    _note_home_ignored(entries, path, typed)
+    for _number, key, value in entries:
+        if key not in KEYS:
+            continue
+        if key not in os.environ:
+            os.environ[key] = value
+            _ENV_APPLIED[key] = value
+        # Uma leitura anterior deste `.env` (a antecipada do `main`) já pode ter posto o valor.
+        if _ENV_APPLIED.get(key) == os.environ.get(key) == value:
+            applied.add(key)
+    core_keys = frozenset(applied)
+    unknown = [entry for entry in entries if entry[1] not in KEYS]
+    if not unknown:
+        return core_keys
+    owners = plugin_env_owners()
+    for number, key, value in unknown:
+        if key not in owners:
+            raise ValueError(
+                _refused_plugin_key(number, key, installed_env())
+                or f".env: variável desconhecida na linha {number}: {key}. Aceitas: "
+                + ", ".join(sorted(KEYS))
+                + "."
+                + _old_name_hint(key)
+            )
+        _PLUGIN_ENV.setdefault(key, (owners[key], value))
+        if toolchain_env_key(key):
+            from .runtime import record_warning
+
+            record_warning(
+                "PLUGIN_ENV_TOOLCHAIN",
+                f".env: {key} (linha {number}) é do plugin {owners[key]} e tem nome de variável que ferramentas "
+                "do sistema leem; ela chega só ao plugin, por api.env, nunca ao ambiente dos subprocessos.",
+            )
+    return core_keys
+
+
+def _old_name_hint(key):
+    """ " Use `GB_X`." quando a chave é o `GETBROLLS_X` da versão de testes da 2.6 e `GB_X` existe."""
+    prefix = "GETBROLLS_"
+    if key.startswith(prefix) and "GB_" + key[len(prefix) :] in KEYS:
+        return f" Use `GB_{key[len(prefix) :]}`."
+    return ""
+
+
+_OUTPUT_IGNORED = "GB_OUTPUT só aceita `json`; o valor dado é ignorado e a saída continua JSON."
+
+
+def load_env_choice(choice, *, warn):
+    """Carrega o `.env` escolhido por `_paths.env_file()`; com `warn`, registra os avisos.
+
+    A origem do `.env` não vira aviso em todo comando: ela fica em `install.env_file`
+    do `doctor`. Só dois `.env` ao mesmo tempo (um deles ignorado) e `GB_HOME` num
+    `.env` fora de `$GB_HOME` (compatível até a 2.7) avisam."""
+    if choice.path is None:
+        _PLUGIN_ENV.clear()
+        return
+    core_keys = load_env(choice.path, source=choice.source)
+    if not warn:
+        return
+    from .runtime import record_warning
+
+    if choice.ignored:
+        record_warning("ENV_FILE_SHADOWED", _ENV_SHADOWED)
+    if "GB_HOME" in core_keys:
+        record_warning("DEPRECATED", _GB_HOME_IN_ENV_DEPRECATED)
+    for ignored in _HOME_IGNORED:
+        record_warning("ENV_GB_HOME_IGNORED", _GB_HOME_IGNORED.format(path=ignored))
+
+
+def load_environment(args, *, warn):
+    """Perfil e `.env` na ordem do contrato: `home` do perfil → escolha do `.env` → `.env` → resto do perfil.
+
+    O `home` do perfil decide qual `$GB_HOME/.env` é lido; o `.env` vence o resto do
+    perfil. Devolve a escolha do `.env` (`_paths.EnvChoice`). Perfil não confiável ou
+    inválido num comando estrito é `UsageError`; `requires` que não bate,
+    `PrerequisiteError` (ver `profile.activate`).
+    """
+    from . import _paths, profile  # tardio: o `profile` importa o `sdk`, que importa este módulo
+
+    active = profile.activate(args)
+    profile.check_home_files()
+    choice = _paths.env_file(getattr(args, "env_file", None))
+    load_env_choice(choice, warn=warn)
+    profile.finish(active)
+    if warn and cache_dir_alias_in_use():
+        from .runtime import record_warning
+
+        record_warning("DEPRECATED", _CACHE_DIR_DEPRECATED)
+    if warn and os.environ.get("GB_OUTPUT", "").strip() not in ("", "json"):
+        from .runtime import record_warning
+
+        record_warning("ENV_VALUE_IGNORED", _OUTPUT_IGNORED)
+    return choice
 
 
 def _pinned(key):
@@ -101,8 +509,8 @@ def executable_override(key):
         return None
     # Absoluto antes de validar: o pin não pode depender da pasta atual.
     path = Path(value).expanduser().resolve()
-    if not path.is_file():
-        detail = "não é um arquivo executável" if path.exists() else "não existe"
+    if not strict_is_file(path):
+        detail = "não é um arquivo executável" if strict_exists(path) else "não existe"
         raise ValueError(f"{key}: {value} {detail}. Aponte para o executável correto ou remova a variável.")
     # No Windows a executabilidade vem da extensão; os.access(X_OK) aceita qualquer legível.
     if os.name != "nt" and not os.access(path, os.X_OK):
@@ -116,7 +524,7 @@ def venv_override():
     if value is None:
         return None
     path = Path(value).expanduser().resolve()
-    if not path.is_dir():
+    if not strict_is_dir(path):
         raise ValueError(
             f"GB_VENV_PATH: {value} não é um diretório existente. Aponte para a pasta .venv ou remova a variável."
         )
@@ -172,10 +580,18 @@ def log_stderr():
     return (os.getenv("GB_LOG_STDERR") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _setting(key, default):
+    """Valor de uma configuração de prévia; vazia (ou só espaços) vale o padrão.
+
+    `GB_GIF_WIDTH=` num `.env` é "não definida", como já era para `GB_LOG_LEVEL` e
+    `GB_CACHE_DIR`: nunca um erro que derruba todo comando."""
+    return (os.getenv(key) or "").strip() or default
+
+
 def settings():
     def integer(key, default, lo, hi):
         try:
-            value = int(os.getenv(key, str(default)))
+            value = int(_setting(key, str(default)))
         except ValueError:
             raise ValueError(key + ": use um inteiro.") from None
         if not lo <= value <= hi:
@@ -187,10 +603,10 @@ def settings():
     # logging setup itself (logs.configure()) re-reads it independently and
     # never raises — see logs.py for why.
     log_level()
-    mode = os.getenv("GB_PREVIEW_MODE", "gif")
+    mode = _setting("GB_PREVIEW_MODE", "gif")
     if mode not in ("gif", "static"):
         raise ValueError("GB_PREVIEW_MODE: use gif ou static.")
-    scope = os.getenv("GB_GIF_SCOPE", "broll")
+    scope = _setting("GB_GIF_SCOPE", "broll")
     if scope not in ("broll", "full"):
         raise ValueError("GB_GIF_SCOPE: use broll ou full.")
     return {

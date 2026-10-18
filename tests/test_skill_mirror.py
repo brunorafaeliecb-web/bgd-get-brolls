@@ -18,9 +18,15 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
+import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _paths import ROOT
 
+# isort: split
+# `_paths` acima põe `scripts/` em sys.path; só depois dele o gerador importa.
+import gen_skill_mirror
+
 from getbrolls import __version__
+from getbrolls.cli import SUMMARIES
 
 ROOT_SKILL = ROOT / "SKILL.md"
 MIRROR_SKILL = ROOT / "skills" / "get-brolls" / "SKILL.md"
@@ -30,7 +36,7 @@ MAX_WORDS = 900
 MAX_WORDS_PER_PARAGRAPH = 80
 
 # Comandos de instalação não têm lugar no SKILL.md: quem instala é
-# `/get-brolls-setup`, e o arquivo mais lido não gasta linha com isso.
+# `/getbrolls:get-brolls-setup`, e o arquivo mais lido não gasta linha com isso.
 INSTALL_MARKERS = (
     "install.sh",
     "install.ps1",
@@ -71,6 +77,7 @@ class SkillMirrorTests(unittest.TestCase):
             cwd=ROOT,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=False,
         )
         self.assertEqual(
@@ -83,7 +90,6 @@ class SkillMirrorTests(unittest.TestCase):
         """`--check` detecta divergência: aponta o gerador para uma cópia
         editada à mão do espelho, fora do repositório, e nunca escreve no
         `skills/get-brolls/SKILL.md` versionado."""
-        import gen_skill_mirror
 
         with tempfile.TemporaryDirectory() as tmp:
             tampered = Path(tmp) / "SKILL.md"
@@ -110,7 +116,6 @@ class SkillMirrorTests(unittest.TestCase):
         mas não exista de verdade (nem arquivo, nem pasta) é um caminho quebrado
         no `SKILL.md` da raiz: precisa falhar alto, em `--check` e na escrita,
         não ficar sem prefixo em silêncio."""
-        import gen_skill_mirror
 
         broken_ref = "scripts/does-not-exist-getbrolls.py"
         frontmatter_text, existing_body = gen_skill_mirror.split_frontmatter(ROOT_SKILL.read_text(encoding="utf-8"))
@@ -202,7 +207,7 @@ class SkillBudgetTests(unittest.TestCase):
                 self.assertNotIn(
                     marker,
                     text,
-                    f"{path.name} traz comando de instalação ({marker}); isso é do /get-brolls-setup",
+                    f"{path.name} traz comando de instalação ({marker}); isso é do /getbrolls:get-brolls-setup",
                 )
 
     def test_the_three_guards_are_present(self):
@@ -211,7 +216,7 @@ class SkillBudgetTests(unittest.TestCase):
         self.assertIn("Stock só sob pedido", text)
         self.assertIn("Parada obrigatória na revisão", text)
         self.assertIn("import-review", text)
-        self.assertIn('approve --candidate <ID> --by NOME --channel chat --statement "frase"', text)
+        self.assertIn('approve --candidate ID --by NOME --channel chat --statement "frase"', text)
         self.assertIn("Silêncio não é aprovação", text)
 
     def test_path_and_platform_conventions_survive(self):
@@ -228,8 +233,8 @@ class SkillBudgetTests(unittest.TestCase):
         # anunciada, não o caminho padrão.
         for form in (
             (
-                'approve --candidate ID1 --candidate ID2 … --by NOME --channel chat --statement "frase exata" '
-                "--project <projeto>"
+                'approve --candidate ID1 --candidate ID2 --by NOME --channel chat --statement "frase exata" '
+                "--project PROJETO"
             ),
             "use `--all` só quando todos os candidatos com prévia foram mostrados",
         ):
@@ -252,7 +257,6 @@ class SkillCommandsExistTests(unittest.TestCase):
     """Todo subcomando citado no SKILL.md existe de verdade na CLI."""
 
     def test_every_mentioned_subcommand_is_registered(self):
-        from getbrolls.cli import SUMMARIES
 
         mentioned = set(re.findall(r"gb\.py\" ([a-z\-]+)", body(ROOT_SKILL)))
         self.assertTrue(mentioned, "SKILL.md não cita nenhum subcomando")

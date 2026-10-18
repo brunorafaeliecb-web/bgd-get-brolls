@@ -1,6 +1,13 @@
 """Existing workflow command handlers; CLI parsing and reporting live separately."""
 
+# pylint: disable=too-many-lines,fixme,cyclic-import
+# `cyclic-import`: `_execute_toolchain` importa `cli.build_parser` e `capabilities` de forma tardia (só roda
+# com tudo carregado); o pylint só permite suprimir R0401 no módulo.
+# Legado: módulo já ultrapassava 1000 linhas antes da 2.6.0; `fixme` é o comentário
+# "Todo executável..." pré-existente (não é um TODO de verdade, é o nome da variável).
+
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -10,13 +17,25 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__, logs
+from . import __version__, _paths, effects, labels, layout, logs
+from .acquisition import candidate_arg
 from .config import CAP_EPSILON
+from .errors import DataRootError, PrerequisiteError
 from .guidance import blocked_beats_question, next_action
-from .ledger import Ledger, digest
+from .ledger import Ledger, atomic_write, digest
 from .media import cut, probe, run
-from .models import approve, candidate, empty_output, id_stem, now, require_fetch, set_segment, signature
-from .presets import PERMIT_PRESETS
+from .models import (
+    approve,
+    candidate,
+    empty_output,
+    id_stem,
+    now,
+    pending_approval,
+    require_fetch,
+    set_segment,
+    signature,
+)
+from .presets import PERMIT_PRESETS  # noqa: F401 -- tests importam daqui; pylint: disable=unused-import
 from .queue import execute as queue_execute
 from .queue import hint as queue_hint
 from .queue import summary_line as queue_summary_line
@@ -26,8 +45,9 @@ from .runtime import record_warning
 _log = logs.get("commands")
 
 # Raiz real da skill/plugin: o comando sugerido não pode depender da pasta atual.
-SKILL_ROOT = Path(__file__).resolve().parents[2]
-INSTALLER = f'bash "{SKILL_ROOT / "scripts" / "install.sh"}" (ou "{SKILL_ROOT / "scripts" / "install.ps1"}" no Windows)'
+INSTALLER = _paths.installer_hint()
+# O que fazer quando os arquivos de dados existem mas não abrem: nenhum reinstalar resolve.
+DATA_PERMISSION_FIX = "Confira as permissões da pasta de dados do getbrolls (`install.data_root`) e repita."
 SYSTEM_TOOLS = "instale pelo gerenciador do sistema; veja docs/GUIDE.md#instalação"
 
 # Executável obrigatório → (comando que resolve, impacto real da ausência).
@@ -80,21 +100,69 @@ def doctor_resolved(overrides):
 
     resolved = {}
     for name in PROBED_EXECUTABLES:
-        found = overrides.get(TOOL_PATH_KEYS.get(name) or "") or shutil.which(name)
-        if not found and name == "yt-dlp":
-            from .social import local_ytdlp
+        if name == "yt-dlp":
+            # O que `social.command()` usaria (pin, venv, PATH), nunca o PATH na frente da venv.
+            from .social import ytdlp_in_use
 
             try:
-                found = local_ytdlp()
+                found = ytdlp_in_use()[0]
             except ValueError:
                 found = None
+            resolved[name] = str(Path(found).resolve()) if found else None
+            continue
+        found = overrides.get(TOOL_PATH_KEYS.get(name) or "") or shutil.which(name)
         if not found and name == "playwright-cli":
             found = _local_playwright()
         resolved[name] = str(Path(found).resolve()) if found else None
     return resolved
 
 
-def doctor_summary(executables, pins=()):
+def data_fix():
+    """Como repor os arquivos de dados: o instalador no checkout, reinstalar no pacote."""
+    return _paths.installer_hint() if _paths.origin() == "checkout" else _paths.REINSTALL_COMMAND
+
+
+def data_problems():
+    """(faltam, sem permissão de leitura) dos arquivos de dados; todos faltam sem a pasta."""
+    try:
+        return _paths.data_inventory()
+    except DataRootError:
+        return list(_paths.REQUIRED_DATA), []
+
+
+def data_problem_notes(missing, unreadable):
+    """As frases do `doctor` e do `setup --check` para os dados: o que falta e o que não abre."""
+    notes = ["Faltam: " + ", ".join(missing)] if missing else []
+    return notes + (["Sem permissão de leitura: " + ", ".join(unreadable)] if unreadable else [])
+
+
+def readiness_probe():
+    """A sondagem que decide o `ready` do `doctor` e do `setup --check`: pins, engine social
+    e a presença de cada executável sondado, pela mesma regra nos dois."""
+    from .social import doctor as social_doctor
+
+    # Pin inválido vira item de `missing`, não morte do diagnóstico.
+    overrides, pin_problems = doctor_overrides()
+    try:
+        social = social_doctor()
+    except ValueError as exc:
+        social = {"engine": "yt-dlp", "installed": False, "error": str(exc)}
+    _judge_ytdlp(social)
+    return overrides, pin_problems, social, _doctor_executables(overrides, social)
+
+
+def _judge_ytdlp(social):
+    """O yt-dlp em uso só conta se funciona: a venv dele importa o `yt_dlp` e, sem venv
+    em uso, nenhuma venv gerenciada ficou pela metade (`bootstrap.ytdlp_problem`)."""
+    from . import bootstrap  # tardio: o `bootstrap` importa este módulo
+
+    problem = bootstrap.ytdlp_problem(social.get("source"), social.get("executable"))
+    if problem:
+        social["installed"] = False
+        social["problem"] = problem
+
+
+def doctor_summary(executables, pins=(), data_missing=(), data_unreadable=()):
     """Veredito humano do doctor: o que funciona, o que falta e o que é opcional."""
     ok = sorted(name for name, present in executables.items() if present)
     missing = [
@@ -103,11 +171,36 @@ def doctor_summary(executables, pins=()):
         if not executables.get(name)
     ]
     missing += list(pins)
+    # Um `item` por linha: o arquivo que falta e o que não abre têm conserto diferente.
+    rows = {
+        "Faltam": ("dados da instalação", data_fix()),
+        "Sem permissão de leitura": ("dados da instalação (sem permissão)", DATA_PERMISSION_FIX),
+    }
+    for note in data_problem_notes(data_missing, data_unreadable):
+        item, fix = rows[note.partition(":")[0]]
+        missing.append({"item": item, "fix": fix, "note": note})
     optional = [
         {"item": name, "note": note} for name, note in sorted(OPTIONAL_EXECUTABLES.items()) if not executables.get(name)
     ]
     optional += [{"item": key, "note": note} for key, note in sorted(OPTIONAL_KEYS.items()) if not os.environ.get(key)]
     return {"ok": ok, "missing": missing, "optional": optional}
+
+
+PLUGIN_PROBLEM_STATUSES = ("failed", "suspended", "invalid", "incompatible")
+
+
+def doctor_plugin_problems(rows):
+    """Uma linha para o `summary` quando algum plugin não carregou: quem lê
+    só o veredito vê a falha sem abrir `plugins[]`. `None` quando está tudo certo."""
+    broken = [row for row in rows if row.get("status") in PLUGIN_PROBLEM_STATUSES]
+    if not broken:
+        return None
+    names = ", ".join(f"{row['id']} ({row['status']})" for row in broken)
+    label = "plugin com problema" if len(broken) == 1 else "plugins com problema"
+    return (
+        f"{len(broken)} {label}: {names}. O motivo de cada um está em plugins[] deste doctor; "
+        "conserte a pasta do plugin (ou reinstale) e habilite de novo com plugins --action enable."
+    )
 
 
 def doctor_contact_sheet(ffmpeg_present):
@@ -182,6 +275,9 @@ EMPTY_STORYBOARD = (
 # Comandos que só consultam o projeto: `inspect` grava no máximo `media.duration_s`
 # e `references` não grava nada — nenhum dos dois muda formato nem aprovação.
 READ_ONLY_CONSULTS = ("references", "inspect")
+# Comandos com `--dry-run`: o ensaio não grava nada, nem pelo portão de formato
+# (`sync_formats`) nem pela recuperação de uma gravação interrompida.
+DRY_RUN_COMMANDS = ("deliver", "search")
 # Nomes de uma palavra que não identificam ninguém. "teste" fica de fora de propósito:
 # as evals assinam como "Ana Teste", que é nome + sobrenome e passa na regra de duas
 # palavras. A lista só morde quando a palavra vem sozinha.
@@ -273,7 +369,7 @@ FLOW_SUMMARIES = {
     "resolve": lambda r: f"Registrei o candidato {_identifier(r)}: estado {r.get('state')}.",
     "preview": lambda r: (
         f"Gerei somente a referência estática de {_identifier(r)}: "
-        f"estado {r.get('state')}, aprovação {(r.get('approval') or {}).get('status')}."
+        f"estado {r.get('state')}, aprovação {(r.get('approval') or {}).get('status')}." + _plugin_reference_note(r)
         if r.get("state") == "reference_only"
         else f"Gerei a prévia de {_identifier(r)}: "
         f"estado {r.get('state')}, aprovação {(r.get('approval') or {}).get('status')}."
@@ -291,7 +387,7 @@ FLOW_SUMMARIES = {
         if isinstance(r.get("rejected"), list)
         else f"Rejeitei {_identifier(r)}: estado {r.get('state')}" + _rejection_note(r)
     ),
-    "review": lambda r: f"Gerei o Storyboard em {r.get('review')}.",
+    "review": lambda r: f"Gerei o Storyboard em {labels.shown(r.get('review'))}.",
     "import-review": lambda r: (
         f"Importei {_count(r.get('imported') or 0, 'decisão', 'decisões')} assinada(s) por {r.get('by')}."
     ),
@@ -322,40 +418,49 @@ def with_summary(command, result):
 
 
 # Escada do fluxo: a primeira condição verdadeira nomeia o próximo passo real.
-STATUS_LADDER = (
-    (
-        lambda c: not c["candidates"],
-        "Nenhum candidato ainda: registre fontes com search ou resolve.",
-    ),
-    (
-        lambda c: c["pending_preview"] > 0,
-        "Gere prévias com preview para os candidatos ainda sem quadro.",
-    ),
-    (
-        lambda c: not c["approved"],
-        (
-            "Peça a decisão humana: pelo Storyboard (review + import-review) ou pela fala "
-            "no chat (approve --candidate ID --by NOME --channel chat --statement "
-            '"frase"), com os IDs que você mostrou.'
-        ),
-    ),
-    (
-        lambda c: c["permitted"] < c["approved"],
-        "Registre as condições reais de uso com permit nos itens aprovados.",
-    ),
-    (
-        lambda c: c["delivered"] < c["permitted"],
-        "Colete os cortes aprovados e permitidos com fetch.",
-    ),
-    (
-        lambda c: c["verified"] < c["delivered"],
-        "Confira os arquivos coletados com verify.",
-    ),
-    (
-        lambda c: c["undelivered"] > 0,
-        "Organize os trechos conferidos em entrega/ com deliver.",
-    ),
+# Item aprovado segue para permit/fetch/verify/deliver antes de prévia nova: quem
+# sobrou sem quadro é rascunho (ver `guidance.flow_complete`), não trava o aprovado.
+# Texto para o agente de cada degrau: `summary.next` do `status` sai daqui pelo
+# mesmo degrau que `summary.do` (ver `summary_next`).
+SEARCH_NEXT = "Nenhum candidato ainda: registre fontes com search ou resolve."
+PERMIT_NEXT = "Registre as condições reais de uso com permit nos itens aprovados."
+FETCH_NEXT = "Colete os cortes aprovados e permitidos com fetch."
+VERIFY_NEXT = "Confira os arquivos coletados com verify."
+DELIVER_NEXT = "Organize os trechos conferidos em entrega/ com deliver."
+PREVIEW_NEXT = "Gere prévias com preview para os candidatos ainda sem quadro."
+INSPECT_NEXT = (
+    "Analise com inspect a fonte do candidato sem duração conhecida antes de gerar prévias "
+    "para os candidatos ainda sem quadro."
 )
+APPROVE_NEXT = (
+    "Peça a decisão humana: pelo Storyboard (review + import-review) ou pela fala "
+    "no chat (approve --candidate ID --by NOME --channel chat --statement "
+    '"frase"), com os IDs que você mostrou.'
+)
+PENDING_DECISION_NEXT = (
+    "Peça a decisão humana: há prévia esperando alguém decidir, pelo Storyboard "
+    "(review + import-review) ou pela fala no chat (approve --candidate ID --by "
+    'NOME --channel chat --statement "frase").'
+)
+FLOW_COMPLETE_NEXT = "Fluxo completo: os itens aprovados estão coletados, verificados e organizados em entrega/."
+
+STATUS_LADDER = (
+    (lambda c: not c["candidates"], SEARCH_NEXT),
+    (lambda c: c["permitted"] < c["approved"], PERMIT_NEXT),
+    (lambda c: c["approved"] and c["delivered"] < c["permitted"], FETCH_NEXT),
+    (lambda c: c["approved"] and c["verified"] < c["delivered"], VERIFY_NEXT),
+    (lambda c: c["approved"] and c["undelivered"] > 0, DELIVER_NEXT),
+    (lambda c: c["pending_preview"] > 0, PREVIEW_NEXT),
+    (lambda c: not c["approved"], APPROVE_NEXT),
+)
+
+
+def provider_error_text(name, error):
+    """`<fonte>: <erro>`, sem repetir o nome quando o erro de plugin já vem como
+    "Plugin <fonte>: …" ou "Fonte <fonte> é do plugin …" (dava "pasta_local:
+    Plugin pasta_local: …" e "pasta_local: Fonte pasta_local …")."""
+    text = str(error)
+    return text if text.startswith((f"Plugin {name}:", f"Fonte {name} ")) else f"{name}: {text}"
 
 
 def status_next(counts, format_pending=0, pending_preview=None, undelivered=0):
@@ -370,86 +475,214 @@ def status_next(counts, format_pending=0, pending_preview=None, undelivered=0):
         "undelivered": undelivered,
     }
     if format_pending:
-        return (
-            "As regras editoriais mudaram: o próximo comando invalidará "
-            + _count(format_pending, "aprovação", "aprovações")
-            + "; gere prévia e revisão novamente antes de coletar."
-        )
+        return _format_next(format_pending)
     from .guidance import flow_complete, leftover_aside, leftovers
 
     state = {"undelivered": counts["undelivered"]}
     counts = {"pending": 0, "rejected": 0, **counts}
-    complete = "Fluxo completo: os itens aprovados estão coletados, verificados e organizados em entrega/."
     # Mesma ordem de `guidance.next_action`: decisão humana pendente ganha de tudo,
     # inclusive do veredito de fim de fluxo. Só depois dela é que a entrega pronta vira
     # "Fluxo completo", e aí a sobra sem prévia é aparte, não próximo passo.
     if counts.get("pending"):
-        return (
-            "Peça a decisão humana: há prévia esperando alguém decidir, pelo Storyboard "
-            "(review + import-review) ou pela fala no chat (approve --candidate ID --by "
-            'NOME --channel chat --statement "frase").'
-        )
+        return PENDING_DECISION_NEXT
     if flow_complete(state, counts):
-        return complete + leftover_aside(leftovers(state, counts))
+        return FLOW_COMPLETE_NEXT + leftover_aside(leftovers(state, counts))
     for matches, step in STATUS_LADDER:
         if matches(counts):
             return step
-    return complete
+    return FLOW_COMPLETE_NEXT
+
+
+def _format_next(format_pending):
+    return (
+        "As regras editoriais mudaram: o próximo comando invalidará "
+        + _count(format_pending, "aprovação", "aprovações")
+        + "; gere prévia e revisão novamente antes de coletar."
+    )
+
+
+def summary_next(do, state):
+    """`summary.next` do `status`: o texto para o agente do mesmo degrau de `summary.do`.
+
+    `summary.next` vinha de uma escada própria, só de contagens: com um beat do brief
+    sem material, ela dizia "Fluxo completo" enquanto `summary.do` mandava buscar.
+    Degrau sem texto próprio aqui usa o `why` dele.
+    """
+    from .guidance import leftover_aside, leftovers
+
+    step = do.get("step")
+    counts = {"pending": 0, "rejected": 0, **(state.get("counts") or {})}
+    if _reference_only_step(do):
+        return REFERENCE_ONLY_NEXT
+    if step == "format" and state.get("format_pending"):
+        return _format_next(state["format_pending"])
+    if step == "approve":
+        return PENDING_DECISION_NEXT if counts["pending"] else APPROVE_NEXT
+    if step == "done":
+        return FLOW_COMPLETE_NEXT + leftover_aside(leftovers(state, counts))
+    by_step = {
+        "search": SEARCH_NEXT,
+        "inspect": INSPECT_NEXT,
+        "preview": PREVIEW_NEXT,
+        "permit": PERMIT_NEXT,
+        "fetch": FETCH_NEXT,
+        "verify": VERIFY_NEXT,
+        "deliver": DELIVER_NEXT,
+        "roteiro-sync": ROTEIRO_SYNC_NEXT,
+        "roteiro-check": ROTEIRO_CHECK_NEXT,
+    }
+    return by_step.get(step) or do.get("why")
 
 
 def _has_preview(c):
     return any((c.get("preview") or {}).get(key) for key in PREVIEW_ARTIFACTS)
 
 
-def rules_from_flags(template, mode, responsible, declaration, video_format=None):
-    """Reescreve só o bloco ```json do modelo, preservando toda a prosa do arquivo."""
-    blocks = re.findall(r"```json\s*\n(.*?)\n```", template, re.DOTALL)
+def _is_plugin_candidate(c):
+    from .providers import BUILTIN_CAPABILITIES
+
+    return c.get("provider") not in BUILTIN_CAPABILITIES
+
+
+def _plugin_reference_note(c):
+    """Frase extra do resumo de `preview --reference-only` de um candidato de plugin que
+    ficou sem imagem: diz se a fonte não mandou miniatura ou se ela não baixou."""
+    preview = c.get("preview") or {}
+    if not _is_plugin_candidate(c) or preview.get("poster_path"):
+        return ""
+    if preview.get("poster_url"):
+        return (
+            " Sem imagem de referência: a miniatura da fonte (poster_url) não pôde ser baixada agora; "
+            "tente a prévia de novo mais tarde antes de mostrar à pessoa."
+        )
+    return (
+        " Sem imagem de referência: a fonte do plugin não mandou miniatura (poster_url), "
+        "então não há nada para mostrar à pessoa."
+    )
+
+
+def _plugin_nothing_seen(c):
+    """Candidato de plugin sem nada que a pessoa possa ter visto: sem prévia
+    local, sem `poster_url` e sem `embed_url`. Fonte embutida nunca cai aqui."""
+    preview = c.get("preview") or {}
+    return _is_plugin_candidate(c) and not (_has_preview(c) or preview.get("poster_url") or preview.get("embed_url"))
+
+
+def _refuse_blind_plugin_approval(c):
+    if _plugin_nothing_seen(c):
+        raise ValueError(
+            f"Não registrei a aprovação de {c['id']}: a fonte do plugin não deu nada que a pessoa possa ter "
+            "visto (nenhuma prévia local, nenhum poster_url nem embed_url). Sem material para mostrar, esta "
+            "fonte não pode ser aprovada; peça ao autor do plugin uma miniatura (poster_url) ou um embed_url."
+        )
+
+
+def _rules_block(text):
+    """O único bloco ```json de um RULES.md: (texto cru, dados)."""
+    blocks = re.findall(r"```json\s*\n(.*?)\n```", text, re.DOTALL)
     if len(blocks) != 1:
         raise ValueError("Modelo de RULES.md precisa de exatamente um bloco JSON.")
-    data = json.loads(blocks[0])
+    return blocks[0], json.loads(blocks[0])
+
+
+def _missing_copyright(video_format):
+    """Recusa de `init-rules --force` num RULES.md sem `copyright`, com o comando pronto."""
+    shown = f" --format {video_format}" if video_format else ""
+    return (
+        'Este RULES.md não tem o bloco "copyright", e todo RULES.md de projeto precisa dele: '
+        "o do RULES.md global não vale aqui. Nada foi gravado. Escolha o modo junto: "
+        f"`init-rules --force --mode per_item_evidence{shown} --project PROJETO` (você confere "
+        'fonte por fonte) ou `--mode user_declaration --responsible "SEU NOME" --declaration "..."` '
+        "(você assume a responsabilidade)."
+    )
+
+
+def rules_from_flags(  # noqa: PLR0913, PLR0917 - one parameter per init-rules flag, plus the template
+    template, mode, responsible, declaration, video_format=None, model=None
+):  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    """Reescreve só o bloco ```json do modelo, preservando toda a prosa do arquivo.
+
+    `--format` mexe só em `video_format`; `copyright` só muda com `--mode`,
+    `--responsible` ou `--declaration`. Um RULES.md de camada pode não ter
+    `copyright`: com uma dessas flags, ele nasce do bloco de `model` (o modelo da
+    instalação); sem nenhuma, a regravação é recusada, porque `copyright` nunca vem
+    do global e o arquivo continuaria sem carregar.
+    """
+    raw, data = _rules_block(template)
     if video_format is not None:
         # Único campo que `--format` toca: o resto das regras continua do jeito que a
         # pessoa deixou. Era esta a lacuna que fazia o conflito brief×rules travar.
         data["video_format"] = video_format
-    rights = data["copyright"]
-    rights["mode"] = mode or ("user_declaration" if (responsible or declaration) else rights["mode"])
-    if responsible is not None:
-        rights["responsible_person"] = responsible.strip() or None
-    if declaration is not None:
-        rights["declaration"] = declaration.strip() or None
-    if rights["mode"] == "user_declaration" and not (
-        (rights["responsible_person"] or "").strip() and (rights["declaration"] or "").strip()
-    ):
-        raise ValueError("Modo user_declaration exige --responsible NOME e --declaration TEXTO.")
+    if any(value is not None for value in (mode, responsible, declaration)):
+        if not isinstance(data.get("copyright"), dict):
+            data["copyright"] = copy.deepcopy(_rules_block(model if model is not None else template)[1]["copyright"])
+        rights = data["copyright"]
+        rights["mode"] = mode or ("user_declaration" if (responsible or declaration) else rights.get("mode"))
+        if responsible is not None:
+            rights["responsible_person"] = responsible.strip() or None
+        if declaration is not None:
+            rights["declaration"] = declaration.strip() or None
+        if rights["mode"] == "user_declaration" and not (
+            (rights.get("responsible_person") or "").strip() and (rights.get("declaration") or "").strip()
+        ):
+            raise ValueError("Modo user_declaration exige --responsible NOME e --declaration TEXTO.")
+    if not isinstance(data.get("copyright"), dict):
+        raise ValueError(  # noqa: TRY004 - contrato da CLI: dado inválido é ValueError (INVALID_DATA)
+            _missing_copyright(video_format)
+        )
     return (
-        template.replace(blocks[0], json.dumps(data, ensure_ascii=False, indent=2), 1),
-        rights,
+        template.replace(raw, json.dumps(data, ensure_ascii=False, indent=2), 1),
+        data.get("copyright"),
     )
 
 
-def brief_report(args):
-    """Beats do vídeo com defaults aplicados, comando pronto e o que já foi registrado.
+class _BriefContext:
+    # pylint: disable=too-few-public-methods,too-many-arguments,too-many-positional-arguments
+    # pylint: disable=too-many-instance-attributes
+    # Contêiner simples de estado, não um objeto com comportamento.
+    """Estado do BRIEF.md já carregado/validado, compartilhado pelas duas rotas de `brief`."""
 
-    Somente leitura, como `status`: não cria a árvore do projeto nem grava no ledger.
-    """
-    from getbrolls.brief import (
-        beat_commands,
-        beat_progress,
-        brief_path,
-        load_brief,
-        missing_provider_keys,
-        provider_unavailable,
-        provider_warnings,
-        validate_brief,
-    )
+    def __init__(  # noqa: PLR0913, PLR0917
+        self, data, conflicts, problems, path, stalled, rules, awaiting_sync, no_broll, sync_problem
+    ):
+        self.data = data
+        self.conflicts = conflicts
+        self.problems = problems
+        self.path = path
+        self.stalled = stalled
+        self.rules = rules
+        self.awaiting_sync = awaiting_sync
+        self.no_broll = no_broll
+        self.sync_problem = sync_problem
+
+
+def _load_brief_rules(args):
+    """Lê RULES.md para o brief; devolve (rules, mensagem de erro ou None)."""
     from getbrolls.rules import load_rules
 
-    rules, rules_error = None, None
     try:
-        rules = load_rules(args.project)
+        return load_rules(args.project), None
     except (ValueError, OSError) as exc:
-        rules_error = str(exc)
-    data, conflicts = validate_brief(load_brief(args.project), rules)
+        return None, str(exc)
+
+
+def _brief_sync_flags(project, beats):
+    """Situação do sync com ROTEIRO.md: aguardando, sem beat ativo, e o texto do problema."""
+    # Só com ROTEIRO.md do getbrolls: fora de sincronia, os beats vêm do sync do roteiro;
+    # em dia e sem beat ativo, o roteiro simplesmente não pede b-roll.
+    sync_needed = roteiro_sync_needed(project, beats)
+    awaiting_sync = bool(sync_needed)
+    no_broll = sync_needed is False and not beats
+    sync_problem = ROTEIRO_SYNC_PROBLEM if not beats else ROTEIRO_DRIFT_PROBLEM
+    return awaiting_sync, no_broll, sync_problem
+
+
+def _load_brief_context(args):
+    """Carrega e valida o BRIEF.md; monta a lista de problemas comuns às duas rotas de `brief`."""
+    from getbrolls.brief import brief_path, load_brief, template_leftovers, validate_brief
+
+    rules, rules_error = _load_brief_rules(args)
+    data, conflicts = validate_brief(load_brief(args.project), rules, project=args.project)
     problems = list(conflicts)
     if rules_error:
         problems.append(f"RULES.md não pôde ser lido, então não conferi o formato: {rules_error}")
@@ -458,122 +691,179 @@ def brief_report(args):
     # brief com todos os seis beats esperando um fato da pessoa.
     stalled = blocked_entries(data["beats"])
     problems += [f'O beat "{entry["id"]}" está travado esperando você: {entry["reason"]}' for entry in stalled]
-    if getattr(args, "validate", False):
-        beat_count = _count(len(data["beats"]), "beat", "beats")
-        return {
-            "summary": {
-                # "válido" só quando não sobrou nada para a pessoa resolver: um conflito
-                # de formato ou um RULES.md ilegível não é um brief pronto para buscar.
-                "line": (
-                    f'Brief de "{data["video"]["title"]}" lido, com {beat_count}, mas '
-                    + _count(len(problems), "ponto", "pontos")
-                    + " para resolver antes de buscar."
-                    if problems
-                    else f'Brief de "{data["video"]["title"]}" válido: {beat_count}.'
-                ),
-                "problems": problems,
-                "next": (
-                    # A mesma frase que `status.summary.do` daria: beat travado é
-                    # pergunta para a pessoa, e nenhum dos dois comandos pode dizer
-                    # "pode buscar" enquanto ela não responder.
-                    blocked_beats_question(stalled)
-                    if stalled
-                    else "Resolva os pontos acima e repita `brief --validate --project ...`."
-                    if problems
-                    else "Pode buscar: `brief --project ...` mostra o comando pronto de cada beat."
-                ),
-            },
-            "brief": path,
-            "valid": True,
-            "beats": len(data["beats"]),
-            "conflicts": conflicts,
-            # Ambiente, não conteúdo: o brief segue válido sem a chave do provedor.
-            "warnings": provider_warnings(data["beats"]),
-        }
-    beats = data["beats"]
-    if getattr(args, "beat", None):
-        chosen = [b for b in beats if b["id"] == args.beat]
-        if not chosen:
-            raise ValueError(
-                f'O BRIEF.md não tem o beat "{args.beat}". Os ids disponíveis são: '
-                + ", ".join(b["id"] for b in beats)
-                + "."
-            )
-        beats = chosen
-    root = Path(args.project).expanduser().resolve() / "brolls"
-    items = Ledger(args.project, recover=False).data["items"] if root.is_dir() else []
-    progress = beat_progress(beats, items)
-    listed = [
+    # Modelo intocado passa na validação de formato, mas não é um brief pronto.
+    problems += template_leftovers(data)
+    awaiting_sync, no_broll, sync_problem = _brief_sync_flags(args.project, data["beats"])
+    if awaiting_sync:
+        problems.append(sync_problem)
+    return _BriefContext(data, conflicts, problems, path, stalled, rules, awaiting_sync, no_broll, sync_problem)
+
+
+def _brief_validate_report(ctx):
+    """Resposta de `brief --validate`: só o veredito e os pontos a resolver, sem comandos."""
+    from getbrolls.brief import provider_warnings
+
+    data, problems, stalled = ctx.data, ctx.problems, ctx.stalled
+    beat_count = _count(len(data["beats"]), "beat", "beats")
+    # Brief válido que só espera o sync: não é "ponto para resolver" no brief.
+    only_sync = ctx.awaiting_sync and problems == [ctx.sync_problem]
+    title = data["video"]["title"]
+    return {
+        "summary": {
+            # "válido" só quando não sobrou nada para a pessoa resolver: um conflito
+            # de formato ou um RULES.md ilegível não é um brief pronto para buscar.
+            "line": (
+                (
+                    f'Brief de "{title}" válido, ainda sem beats: eles vêm do ROTEIRO.md.'
+                    if not data["beats"]
+                    else f'Brief de "{title}" válido, com {beat_count}, mas o ROTEIRO.md mudou desde o último sync.'
+                )
+                if only_sync
+                else f'Brief de "{title}" lido, com {beat_count}, mas '
+                + _count(len(problems), "ponto", "pontos")
+                + " para resolver antes de buscar."
+                if problems
+                else f'Brief de "{title}" válido, sem beats ativos: {ROTEIRO_NO_BROLL}.'
+                if ctx.no_broll
+                else f'Brief de "{title}" válido: {beat_count}.'
+            ),
+            "problems": problems,
+            "next": (
+                # A mesma frase que `status.summary.do` daria: beat travado é
+                # pergunta para a pessoa, e nenhum dos dois comandos pode dizer
+                # "pode buscar" enquanto ela não responder.
+                blocked_beats_question(stalled)
+                if stalled
+                else ROTEIRO_SYNC_NEXT
+                if only_sync
+                else "Resolva os pontos acima e repita `brief --validate --project ...`."
+                if problems
+                else ROTEIRO_NO_BROLL_NEXT
+                if ctx.no_broll
+                else "Pode buscar: `brief --project PROJETO` mostra o comando pronto de cada beat."
+            ),
+        },
+        "brief": ctx.path,
+        "valid": True,
+        "beats": len(data["beats"]),
+        "conflicts": ctx.conflicts,
+        # Ambiente, não conteúdo: o brief segue válido sem a chave do provedor.
+        "warnings": provider_warnings(data["beats"]),
+    }
+
+
+def _brief_select_beats(ctx, args):
+    """Filtra para o beat pedido por --beat, ou recusa se ele não existir/está aposentado."""
+    from getbrolls.brief import retired_beat_ids
+
+    beats = ctx.data["beats"]
+    beat_id = getattr(args, "beat", None)
+    if not beat_id:
+        return beats
+    chosen = [b for b in beats if b["id"] == beat_id]
+    if chosen:
+        return chosen
+    if beat_id in retired_beat_ids(args.project):
+        # Aposentado não tem comando de busca: a frase diz por quê e lista os ativos.
+        raise ValueError(
+            retired_beat_message(beat_id) + " Os ids ativos são: " + ", ".join(b["id"] for b in beats) + "."
+        )
+    raise ValueError(
+        f'O BRIEF.md não tem o beat "{beat_id}". Os ids disponíveis são: ' + ", ".join(b["id"] for b in beats) + "."
+    )
+
+
+def _brief_listed_beats(args, beats, manifest):
+    """Cada beat com o comando pronto e os candidatos já registrados; pula os aposentados."""
+    from getbrolls.brief import beat_commands, beat_progress
+
+    progress = beat_progress(beats, manifest["items"])
+    return [
         {
             "id": b["id"],
             "resolved": b["resolved"],
-            "commands": beat_commands(args.project, b["resolved"]),
+            "commands": beat_commands(args.project, b["resolved"], tried=tried_searches(manifest, b["id"])),
             "candidates": progress[b["id"]],
         }
         for b in beats
+        # Fora de `progress` = beat aposentado: nem lista, nem degrau de busca.
+        if b["id"] in progress
     ]
+
+
+def _brief_coverage(ctx, args, manifest):
+    """Beats com candidato/travado/faltando; acrescenta os que faltam a `ctx.problems`."""
+    beats = _brief_select_beats(ctx, args)
+    listed = _brief_listed_beats(args, beats, manifest)
     # Beat travado espera um fato da pessoa: ele não é "sem candidato ainda". A lista
     # já entrou em `problems` lá em cima, junto com a da rota `--validate`.
-    blocked = [entry for entry in stalled if entry["id"] in {b["id"] for b in listed}]
+    blocked = [entry for entry in ctx.stalled if entry["id"] in {b["id"] for b in listed}]
     stuck = {entry["id"] for entry in blocked}
     missing = [entry for entry in listed if entry["id"] not in stuck and not entry["candidates"]]
     covered = len(listed) - len(missing) - len(blocked)
-    problems += [f'O beat "{entry["id"]}" ainda não tem candidato registrado.' for entry in missing]
+    ctx.problems += [f'O beat "{entry["id"]}" ainda não tem candidato registrado.' for entry in missing]
+    return {"listed": listed, "covered": covered, "missing": missing, "blocked": blocked}
+
+
+def _brief_next_action_state(ctx, args, ledger, coverage):
+    """O mesmo `state` de `status` (`_flow_state`), com o bloco de beats deste `brief`.
+
+    Montar um `state` à parte deixava de fora o que só `_flow_state` lê (o que falta
+    entregar, quem ainda precisa de prévia, o formato pendente, a revisão do roteiro):
+    o `brief` dizia "Fluxo completo" enquanto o `status` mandava rodar `deliver`.
+    """
+    from getbrolls.brief import search_plan
+
+    manifest = ledger.data
+    beats = ctx.data["beats"]
+    block = {
+        "beats": len(coverage["listed"]),
+        "covered": coverage["covered"],
+        "missing": [
+            missing_beat_entry(
+                entry["id"],
+                entry["resolved"],
+                entry["commands"],
+                search_plan(entry["resolved"], tried_searches(manifest, entry["id"])),
+            )
+            for entry in coverage["missing"]
+        ],
+        "blocked": coverage["blocked"],
+        "conflicts": ctx.conflicts,
+        # Os mesmos sinais do roteiro que o `status` lê (sync, esqueleto, revisão).
+        **_roteiro_flags(roteiro_sync_needed(args.project, beats), beats, args.project),
+    }
+    items = manifest["items"]
+    format_pending = sum(1 for c in items if _format_pending(c, ctx.rules))
+    return _flow_state(ledger, ctx.rules, format_pending=format_pending, brief=block)
+
+
+def _brief_full_report(ctx, args):
+    """Resposta completa de `brief`: beats com comando pronto, cobertura e o próximo passo."""
+    # Só leitura: sem `brolls/`, o manifesto é vazio e nada é criado.
+    ledger = Ledger(Path(args.project).expanduser(), recover=False)
+    manifest = ledger.data
+    coverage = _brief_coverage(ctx, args, manifest)
+    listed, covered, missing, blocked = (
+        coverage["listed"],
+        coverage["covered"],
+        coverage["missing"],
+        coverage["blocked"],
+    )
+    data = ctx.data
+    state = _brief_next_action_state(ctx, args, ledger, coverage)
     return {
         "summary": {
             "line": f'Brief de "{data["video"]["title"]}": '
             + _count(len(listed), "beat", "beats")
             + f", {covered} com candidato e {len(missing)} sem"
-            + (f", {len(blocked)} travado(s) esperando você." if blocked else "."),
-            "problems": problems,
+            + (f", {len(blocked)} travado(s) esperando você." if blocked else ".")
+            + (f" Sem beats ativos: {ROTEIRO_NO_BROLL}." if ctx.no_broll else ""),
+            "problems": ctx.problems,
             # Mesma escada de `status`: a pessoa ouve a mesma frase nos dois comandos.
-            "next": next_action(
-                {
-                    "project": args.project,
-                    "counts": {
-                        "candidates": len(items),
-                        "previews": sum(1 for c in items if _has_preview(c)),
-                        # Sem estes dois a escada nunca via a decisão humana daqui, e o
-                        # `brief` mandava buscar o beat vazio enquanto o `status` pedia
-                        # aprovação do mesmo projeto: dois comandos, dois próximos passos.
-                        "pending": sum(1 for c in items if STAGE_TESTS["pending"](c)),
-                        "rejected": sum(1 for c in items if STAGE_TESTS["rejected"](c)),
-                        "approved": sum(1 for c in items if STAGE_TESTS["approved"](c)),
-                        "permitted": sum(1 for c in items if STAGE_TESTS["permitted"](c)),
-                        "delivered": sum(1 for c in items if STAGE_TESTS["delivered"](c)),
-                        "verified": sum(1 for c in items if STAGE_TESTS["verified"](c)),
-                    },
-                    "brief": {
-                        "beats": len(listed),
-                        "covered": covered,
-                        "missing": [
-                            {
-                                "id": entry["id"],
-                                "search": entry["commands"].get("search"),
-                                "intent": entry["resolved"].get("intent"),
-                                "target": entry["resolved"].get("target"),
-                                "unavailable": (
-                                    missing_provider_keys(entry["resolved"])
-                                    if provider_unavailable(entry["resolved"])
-                                    else []
-                                ),
-                            }
-                            for entry in missing
-                        ],
-                        "blocked": blocked,
-                        "conflicts": conflicts,
-                    },
-                    "review_page": (root / "review.html").is_file(),
-                    "board_url": _live_board_url(args.project),
-                    "rights_mode": _rights_mode(rules),
-                    "candidate": _pending_candidate(items),
-                    "candidates": _step_candidates(items),
-                    "duration_unknown": len(_uninspected(items)),
-                    "inspect_candidate": next((c["id"] for c in _uninspected(items)), None),
-                }
-            )["for_human"],
+            "next": next_action(state)["for_human"],
         },
-        "brief": path,
+        "brief": ctx.path,
         "video": data["video"],
         "rights": data["rights"],
         "defaults": data["defaults"],
@@ -584,8 +874,19 @@ def brief_report(args):
             "missing": len(missing),
             "blocked": len(blocked),
         },
-        "conflicts": conflicts,
+        "conflicts": ctx.conflicts,
     }
+
+
+def brief_report(args):
+    """Beats do vídeo com defaults aplicados, comando pronto e o que já foi registrado.
+
+    Somente leitura, como `status`: não cria a árvore do projeto nem grava no ledger.
+    """
+    ctx = _load_brief_context(args)
+    if getattr(args, "validate", False):
+        return _brief_validate_report(ctx)
+    return _brief_full_report(ctx, args)
 
 
 def library_command(args):
@@ -675,7 +976,9 @@ def reject_all(ledger, only, reason=None):
                 reason_present=bool(rejection.get("reason")),
                 output_cleared=True,
             )
-    except Exception:  # noqa: BLE001, S110 - logging must never break a command
+    except Exception:  # noqa: BLE001, S110 -- pylint: disable=broad-exception-caught
+        # Legado: ocorrência pré-existente (corpo idêntico ao código anterior à 2.6.0); logging must
+        # never break a command.
         pass
     return {
         "rejected": [c["id"] for c in chosen],
@@ -684,43 +987,62 @@ def reject_all(ledger, only, reason=None):
     }
 
 
-def approve_all(ledger, args, rules, only=None):  # noqa: C901, PLR0912 - existing size; one branch per rejection reason across the batch
-    """Aplica a mesma decisão humana a vários itens de uma vez.
+def approval_gate(c, rules, *, bulk, by_id):
+    """Por que este candidato não pode ser aprovado agora, ou None se pode.
 
-    `only` é a lista de IDs que o agente disse ter mostrado à pessoa: aprova
-    exatamente esses. Sem `only` (`--all`), o alvo é todo item com prévia e sem
-    aprovação válida — e um id desconhecido é erro, nunca silêncio.
+    Um portão só para `approve --candidate ID` e para o lote (`--all`, vários IDs): sem
+    nada que a pessoa tenha visto, sem prévia, barrado pelas regras ou sem intervalo, a
+    aprovação não vale em caminho nenhum. `bulk` diz se o item vem num lote; `by_id`, se
+    a pessoa o nomeou por ID (`--candidate`, uma ou várias vezes). Três diferenças ficam
+    de propósito:
+
+    - no lote só conta a prévia gravada em disco; com um ID só, a fonte de plugin vale
+      também pela miniatura ou pelo embed que mostrou (`docs/SDK.md`);
+    - já aprovado sai do lote, para a leva não reassinar o que já vale;
+    - rejeitado sai só do `--all`: o ID explícito, um ou vários, pode reaprovar um item
+      rejeitado, e o lote sem IDs nunca aprova o que a pessoa descartou.
     """
     from .rules import allowed
 
-    approved, skipped = [], []
-    wanted = list(only) if only else None
-    if wanted is not None:
-        known = {c["id"] for c in ledger.data["items"]}
-        missing = [i for i in wanted if i not in known]
-        if missing:
-            raise ValueError("Candidato não registrado no projeto: " + ", ".join(missing) + ".")
-    for c in ledger.data["items"]:
-        if wanted is not None and c["id"] not in wanted:
-            continue
-        if not _has_preview(c):
-            reason = "sem prévia gerada; rode preview antes"
-        elif not allowed(c, rules):
-            reason = "bloqueado pelas regras atuais do usuário"
-        elif _stage_status(c, "approval") == "rejected":
-            reason = "rejeitado por decisão humana"
-        elif _stage_status(c, "approval") == "approved" and c["approval"].get("signature") == signature(c):
-            reason = "já tem aprovação válida para este intervalo"
-        elif c["segment"]["start_s"] is None and c.get("media", {}).get("kind") != "image":
-            reason = "sem intervalo escolhido; rode preview --start/--end"
-        else:
-            approve(c, args.by, args.channel, args.statement)
-            approved.append(c)
-            continue
-        skipped.append({"id": c["id"], "reason": reason})
-    if approved:
-        ledger.save_many("approve-chat" if args.channel == "chat" else "approve", approved)
-        render(ledger)
+    checks = [
+        (_plugin_nothing_seen(c), "fonte de plugin sem nada para mostrar (sem prévia, poster_url nem embed_url)"),
+        (
+            not _has_preview(c) and (bulk or not _is_plugin_candidate(c)),
+            "sem prévia gerada; rode preview antes",
+        ),
+        (not allowed(c, rules), "bloqueado pelas regras atuais do usuário"),
+    ]
+    if not by_id:
+        checks.append((_stage_status(c, "approval") == "rejected", "rejeitado por decisão humana"))
+    if bulk:
+        checks.append(
+            (
+                _stage_status(c, "approval") == "approved" and c["approval"].get("signature") == signature(c),
+                "já tem aprovação válida para este intervalo",
+            )
+        )
+    checks.append(
+        (
+            c["segment"]["start_s"] is None and c.get("media", {}).get("kind") != "image",
+            "sem intervalo escolhido; rode preview --start e --end",
+        )
+    )
+    for skip, reason in checks:
+        if skip:
+            return reason
+    return None
+
+
+def _refuse_ungated_approval(c, rules):
+    """`approve --candidate ID`: recusa pelo mesmo motivo que tiraria o item do lote."""
+    _refuse_blind_plugin_approval(c)
+    reason = approval_gate(c, rules, bulk=False, by_id=True)
+    if reason is not None:
+        raise ValueError(f"Não registrei a aprovação de {c['id']}: {reason}.")
+
+
+def _log_approve_all(args, approved, skipped):
+    """Loga cada aprovação do lote e o resumo; nunca deixa uma falha de log derrubar o comando."""
     try:
         for c in approved:
             logs.event(
@@ -734,8 +1056,39 @@ def approve_all(ledger, args, rules, only=None):  # noqa: C901, PLR0912 - existi
                 statement_present=bool((args.statement or "").strip()),
             )
         logs.event(_log, logging.INFO, "approve_all", approved=len(approved), skipped=len(skipped))
-    except Exception:  # noqa: BLE001, S110 - logging must never break a command
+    except Exception:  # noqa: BLE001, S110 -- pylint: disable=broad-exception-caught
+        # logging must never break a command
         pass
+
+
+def approve_all(ledger, args, rules, only=None):
+    """Aplica a mesma decisão humana a vários itens de uma vez.
+
+    `only` é a lista de IDs que o agente disse ter mostrado à pessoa: aprova
+    exatamente esses, inclusive um que tinha sido rejeitado — e um id desconhecido é
+    erro, nunca silêncio. Sem `only` (`--all`), o alvo é todo item com prévia e sem
+    aprovação válida, nunca um rejeitado.
+    """
+    approved, skipped = [], []
+    wanted = list(only) if only else None
+    if wanted is not None:
+        known = {c["id"] for c in ledger.data["items"]}
+        missing = [i for i in wanted if i not in known]
+        if missing:
+            raise ValueError("Candidato não registrado no projeto: " + ", ".join(missing) + ".")
+    for c in ledger.data["items"]:
+        if wanted is not None and c["id"] not in wanted:
+            continue
+        reason = approval_gate(c, rules, bulk=True, by_id=wanted is not None)
+        if reason is None:
+            approve(c, args.by, args.channel, args.statement)
+            approved.append(c)
+            continue
+        skipped.append({"id": c["id"], "reason": reason})
+    if approved:
+        ledger.save_many("approve-chat" if args.channel == "chat" else "approve", approved)
+        render(ledger)
+    _log_approve_all(args, approved, skipped)
     if wanted is None and approved:
         # `--all` mira o disco, não a conversa: a prévia de um candidato descartado
         # continua lá e entra na leva. Dizer em voz alta o que foi aprovado é o que
@@ -780,7 +1133,15 @@ def _search_row(c):
     return row
 
 
-def search_summary_line(rows, excluded, errors, dry_run, query_used=None, retry=None):  # noqa: PLR0913, PLR0917 - existing size; one field per fact the spoken summary line reports
+def search_summary_line(  # noqa: PLR0913, PLR0917 - existing size; one field per fact the spoken summary line reports
+    rows,
+    excluded,
+    errors,
+    dry_run,
+    query_used=None,
+    retry=None,
+):  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    # Legado: ocorrência pré-existente (corpo idêntico ao código anterior à 2.6.0).
     """Quantos vieram e quais são os três primeiros — o resumo que cabe numa fala.
 
     Zero candidatos nunca sai calado: a linha diz qual query a fonte recebeu e, se
@@ -847,7 +1208,7 @@ STAGE_TESTS = {
 def status_journal(root):
     """Leitura do journal append-only: quantos eventos e qual foi o último."""
     path = root / "events.jsonl"
-    if not path.is_file():
+    if not _paths.strict_is_file(path):
         return {"events": 0, "last": None}
     lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     try:
@@ -865,7 +1226,7 @@ def status_journal(root):
 def status_references(root):
     """Quantas referências memorizadas o projeto tem, sem derrubar o relatório."""
     path = root / "references.json"
-    if not path.is_file():
+    if not _paths.strict_is_file(path):
         return 0, None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -878,9 +1239,15 @@ def status_references(root):
 
 
 def _format_pending(c, rules):
-    """True quando as regras atuais mudariam o formato-alvo já gravado no item."""
+    """True quando o formato-alvo das regras atuais desfaria a decisão ou a prévia do item.
+
+    Item rejeitado fica de fora: `sync_formats` só realinha o formato dele, sem invalidar
+    nada, então o `status` não pode prometer uma aprovação invalidada nem pedir decisão.
+    """
     if rules is None:
         return None
+    if (c.get("approval") or {}).get("status") == "rejected":
+        return False
     from getbrolls.rules import format_report
 
     return c.get("format", {}).get("target", "native") != format_report(c, rules)["target"]
@@ -903,59 +1270,232 @@ def blocked_entries(beats):
     ]
 
 
-def brief_state(project, rules, items):
-    """Cobertura dos beats para a escada de orientação, sem gravar nada no projeto.
-
-    Devolve `None` quando não há BRIEF.md legível: esse é o degrau do topo da escada.
-    """
-    from getbrolls.brief import (
-        beat_commands,
-        beat_progress,
-        brief_path,
-        load_brief,
-        missing_provider_keys,
-        provider_unavailable,
-        validate_brief,
+def retired_beat_message(shot):
+    """Frase de recusa para um beat aposentado pelo roteiro, igual em search, resolve e brief."""
+    return (
+        f'O beat "{shot}" foi aposentado pelo roteiro ("retired": true no BRIEF.md): a cena '
+        "saiu do ROTEIRO.md, então não busco material para ele. Se a cena voltou, ajuste o "
+        "ROTEIRO.md e rode `roteiro --action sync --project PROJETO`; `status --project PROJETO` "
+        "mostra os beats ativos."
     )
 
+
+def _refuse_retired_shot(project, shot):
+    """`--shot` de beat aposentado não liga material novo a ele: recusa antes de buscar ou baixar."""
+    from getbrolls.brief import retired_beat_ids
+
+    if shot in retired_beat_ids(project):
+        raise ValueError(retired_beat_message(shot))
+
+
+def _beat_search_names(project, shot, rules, provider, names):
+    """Fontes que `search --shot` pode consultar: as que o beat do BRIEF.md permite.
+
+    Sem BRIEF.md válido, ou com um `--shot` que não é beat dele, nada muda: o beat
+    livre continua valendo como antes. Com o beat no brief, fonte fora de
+    `allowed_sources` é recusada com a lista certa, em vez de virar candidato ligado
+    ao beat como se a pessoa tivesse permitido aquela origem.
+    """
+    from getbrolls.brief import beat_sources
+    from getbrolls.brief import searchable as searchable_sources
+
+    _refuse_retired_shot(project, shot)
+    allowed = beat_sources(project, shot, rules)
+    if allowed is None:
+        return names
+    searchable = [name for name in allowed if name in searchable_sources()]
+    if provider != "auto":
+        if provider in allowed:
+            return names
+        route = (
+            f"Busque com --provider {searchable[0]} (ou --provider auto, que fica nas fontes do beat)."
+            if searchable
+            else f"Nenhuma dessas fontes tem busca por API: registre o material com "
+            f"`resolve --url URL_PUBLICA --shot {shot}` ou `resolve --file ARQUIVO --shot {shot}`."
+        )
+        raise ValueError(
+            f'O beat "{shot}" do BRIEF.md só aceita material de {", ".join(allowed)}, e {provider} '
+            f"não está nessa lista. {route} Se {provider} também serve para esse trecho, "
+            "acrescente a fonte em allowed_sources do beat e rode `brief --validate`."
+        )
+    chosen = [name for name in names if name in allowed] or searchable
+    if not chosen:
+        raise ValueError(
+            f'O beat "{shot}" do BRIEF.md só aceita {", ".join(allowed)}, e nenhuma dessas '
+            f"fontes tem busca por API: registre o material com `resolve --url URL_PUBLICA "
+            f"--shot {shot}` ou `resolve --file ARQUIVO --shot {shot}`."
+        )
+    return chosen
+
+
+# Teto do registro de buscas vazias: é memória de orientação, não histórico.
+MAX_EMPTY_SEARCHES = 500
+
+
+def _empty_log(data):
+    """`empty_searches` do manifesto, só com entradas legíveis; lixo vira lista vazia."""
+    log = (data or {}).get("empty_searches") if isinstance(data, dict) else None
+    if not isinstance(log, list):
+        return []
+    return [e for e in log if isinstance(e, dict)]
+
+
+def record_empty_searches(ledger, shot, empty):
+    """Guarda no manifesto que `search --shot` voltou vazio nesta fonte, com esta query.
+
+    É o que tira o degrau `brief-search` do laço: sem registro, a escada sugeria a
+    mesma fonte e a mesma query para sempre, sem nunca tentar a próxima permitida.
+    Um registro ilegível (editado à mão) é refeito, nunca derruba a busca.
+    """
+    log = _empty_log(ledger.data)
+    for provider, query in empty:
+        entry = {"shot": shot, "provider": provider, "query": query}
+        if not any({k: e.get(k) for k in entry} == entry for e in log):
+            log.append({**entry, "at": now()})
+    ledger.data["empty_searches"] = log[-MAX_EMPTY_SEARCHES:]
+    ledger.save("search-empty")
+
+
+def tried_searches(data, shot):
+    """Pares (fonte, query) em que a busca deste beat já voltou vazia."""
+    return {
+        (e.get("provider"), e.get("query"))
+        for e in _empty_log(data)
+        if e.get("shot") == shot and isinstance(e.get("provider"), str) and isinstance(e.get("query"), str)
+    }
+
+
+def missing_beat_entry(beat_id, resolved, commands, plan):
+    """Beat sem candidato como a escada lê, igual em `status` e em `brief`."""
+    state = plan["state"]
+    return {
+        "id": beat_id,
+        "search": commands.get("search"),
+        # Todas as fontes e buscas já voltaram vazias: pergunta para a pessoa.
+        "exhausted": plan["sources"] if state == "exhausted" else [],
+        "queries": plan["queries"] if state == "exhausted" else [],
+        # Frase pronta do motivo (esgotado, falta de chave): a escada repassa como veio.
+        "note": plan["note"],
+        # A frase para a pessoa muda quando o beat não tem alvo literal: prometer
+        # busca ali contradiz a guarda "literal primeiro, nada de preenchimento".
+        "intent": resolved.get("intent"),
+        "target": resolved.get("target"),
+        # Toda fonte que sobra depende de uma chave que falta aqui: o degrau vira
+        # pedido de configuração, não pergunta sobre o conteúdo do trecho.
+        "unavailable": plan["needs_keys"] if state in ("unavailable", "needs_keys") else [],
+        "unavailable_note": plan["note"] if state == "needs_keys" else None,
+        # Nenhuma fonte com busca por API: o passo é a pessoa trazer o link ou o arquivo.
+        "resolve": commands.get("resolve") if state == "resolve_only" else None,
+        "allowed_sources": list(resolved.get("allowed_sources") or []),
+    }
+
+
+def _brief_or_none(project, rules):
+    """Carrega e valida o BRIEF.md; devolve (data, conflicts, resultado antecipado ou None)."""
+    from getbrolls.brief import brief_path, load_brief, validate_brief
+
     try:
-        data, conflicts = validate_brief(load_brief(project), rules)
+        data, conflicts = validate_brief(load_brief(project), rules, project=project)
     except (ValueError, OSError) as exc:
         # Nada do brief quebra o `status`. Arquivo ausente é "faça o brief"; arquivo
         # presente e errado é "corrija o brief" — degraus e comandos diferentes.
         try:
+            # lenient: inside except (ValueError, OSError), which maps any error to False
             exists = brief_path(project).exists()
         except (ValueError, OSError):
             exists = False
-        return {"error": str(exc)} if exists else None
+        return None, None, ({"error": str(exc)} if exists else None)
+    return data, conflicts, None
+
+
+def _missing_beat_entries(project, beats, manifest, stuck, progress):
+    """Beats sem candidato registrado ainda (fora dos aposentados/travados), com seus comandos."""
+    from getbrolls.brief import beat_commands, search_plan
+
+    missing = []
+    for b in beats:
+        if b["id"] not in progress or b["id"] in stuck or progress[b["id"]]:
+            # Fora de `progress` = beat aposentado: não vira degrau de busca.
+            continue
+        tried = tried_searches(manifest, b["id"])
+        commands = beat_commands(project, b["resolved"], tried)
+        missing.append(missing_beat_entry(b["id"], b["resolved"], commands, search_plan(b["resolved"], tried)))
+    return missing
+
+
+def brief_state(project, rules, items, data=None):
+    """Cobertura dos beats para a escada de orientação, sem gravar nada no projeto.
+
+    Devolve `None` quando não há BRIEF.md legível: esse é o degrau do topo da escada.
+    `data` é o manifesto, para o degrau de busca pular a fonte que já voltou vazia.
+    """
+    from getbrolls.brief import beat_progress
+
+    manifest = data
+    data, conflicts, early = _brief_or_none(project, rules)
+    if data is None:
+        return early
     beats = data["beats"]
     progress = beat_progress(beats, items)
     # Beat travado sai das duas contas: ele não está coberto e também não é "ainda vou
     # buscar" — é pergunta em aberto para a pessoa, e vira degrau próprio na escada.
     blocked = blocked_entries(beats)
     stuck = {entry["id"] for entry in blocked}
-    missing = [
-        {
-            "id": b["id"],
-            "search": beat_commands(project, b["resolved"]).get("search"),
-            # A frase para a pessoa muda quando o beat não tem alvo literal: prometer
-            # busca ali contradiz a guarda "literal primeiro, nada de preenchimento".
-            "intent": b["resolved"].get("intent"),
-            "target": b["resolved"].get("target"),
-            # Toda fonte permitida depende de uma chave que falta aqui: o degrau vira
-            # pedido de configuração, não pergunta sobre o conteúdo do trecho.
-            "unavailable": (missing_provider_keys(b["resolved"]) if provider_unavailable(b["resolved"]) else []),
-        }
-        for b in beats
-        if b["id"] not in stuck and not progress[b["id"]]
-    ]
+    missing = _missing_beat_entries(project, beats, manifest, stuck, progress)
     return {
         "beats": len(beats),
         "covered": len(beats) - len(missing) - len(blocked),
         "missing": missing,
         "blocked": blocked,
         "conflicts": conflicts,
+        # O que o `inspect` de um candidato do beat procura: a fala, ou o alvo.
+        "beat_queries": {b["id"]: b["resolved"].get("narration") or b["resolved"]["target"] for b in beats},
+        # Só com ROTEIRO.md do getbrolls: fora de sincronia, a escada manda para o sync;
+        # em dia e sem beat ativo, o `status` diz que o roteiro não pede b-roll e segue.
+        **_roteiro_flags(roteiro_sync_needed(project, beats), beats, project),
     }
+
+
+def roteiro_sync_needed(project, beats):
+    """None sem ROTEIRO.md do getbrolls; senão, se o brief ainda não reflete o roteiro. Só lê."""
+    from getbrolls import roteiro, roteiro_sync
+
+    if not roteiro.is_roteiro(project):
+        return None
+    return roteiro_sync.out_of_sync(project, [b["id"] for b in beats])
+
+
+def _roteiro_reviewed(project):
+    """O roteiro atual tem revisão válida? Só lê; roteiro que não abre conta como sem revisão."""
+    from getbrolls import roteiro, roteiro_review
+
+    try:
+        return roteiro_review.review_state(project, roteiro.parse(roteiro.load_text(project)))["reviewed"]
+    except (ValueError, OSError):
+        return False
+
+
+def _roteiro_skeleton(project):
+    """Rótulos das cenas com texto de esqueleto do `roteiro new`; só lê, roteiro que não abre dá lista vazia."""
+    from getbrolls import roteiro
+
+    try:
+        return [label for label, _ in roteiro.skeleton_scenes(roteiro.parse(roteiro.load_text(project)))]
+    except (ValueError, OSError):
+        return []
+
+
+def _roteiro_flags(sync_needed, beats, project):
+    if sync_needed:
+        skeleton = _roteiro_skeleton(project)
+        if skeleton:
+            # Review e sync recusam texto de esqueleto: o degrau é editar o roteiro.
+            return {"roteiro_sync": True, "roteiro_skeleton": skeleton}
+        # Sem revisão, o sync recusa: o degrau é o `check`, que mostra o hash para o `review`.
+        return {"roteiro_sync": True, **({} if _roteiro_reviewed(project) else {"roteiro_unreviewed": True})}
+    if sync_needed is False and not beats:
+        return {"roteiro_no_broll": True}
+    return {}
 
 
 def _rights_mode(rules):
@@ -1008,16 +1548,30 @@ def _uninspected(items):
 
     É o que separa o degrau `inspect` do degrau `preview`: sem duração, qualquer
     `--start/--end` é palpite, e o palpite custa um pedido à fonte. Item rejeitado
-    fica de fora: ninguém gasta pedido à fonte por um trecho já descartado.
+    fica de fora: ninguém gasta pedido à fonte por um trecho já descartado. Foto
+    também: não tem duração nem trecho a descobrir, e vai direto à prévia estática.
     """
+    from .acquisition import fetch_only
+
     return [
         c
         for c in items
         if not (c.get("media") or {}).get("duration_s")
+        and (c.get("media") or {}).get("kind") != "image"
         and c.get("source_url")
         and not _has_preview(c)
         and _stage_status(c, "approval") != "rejected"
+        # Fonte que só entrega no `fetch`: `inspect` é recusado antes de rodar o plugin.
+        and not fetch_only(c)
     ]
+
+
+def _reference_only(items):
+    """Ids dos itens sem quadro cuja fonte só entrega o arquivo no `fetch` (rota de
+    plugin `stage="fetch"`): a prévia deles é `--reference-only`, nunca com mídia."""
+    from .acquisition import fetch_only
+
+    return [c["id"] for c in _needs_preview(items) if fetch_only(c)]
 
 
 def serve_state(project):
@@ -1041,16 +1595,18 @@ def deliver_report(ledger, rules, dry_run=False):
         dry_run=dry_run,
         ledger=ledger,
         for_human=lambda: _delivery_next(ledger, rules),
+        rules=rules,
     )
-    # `build_delivery` raises before returning when any file is in conflict, so
-    # reaching here means zero conflicts this run.
+    # A real run raises before returning when any file is in conflict; only the dry
+    # run comes back with `conflicts`, which the log line and the summary count.
+    conflicts = len(report.get("conflicts", []))
     logs.event(
         _log,
         logging.INFO,
         "deliver",
         delivered=len(report["items"]),
         skipped=len(report["skipped"]),
-        conflicts=0,
+        conflicts=conflicts,
         dry_run=bool(dry_run),
     )
     verb = "Organizaria" if dry_run else "Organizei"
@@ -1058,12 +1614,18 @@ def deliver_report(ledger, rules, dry_run=False):
     line = (
         f"{verb} {_count(len(report['items']), 'trecho', 'trechos')} em "
         + _count(beats, "pasta", "pastas")
-        + f" dentro de {report['delivery']}."
+        + f" dentro de {labels.shown(report['delivery'])}."
     )
     if report["removed"]:
         line += " " + _count(len(report["removed"]), "link órfão removido", "links órfãos removidos") + "."
     if report["kept"]:
         line += " Deixei intocado o que você criou lá: " + ", ".join(report["kept"]) + "."
+    if conflicts:
+        line += (
+            " "
+            + _count(conflicts, "conflito faria", "conflitos fariam")
+            + " a entrega de verdade falhar (veja `conflicts`)."
+        )
     # Mesma escada de `status` e `brief`: a pessoa ouve a mesma frase em qualquer comando.
     return {"summary": {"line": line, "next": _flow_next(ledger, rules)}, **report}
 
@@ -1088,14 +1650,36 @@ def _delivery_next(ledger, rules):
     return _flow_next(ledger, rules)
 
 
+def _preview_is_image(items):
+    """O item que o degrau `preview` nomeia é uma foto? Então o comando vai sem intervalo."""
+    chosen = _step_candidates(items)["preview"]
+    return any(c["id"] == chosen and (c.get("media") or {}).get("kind") == "image" for c in items)
+
+
 def _needs_preview(items):
     """Itens ainda em jogo e sem nenhum quadro: um item rejeitado não trava o fluxo."""
     return [c for c in items if not _has_preview(c) and _stage_status(c, "approval") != "rejected"]
 
 
-def _undelivered(items):
-    """Arquivos já conferidos que ainda não apareceram em `entrega/`."""
-    return [c for c in items if STAGE_TESTS["verified"](c) and not (c.get("delivery") or {}).get("path")]
+def _undelivered(items, retired=frozenset()):
+    """Arquivos já conferidos que ainda não apareceram em `entrega/`.
+
+    Clipe de beat aposentado (`retired`, ids do BRIEF.md) fica fora de `entrega/` de
+    propósito: contá-lo aqui deixaria o fluxo pedindo `deliver` para sempre.
+    """
+    return [
+        c
+        for c in items
+        if STAGE_TESTS["verified"](c)
+        and not (c.get("delivery") or {}).get("path")
+        and not (retired and c.get("shot") in retired)
+    ]
+
+
+def _retired_shots(project):
+    from getbrolls.brief import retired_beat_ids
+
+    return retired_beat_ids(project)
 
 
 _UNSET = object()
@@ -1132,12 +1716,13 @@ def _live_board_url(project):
 def _flow_state(ledger, rules, counts=None, format_pending=0, brief=_UNSET):
     """Estado que a escada de `guidance` lê: a mesma leitura em status, brief e deliver."""
     items = ledger.data["items"]
-    review_page = (ledger.root / "review.html").is_file()
+    review_page = _paths.strict_is_file(ledger.root / "review.html")
+    brief_value = brief_state(ledger.root.parent, rules, items, ledger.data) if brief is _UNSET else brief
     return {
         "project": str(ledger.root.parent),
-        "counts": counts or {key: sum(1 for c in items if STAGE_TESTS[key](c)) for key in STAGE_TESTS},
+        "counts": counts or {key: sum(1 for c in items if test(c)) for key, test in STAGE_TESTS.items()},
         "format_pending": format_pending,
-        "brief": brief_state(ledger.root.parent, rules, items) if brief is _UNSET else brief,
+        "brief": brief_value,
         "review_page": review_page,
         # Só perguntamos ao servidor quando existe página para ele servir.
         "board_url": _live_board_url(ledger.root.parent) if review_page else None,
@@ -1147,9 +1732,22 @@ def _flow_state(ledger, rules, counts=None, format_pending=0, brief=_UNSET):
         "candidates": _step_candidates(items),
         "duration_unknown": len(_uninspected(items)),
         "inspect_candidate": next((c["id"] for c in _uninspected(items)), None),
-        "undelivered": len(_undelivered(items)),
+        "reference_only": _reference_only(items),
+        "inspect_query": _inspect_query(items, brief_value),
+        "undelivered": len(_undelivered(items, _retired_shots(ledger.root.parent))),
         "pending_preview": len(_needs_preview(items)),
+        "preview_image": _preview_is_image(items),
     }
+
+
+def _inspect_query(items, brief):
+    """`--query` pronto para o `inspect` do degrau: a fala (ou o alvo) do beat do candidato.
+
+    Sem beat no brief, o lugar fica em MAIÚSCULAS para quem conhece a frase preencher.
+    """
+    first = next(iter(_uninspected(items)), None)
+    queries = (brief or {}).get("beat_queries") or {}
+    return queries.get((first or {}).get("shot")) or None
 
 
 def _flow_next(ledger, rules):
@@ -1160,17 +1758,68 @@ def _flow_next(ledger, rules):
         return None
 
 
-def status_report(ledger, rules=None, rules_error=None, queue=None):
-    """Onde o projeto está, por etapa. Somente leitura: não grava nada."""
-    items = ledger.data["items"]
-    listing = {key: [c["id"] for c in items if STAGE_TESTS[key](c)] for key, _, _ in STATUS_STAGES}
-    counts = {key: len(listing[key]) for key, _, _ in STATUS_STAGES}
-    pending_format = {c["id"]: _format_pending(c, rules) for c in items}
-    format_pending = sum(1 for value in pending_format.values() if value)
-    remembered, references_error = status_references(ledger.root)
-    review_page = ledger.root / "review.html"
-    brief = brief_state(ledger.root.parent, rules, items)
+# `summary.next` quando `summary.do` manda a prévia de referência (fonte de plugin
+# que só entrega o arquivo no `fetch`): o texto genérico "Gere prévias com preview…"
+# contradizia o comando pronto ao lado. Fontes embutidas nunca chegam aqui.
+REFERENCE_ONLY_NEXT = (
+    "Registre a prévia de referência (preview --reference-only) do candidato cuja fonte só entrega "
+    "o arquivo no fetch; depois approve, permit e fetch."
+)
+
+
+# `summary.next` quando o BRIEF.md ainda não tem beats porque o projeto tem ROTEIRO.md:
+# buscar sem beat não tem alvo, e repetir `brief --validate` não muda nada.
+ROTEIRO_SYNC_NEXT = (
+    "Revise o ROTEIRO.md com a pessoa e rode `roteiro --action sync --project PROJETO`: os beats "
+    "nascem dele. Depois, `brief --project PROJETO` mostra o comando pronto de cada beat."
+)
+# Mesmo degrau, antes da revisão: o sync recusaria, então o passo é conferir e mostrar.
+ROTEIRO_CHECK_NEXT = (
+    "Rode `roteiro --action check --project PROJETO`, mostre o roteiro à pessoa e registre a revisão "
+    'com `roteiro --action review --project PROJETO --by NOME --channel chat --statement "…" --expect REVIEW_SHA256`; '
+    "depois, `roteiro --action sync`."
+)
+ROTEIRO_DRIFT_PROBLEM = (
+    "O ROTEIRO.md mudou desde o último sync: os beats do BRIEF.md não batem com as cenas. Revise o "
+    "roteiro com a pessoa e rode `roteiro --action sync --project PROJETO`."
+)
+ROTEIRO_NO_BROLL = "o roteiro não pede b-roll"
+ROTEIRO_NO_BROLL_NEXT = (
+    "Nada para buscar: o roteiro não pede b-roll. Se a pessoa quiser, ponha uma cena [BROLL: ...] no "
+    "ROTEIRO.md, revise com ela e rode `roteiro --action sync --project PROJETO`."
+)
+ROTEIRO_SYNC_PROBLEM = (
+    "O BRIEF.md ainda não tem beats: eles vêm do ROTEIRO.md. Revise o roteiro com a pessoa e "
+    "rode `roteiro --action sync --project PROJETO`."
+)
+
+
+def _reference_only_step(do):
+    return do.get("step") == "preview" and "--reference-only" in (do.get("command") or "")
+
+
+class _StatusContext:  # pylint: disable=too-few-public-methods
+    # Contêiner simples de estado derivado, não um objeto com comportamento.
+    """Estado derivado de `status`, compartilhado entre o resumo falado e a lista de itens."""
+
+    def __init__(  # noqa: PLR0913, PLR0917 -- pylint: disable=too-many-arguments,too-many-positional-arguments
+        self, ledger, rules, items, counts, format_pending, listing, pending_format
+    ):
+        self.ledger = ledger
+        self.rules = rules
+        self.items = items
+        self.counts = counts
+        self.format_pending = format_pending
+        self.listing = listing
+        self.pending_format = pending_format
+
+
+def _status_summary(ctx, queue, review_page, brief):
+    """Monta o bloco `summary`: linha falada, degrau seguinte e contagem do brief."""
+    ledger, rules, counts, format_pending = ctx.ledger, ctx.rules, ctx.counts, ctx.format_pending
     line = _status_line({"counts": counts})
+    if brief and brief.get("roteiro_no_broll"):
+        line += f" Sem beats ativos: {ROTEIRO_NO_BROLL}."
     if ledger.recovered:
         line += " Há uma gravação interrompida pendente; o próximo comando de escrita a concluirá."
     if queue and queue.get("error"):
@@ -1179,29 +1828,28 @@ def status_report(ledger, rules=None, rules_error=None, queue=None):
     elif queue and queue.get("line"):
         # Uma linha da fila social, lida sem gravar: contagens e próximo horário permitido.
         line += " " + queue["line"]
+    state = _flow_state(
+        ledger,
+        rules,
+        counts=counts,
+        format_pending=format_pending,
+        brief=brief,
+    )
+    do = next_action(state)
     # Veredito primeiro, como no doctor: o JSON completo continua logo abaixo.
-    summary = {
+    return {
         "line": line,
-        "stages": [{"stage": plural, "count": counts[key], "items": listing[key]} for key, _, plural in STATUS_STAGES],
-        "next": status_next(
-            counts,
-            format_pending,
-            pending_preview=len(_needs_preview(items)),
-            undelivered=len(_undelivered(items)),
-        ),
+        "stages": [
+            {"stage": plural, "count": counts[key], "items": ctx.listing[key]} for key, _, plural in STATUS_STAGES
+        ],
+        # O mesmo degrau de `do`, no texto para o agente: as duas chaves nunca
+        # nomeiam passos diferentes.
+        "next": summary_next(do, state),
         # Aditivo: `line/stages/next` seguem iguais; `do` traz o mesmo passo já em
         # comando pronto e `brief` diz quantos beats ainda estão sem material.
-        "do": next_action(
-            _flow_state(
-                ledger,
-                rules,
-                counts=counts,
-                format_pending=format_pending,
-                brief=brief,
-            )
-        ),
+        "do": do,
         # Mesmo aviso de `review`: a página existe mas não tem o que revisar.
-        "warnings": ([EMPTY_STORYBOARD] if review_page.is_file() and not counts["previews"] else []),
+        "warnings": ([EMPTY_STORYBOARD] if _paths.strict_is_file(review_page) and not counts["previews"] else []),
         # `None` enquanto não houver um brief válido para contar (ausente ou inválido).
         "brief": (
             None
@@ -1215,40 +1863,66 @@ def status_report(ledger, rules=None, rules_error=None, queue=None):
             }
         ),
     }
+
+
+def _status_items(ctx):
+    """Lista enxuta de itens para o `status`: só os campos que a pessoa decide a partir de."""
+    return [
+        {
+            "id": c["id"],
+            "title": c.get("title"),
+            "provider": c.get("provider"),
+            "source_url": c.get("source_url"),
+            "state": c.get("state"),
+            "segment": c.get("segment"),
+            "approval": (c.get("approval") or {}).get("status"),
+            # Por que este saiu: quem lê a lista não precisa abrir o manifesto.
+            "rejection_reason": (c.get("rejection") or {}).get("reason"),
+            "rights": (c.get("rights") or {}).get("status"),
+            "preview": _has_preview(c),
+            "format_pending": ctx.pending_format[c["id"]],
+            "output": (c.get("output") or {}).get("path"),
+        }
+        for c in ctx.items
+    ]
+
+
+def _status_layout(project):
+    """`{version, source, problem}` do layout do projeto; somente leitura."""
+    found = layout.info(project)
+    return {"version": found.version, "source": found.source, "problem": found.problem}
+
+
+def status_report(ledger, rules=None, rules_error=None, queue=None):
+    """Onde o projeto está, por etapa. Somente leitura: não grava nada."""
+    items = ledger.data["items"]
+    listing = {key: [c["id"] for c in items if STAGE_TESTS[key](c)] for key, _, _ in STATUS_STAGES}
+    counts = {key: len(listing[key]) for key, _, _ in STATUS_STAGES}
+    pending_format = {c["id"]: _format_pending(c, rules) for c in items}
+    format_pending = sum(1 for value in pending_format.values() if value)
+    ctx = _StatusContext(ledger, rules, items, counts, format_pending, listing, pending_format)
+    remembered, references_error = status_references(ledger.root)
+    review_page = ledger.root / "review.html"
+    brief = brief_state(ledger.root.parent, rules, items, ledger.data)
     app_log = ledger.root / "getbrolls.log"
     return {
-        "summary": summary,
+        "summary": _status_summary(ctx, queue, review_page, brief),
         "project": str(ledger.root),
         "counts": counts,
         "stages": listing,
         # Aditivo, ao lado de "review_page": onde o getbrolls.log está, se existir.
+        # lenient: pointer to the log; logs.log_path is a never-raise view
         "log": str(app_log) if app_log.is_file() else None,
-        "items": [
-            {
-                "id": c["id"],
-                "title": c.get("title"),
-                "provider": c.get("provider"),
-                "source_url": c.get("source_url"),
-                "state": c.get("state"),
-                "segment": c.get("segment"),
-                "approval": (c.get("approval") or {}).get("status"),
-                # Por que este saiu: quem lê a lista não precisa abrir o manifesto.
-                "rejection_reason": (c.get("rejection") or {}).get("reason"),
-                "rights": (c.get("rights") or {}).get("status"),
-                "preview": _has_preview(c),
-                "format_pending": pending_format[c["id"]],
-                "output": (c.get("output") or {}).get("path"),
-            }
-            for c in items
-        ],
+        "items": _status_items(ctx),
         "format_pending": format_pending,
         # Somente leitura: lê o PID file e pergunta ao sistema se o processo vive.
         "serve": serve_state(ledger.root.parent),
+        "layout": _status_layout(ledger.root.parent),
         "rules_error": rules_error,
         "references": remembered,
         "references_error": references_error,
         "queue": queue,
-        "review_page": str(review_page) if review_page.is_file() else None,
+        "review_page": str(review_page) if _paths.strict_is_file(review_page) else None,
         "journal": {
             **status_journal(ledger.root),
             "recovered_write": "pending" if ledger.recovered else False,
@@ -1258,11 +1932,14 @@ def status_report(ledger, rules=None, rules_error=None, queue=None):
 
 def _local_playwright(root=None):
     """Playwright CLI instalado em `.tools`, ou None quando não há um."""
-    root = Path(root) if root is not None else SKILL_ROOT
-    root = root / ".tools/node_modules/.bin"
+    if root is not None:
+        bin_dir = Path(root) / ".tools/node_modules/.bin"
+    else:
+        bin_dir = _paths.tools_dir().path / "node_modules/.bin"
     for name in ("playwright-cli.cmd", "playwright-cli"):
-        if (root / name).is_file():
-            return root / name
+        # lenient: tool discovery: try the next candidate name
+        if (bin_dir / name).is_file():
+            return bin_dir / name
     return None
 
 
@@ -1276,6 +1953,7 @@ def _safe_size(path):
     """File size in bytes, or None when the file is missing/unreadable."""
     try:
         return Path(path).stat().st_size
+    # lenient: log field only: file size or None, so a logging call never raises
     except OSError:
         return None
 
@@ -1291,6 +1969,7 @@ def _rules_project_present(args):
     if not project:
         return False
     try:
+        # lenient: telemetry field, inside try/except OSError
         return (Path(project).expanduser() / "RULES.md").is_file()
     except OSError:
         return False
@@ -1304,6 +1983,7 @@ def _brief_present(args):
     try:
         from getbrolls.brief import brief_path
 
+        # lenient: telemetry field, inside try/except (ValueError, OSError)
         return brief_path(project).is_file()
     except (ValueError, OSError):
         return False
@@ -1327,161 +2007,989 @@ def _inspect_windows_source(windows):
     return "none"
 
 
-def execute(args):  # noqa: C901, PLR0911, PLR0912, PLR0915 - existing size; shrink when the dispatcher is split
-    from getbrolls.config import load_env, settings
+def _validate_scan_flags(cmd, args):
+    """`preview --scan` não combina com --start/--end nem --reference-only."""
+    if not (cmd == "preview" and args.scan):
+        return
+    if args.start is not None or args.end is not None:
+        raise ValueError(
+            "--scan varre o vídeo inteiro: não combine com --start/--end. "
+            "Escolha o intervalo depois, olhando a varredura."
+        )
+    if args.reference_only:
+        raise ValueError("--scan precisa da mídia de trabalho; não use com --reference-only.")
 
-    if args.env_file and not Path(args.env_file).is_file():
-        raise ValueError("--env-file não existe. Confira o caminho.")
-    load_env(args.env_file or Path(__file__).resolve().parents[2] / ".env")
-    config = settings()
-    with contextlib.suppress(Exception):
+
+def _bulk_approve_result(args, ledger, rules):
+    """Resolve `approve --all`/vários `--candidate`, ou normaliza `args.candidate` para um só."""
+    chosen = list(args.candidate or [])
+    if args.channel == "chat" and not (args.statement or "").strip():
+        raise ValueError("Aprovação pelo chat exige --statement com a frase exata dita pela pessoa.")
+    if args.all and chosen:
+        raise ValueError("Use --all sozinho ou --candidate ID (repetindo a flag), nunca os dois juntos.")
+    if args.all and (args.start is not None or args.end is not None):
+        raise ValueError("--all aprova os intervalos já escolhidos; não use --start/--end.")
+    if not args.all and not chosen:
+        raise ValueError(
+            "Informe --candidate ID (repita a flag para vários), ou use --all para todos os candidatos com prévia."
+        )
+    if len(chosen) > 1 and (args.start is not None or args.end is not None):
+        raise ValueError("--start/--end valem para um candidato só; aprove um por vez para mudar o intervalo.")
+    if args.all:
+        return approve_all(ledger, args, rules)
+    if len(chosen) > 1:
+        return approve_all(ledger, args, rules, only=chosen)
+    args.candidate = chosen[0]
+    return None
+
+
+def _bulk_reject_result(args, ledger):
+    """Resolve vários `--candidate` de `reject` de uma vez, ou normaliza para um candidato só."""
+    # `--candidate` é repetível: `argparse` entrega lista mesmo com um ID só.
+    chosen = list(args.candidate or [])
+    if len(chosen) > 1:
+        return reject_all(ledger, chosen, getattr(args, "reason", None))
+    args.candidate = chosen[0]
+    return None
+
+
+def _bulk_candidate_result(cmd, args, ledger, rules):
+    """Resolve `approve --all`/vários `--candidate` de uma vez, ou normaliza para um candidato só."""
+    if cmd == "approve":
+        return _bulk_approve_result(args, ledger, rules)
+    if cmd == "reject":
+        return _bulk_reject_result(args, ledger)
+    return None
+
+
+def _validate_candidate_guard(c, rules, cmd):
+    """Bloqueia preview/approve/permit/fetch num asset que as regras atuais não permitem."""
+    from getbrolls.rules import allowed
+
+    if not allowed(c, rules) and cmd in ("preview", "approve", "permit", "fetch"):
+        raise ValueError("Asset bloqueado pelas regras atuais do usuário.")
+
+
+def _apply_start_end(cmd, c, args):
+    """Confere/grava o intervalo de origem para preview/approve, ou recusa quando não cabe."""
+    if cmd not in ("preview", "approve"):
+        return
+    # `--reference-only` não pede mídia nenhuma: é o cartaz estático de um vídeo que
+    # a fonte não deixa baixar. Exigir intervalo aqui obrigaria a inventar um.
+    reference_without_range = cmd == "preview" and args.reference_only and args.start is None and args.end is None
+    # `approve --candidate ID` sozinho confirma o intervalo que a pessoa acabou de
+    # ver na prévia: exigir `--start/--end` de novo obrigaria a redigitar o que já
+    # está gravado, e digitar errado apagaria a prévia que ela aprovou.
+    approving_current = cmd == "approve" and args.start is None and args.end is None
+    if approving_current:
+        pass
+    elif c.get("media", {}).get("kind") != "image" and not reference_without_range:
+        if args.start is None or args.end is None:
+            raise ValueError(
+                "Vídeo exige --start e --end. Se a fonte não libera o trecho, use "
+                "`--reference-only` sozinho e eu gero só o cartaz estático."
+            )
+        set_segment(c, args.start, args.end)
+    elif args.start is not None or args.end is not None:
+        raise ValueError("Imagem estática não precisa de intervalo de origem.")
+
+
+def _permit_via_preset(c, args, preset):
+    """Rota `--preset`: condição genérica da fonte, com verificação opcional anexada."""
+    # O preset nunca vira licença: ele diz o que a fonte costuma exigir e manda
+    # conferir a página do item. Quem assina continua responsável, e `fetch`
+    # continua exigindo a aprovação humana.
+    from getbrolls import presets
+
+    evidence = presets.get(preset)["text"]
+    if args.evidence is not None:
+        if not args.evidence.strip():
+            raise ValueError("Evidência não pode ser vazia.")
+        evidence += " | Verificado por quem pediu: " + args.evidence.strip()
+    c["rights"]["basis"] = "per_item_evidence"
+    return evidence, "preset", preset
+
+
+def _permit_via_declared_by(c, args):
+    """Rota `--declared-by`/`--declaration-text`: declaração literal dita no chat."""
+    name = (args.declared_by or "").strip()
+    text = (args.declaration_text or "").strip()
+    _check_declared_by(name)
+    if len(text) < 20:  # noqa: PLR2004 - matches the "20 caracteres ou mais" message below
+        raise ValueError("--declaration-text precisa da frase literal da pessoa, com 20 caracteres ou mais.")
+    evidence = "Declaração do usuário " + name + ": " + text
+    c["rights"]["basis"] = "user_declaration"
+    c["rights"]["responsible_person"] = name
+    c["rights"]["declaration_channel"] = "chat"
+    return evidence, "declaration", None
+
+
+def _permit_via_rules_declaration(c, rules):
+    """Rota `--declaration`: usa a declaração já configurada em RULES.md."""
+    rights = rules["copyright"]
+    if rights["mode"] != "user_declaration":
+        raise ValueError("Usuário deve configurar sua declaração em RULES.md primeiro.")
+    evidence = "Declaração do usuário " + rights["responsible_person"] + ": " + rights["declaration"]
+    c["rights"]["basis"] = "user_declaration"
+    c["rights"]["responsible_person"] = rights["responsible_person"]
+    return evidence, "declaration", None
+
+
+def _permit_via_evidence(c, args):
+    """Rota padrão: `--evidence` com o texto literal das condições de uso."""
+    if args.evidence is None:
+        raise ValueError(
+            'Diga as condições de uso: --evidence TEXTO, ou --declared-by NOME --declaration-text "frase da pessoa".'
+        )
+    if not args.evidence.strip():
+        raise ValueError("Evidência não pode ser vazia.")
+    c["rights"]["basis"] = "per_item_evidence"
+    return args.evidence, "evidence", None
+
+
+def _apply_permit(c, args, rules):
+    """Aplica `permit`: registra a evidência/preset/declaração e devolve (rota, nome do preset)."""
+    preset = getattr(args, "preset", None)
+    if preset and (args.declaration or args.declared_by or args.declaration_text):
+        raise ValueError(
+            "--preset registra as condições genéricas da fonte; não combine com "
+            "declaração de responsabilidade. Escolha um dos dois."
+        )
+    if preset:
+        evidence, permit_route, permit_preset_name = _permit_via_preset(c, args, preset)
+    elif args.declared_by or args.declaration_text:
+        evidence, permit_route, permit_preset_name = _permit_via_declared_by(c, args)
+    elif args.declaration:
+        evidence, permit_route, permit_preset_name = _permit_via_rules_declaration(c, rules)
+    else:
+        evidence, permit_route, permit_preset_name = _permit_via_evidence(c, args)
+    c["rights"]["status"] = "permitted"
+    c["rights"]["evidence"].append(evidence)
+    return permit_route, permit_preset_name
+
+
+def _apply_preview(c, args, ledger, config):
+    """Aplica `preview`: gera a mídia (ou referência), atualiza estado e devolve (modo, invalidou_aprovação)."""
+    context_before = signature(c)
+    if not args.reference_only and c["provider"] != "local" and c.get("media", {}).get("kind") == "image":
+        # Foto remota (NASA, Commons): sem intervalo nem teto de segundos. A prévia
+        # é o cartaz da própria foto, baixada uma vez para o cache privado.
+        from .acquisition import prepare_image_source
+
+        prepare_image_source(ledger, c)
+    elif not args.reference_only and c["provider"] != "local":
+        # Vídeo sem --start/--end já parou antes, no guard de `preview`/`approve`.
+        asked = args.end - args.start  # pyright: ignore[reportOptionalOperand]
+        if asked > float(config["max_seconds"]) + CAP_EPSILON:
+            raise ValueError(
+                f"Trecho de {asked:g} s excede o teto de prévia: GB_PREVIEW_MAX_SECONDS "
+                f"está em {config['max_seconds']} s. Encurte o intervalo, ou aumente a "
+                "variável se você realmente precisa de uma prévia mais longa."
+            )
+        from .acquisition import prepare_source
+
+        prepare_source(ledger, c, args.start, args.end)
+    if c.get("local_path") and not args.reference_only:
+        from .previewing import prepare_preview
+
+        prepare_preview(ledger, c, args.start, args.end, config)
+        if c["approval"]["status"] == "approved" and c["approval"].get("signature") == signature(c):
+            c["state"] = "verified" if c["output"].get("verified") else "approved"
+        else:
+            c["state"] = "rejected" if c["approval"]["status"] == "rejected" else "awaiting_approval"
+        preview_mode = "image" if c.get("media", {}).get("kind") == "image" else "cut"
+    else:
+        c["preview"]["warning"] = "Somente referência estática; o trecho animado requer original local autorizado."
+        c["state"] = "reference_only"
+        # Sem um arquivo de imagem ninguém decide nada, e `status` nem conta o item
+        # como tendo prévia. A miniatura pública da fonte já basta para isso.
+        reference_poster(ledger, c)
+        preview_mode = "reference_only"
+    if c["preview"].get("warning"):
+        record_warning("PREVIEW_LIMITATION", c["preview"]["warning"])
+    if args.narration is not None:
+        c["narration"] = args.narration
+    if args.reason is not None:
+        c["match"]["reason"] = args.reason
+    approval_invalidated = False
+    if context_before != signature(c):
+        c["approval"] = pending_approval()
+        c.pop("review", None)
+        c["state"] = "awaiting_approval" if c.get("local_path") else "reference_only"
+        approval_invalidated = True
+    return preview_mode, approval_invalidated
+
+
+def _fetch_local_source(c):
+    """Confirma que o original local importado ainda bate com o hash registrado."""
+    src = c["local_path"]
+    if digest(src) != c["local_sha256"]:
+        raise ValueError("Original local mudou: importe novamente e aprove a nova versão.")
+    return src
+
+
+def _fetch_routed_check_existing(ledger, c):
+    """Recusa a rota de plugin se a revisão atual já foi coletada (sem gastar licença/cota)."""
+    stem = id_stem(c["id"]) + f"-r{c['segment']['revision']}"
+    project = ledger.root.parent
+    if c.get("media", {}).get("kind") == "image":
+        # Todas as pastas de clipes do layout: no 1, a antiga `brolls/clips/` também.
+        existing = layout.existing_clips(project, stem + ".*")
+        if existing:
+            # Recusa antes de gastar licença/cota numa revisão já coletada, seja
+            # qual for a extensão que a imagem coletada usou.
+            raise ValueError(_already_collected(existing[0]))
+        return
+    planned = "clips/" + stem + ".mp4"
+    if layout.clip_taken(project, planned):
+        # Recusa antes de gastar licença/cota numa revisão já coletada.
+        raise ValueError(_already_collected(planned))
+
+
+def _fetch_routed_record_license(c, routed, reacquire):
+    """Grava consumo/reaquisição de licença da rota de plugin; devolve se algo mudou."""
+    from .acquisition import license_evidence
+
+    changed = False
+    if reacquire and not routed.reused and c["acquisition"].get("route_consumed_at"):
+        # Nova aquisição confirmada pela pessoa: a primeira data fica, e esta
+        # entra na lista — o ledger mostra que a licença foi consumida de novo.
+        c["acquisition"].setdefault("route_reacquired_at", []).append(now())
+        logs.event(_log, logging.INFO, "route_reacquired", candidate=c["id"], plugin=routed.plugin)
+        changed = True
+    if routed.license:
+        # Evidência a mais, gravada depois do permit humano — nunca no lugar dele.
+        evidence = license_evidence(routed.plugin, routed.license)
+        if evidence not in c["rights"]["evidence"]:
+            c["rights"]["evidence"].append(evidence)
+            changed = True
+    if not c["acquisition"].get("route_consumed_at"):
+        c["acquisition"]["route_consumed_at"] = now()
+        changed = True
+    return changed
+
+
+def _fetch_routed_validate_format(c, routed):
+    """Confere formato de imagem, ou duração mínima do vídeo, entregues pela rota de plugin."""
+    if c.get("media", {}).get("kind") == "image":
+        # O formato só é conferido DEPOIS que cache e licença já estão
+        # gravados (acima) — uma imagem de formato não reconhecido é recusada sem
+        # custar a rota (e a licença) de novo a cada retry; o cache já existe.
+        # A extensão vem do conteúdo, como na foto das fontes embutidas
+        # (`media.image_suffix`), nunca do nome que o plugin deu ao arquivo.
+        from .media import SNIFFED_IMAGE_SUFFIXES, image_suffix
+
+        try:
+            image_suffix(routed.path)
+        except ValueError:
+            from .http import ProviderError
+
+            raise ProviderError(
+                f"Plugin {routed.plugin}: a rota devolveu uma imagem de formato não "
+                f"reconhecido; entregue {', '.join(SNIFFED_IMAGE_SUFFIXES)}."
+            ) from None
+        return
+    if routed.duration_s is not None and c["segment"]["end_s"] > routed.duration_s + 0.1:
+        raise ValueError(
+            f"A fonte entregou {routed.duration_s:g} s, mas o trecho aprovado vai até "
+            f"{c['segment']['end_s']:g} s: a duração real é menor. Gere a prévia com um "
+            "intervalo dentro dela (preview --reference-only), aprove e rode fetch de novo; "
+            "o arquivo já baixado é reaproveitado."
+        )
+
+
+def _fetch_routed_source(args, ledger, c):
+    """Fonte de plugin: cache privado reaproveitável, licença registrada e formato conferido."""
+    from .acquisition import fetch_routed_source
+
+    # Rota de plugin: roda só aqui, depois de aprovação + permit (require_fetch antes
+    # de chamar). O plugin traz o arquivo; corte, hash e ledger seguem com o core.
+    _fetch_routed_check_existing(ledger, c)
+    # O arquivo da rota vai para o cache privado (fora de `brolls/`) e é
+    # reaproveitado se este `fetch` falhar adiante: a licença é consumida uma vez.
+    reacquire = bool(getattr(args, "reacquire", False))
+    routed = fetch_routed_source(ledger, c, reacquire=reacquire)
+    if _fetch_routed_record_license(c, routed, reacquire):
+        # Grava já, antes do corte: se o corte falhar, a licença consumida e o
+        # marcador ficam no ledger (a rota não roda de novo no próximo fetch).
+        ledger.save("fetch-route", c)
+    _fetch_routed_validate_format(c, routed)
+    return routed.path
+
+
+def _fetch_downloaded_source(ledger, c):
+    """Sem original local nem rota de plugin: baixa direto do provedor para um arquivo temporário."""
+    from getbrolls import providers
+    from getbrolls.http import download_rendition
+
+    # Re-resolve from the provider to refresh temporary variant URLs.
+    fresh = providers.refresh(c)
+    url = fresh.get("media_url")
+    if not url:
+        raise ValueError(
+            "Esta fonte não disponibilizou arquivo por transporte permitido; "
+            f"execute antes: preview --candidate {candidate_arg(c)} --start INICIO --end FIM"
+        )
+    temp = ledger.root / "previews" / ("download-" + id_stem(c["id"]) + ".part")
+    # Sobra de um `fetch` morto no meio (SIGTERM): o download abre com "xb" e
+    # recusaria o nome já existente. É o mesmo cuidado do `reference_poster`.
+    effects.unlink(temp, missing_ok=True)
+    download_rendition(fresh, temp)
+    return temp
+
+
+def _fetch_source(args, ledger, c):
+    """Resolve de onde vem o arquivo do `fetch`: local, rota de plugin, ou download direto.
+
+    Devolve {src, temp, routed_remote}. `temp` é o arquivo temporário a apagar depois
+    (só no caso de download); `routed_remote` marca a rota de plugin para o log final.
+    """
+    from .acquisition import route_name
+
+    if c.get("local_path"):
+        return {"src": _fetch_local_source(c), "temp": None, "routed_remote": False}
+    if route_name(c) is not None:
+        return {"src": _fetch_routed_source(args, ledger, c), "temp": None, "routed_remote": True}
+    temp = _fetch_downloaded_source(ledger, c)
+    return {"src": temp, "temp": temp, "routed_remote": False}
+
+
+def _fetch_image_output(ledger, c, source):
+    """Copia a imagem baixada/roteada/local para clips/, com extensão pelo conteúdo real."""
+    from .media import IMAGE_SUFFIXES, copy_image, image_suffix
+
+    src, temp = source["src"], source["temp"]
+    # O download chega como `.part` (e cópia antiga do cache como `.mp4`), e a
+    # rota de plugin nomeia o arquivo como quiser: a extensão de `clips/` — e,
+    # dela, a de `entrega/` — sai do conteúdo real, só de formato conhecido; o
+    # resto é recusado, nunca herda a da URL nem a do nome. Só o original
+    # local importado pela pessoa, já com extensão de imagem, fica como está.
+    suffix = Path(src).suffix.lower()
+    try:
+        if c["provider"] != "local" or suffix not in IMAGE_SUFFIXES:
+            suffix = image_suffix(src)
+        rel = "clips/" + id_stem(c["id"]) + f"-r{c['segment']['revision']}" + suffix
+        dest = layout.clip_file(ledger.root.parent, rel, for_write=True)
+        if layout.clip_taken(ledger.root.parent, rel):
+            raise ValueError(_already_collected(rel))
+        staged = _staged_clip(dest)
+        copy_image(src, staged)
+    finally:
+        if temp:
+            effects.unlink(temp, missing_ok=True)
+    c["output"] = {"path": rel, "sha256": digest(staged), "verified": True}
+    c["state"] = "verified"
+    return staged, dest
+
+
+def _staged_clip(dest):
+    """Nome provisório do clipe, na mesma pasta: o nome final só vem depois do journal.
+
+    Uma sobra de `fetch` interrompido com o mesmo nome é apagada antes.
+    """
+    staged = layout.staged_clip(dest)
+    effects.unlink(staged, missing_ok=True)
+    return staged
+
+
+def _drop_staged_leftovers(ledger, c):
+    """Apaga o provisório que um `fetch` morto (SIGKILL) deixou desta revisão.
+
+    Roda antes de tudo: a recusa "já coletada" da rota de plugin olha `<nome>.*` e
+    tomaria a sobra por um clipe. Pasta de clipes inutilizável fica para quem grava recusar.
+    """
+    stem = id_stem(c["id"]) + f"-r{c['segment']['revision']}"
+    try:
+        folder = layout.clips_dir(ledger.root.parent)
+    except ValueError:
+        return
+    # lenient: cleanup of staged leftovers from an interrupted fetch
+    if folder.is_dir():
+        for leftover in folder.glob(stem + layout.STAGED_CLIP_MARK + ".*"):
+            effects.unlink(leftover, missing_ok=True)
+
+
+def _publish_clip(ledger, c, staged):
+    """Grava o journal do `fetch` com o nome final do clipe; o ledger troca o nome do provisório.
+
+    A troca roda dentro da transação, depois do journal e antes do manifesto. Um SIGKILL em qualquer
+    ponto deixa o journal para o próximo comando concluir: o manifesto nunca nomeia um clipe que não
+    existe. Interrompido antes do journal, o manifesto não conhece o corte e o provisório some.
+    """
+    try:
+        ledger.save("fetch", c, publish=[c["output"]["path"]])
+    except BaseException:
+        # lenient: inside except BaseException of a failed save; must not mask that error
+        if not ledger.pending.exists():
+            effects.unlink(staged, missing_ok=True)
+        raise
+
+
+def _fetch_finish_image(ledger, c, source, fetch_started_at):
+    """Grava e loga o `fetch` de imagem; devolve o candidato (retorno antecipado do pipeline)."""
+    staged, dest = _fetch_image_output(ledger, c, source)
+    _publish_clip(ledger, c, staged)
+    render(ledger)
+    logs.event(
+        _log,
+        logging.INFO,
+        "fetch",
+        candidate=c["id"],
+        kind="remote" if c["provider"] != "local" else "local",
+        bytes=_safe_size(dest),
+        sha256_prefix=_sha256_prefix(c["output"]["sha256"]),
+        ms=round((time.monotonic() - fetch_started_at) * 1000),
+    )
+    return c
+
+
+def _fetch_video_output(ledger, c, source):
+    """Corta o vídeo para clips/, recusando sobrescrever uma revisão já coletada."""
+    src, temp = source["src"], source["temp"]
+    rel = "clips/" + id_stem(c["id"]) + f"-r{c['segment']['revision']}.mp4"
+    try:
+        dest = layout.clip_file(ledger.root.parent, rel, for_write=True)
+    except ValueError:
+        if temp:
+            effects.unlink(temp, missing_ok=True)
+        raise
+    # O arquivo entregue nasce somente-leitura (delivery._freeze congela o inode
+    # compartilhado): sem esta checagem o ffmpeg falharia por permissão, sem dizer
+    # o motivo. Recusar aqui, antes de gastar a fonte, explica o que fazer.
+    if layout.clip_taken(ledger.root.parent, rel):
+        if temp:
+            effects.unlink(temp, missing_ok=True)
+        raise ValueError(_already_collected(rel))
+    staged = _staged_clip(dest)
+    try:
+        offset = c.get("local_start_s", 0)
+        start = c["segment"]["start_s"] - offset
+        end = c["segment"]["end_s"] - offset
+        if start < 0 or (c.get("local_duration_s") is not None and end > c["local_duration_s"] + 0.1):
+            raise ValueError("Gere uma nova prévia para este intervalo antes da coleta.")
+        cut(src, staged, start, end)
+    finally:
+        if temp:
+            effects.unlink(temp, missing_ok=True)
+    c["output"] = {
+        "path": rel,
+        "sha256": digest(staged),
+        "verified": True,
+    }
+    c["state"] = "verified"
+    c["output_media"] = probe(staged)
+    return staged, dest
+
+
+def _fetch_finish_video(ledger, c, source, fetch_started_at):
+    """Corta, grava e loga o `fetch` de vídeo; devolve o candidato."""
+    staged, _ = _fetch_video_output(ledger, c, source)
+    _publish_clip(ledger, c, staged)
+    render(ledger)
+    with contextlib.suppress(Exception):  # logging must never break a command
         logs.event(
             _log,
-            logging.DEBUG,
-            "config",
-            env_file_present=bool(getattr(args, "env_file", None)),
-            rules_project=_rules_project_present(args),
-            brief_present=_brief_present(args),
-            provider_keys=_provider_keys_set(),
+            logging.INFO,
+            "fetch",
+            candidate=c["id"],
+            kind="remote" if source["temp"] or source["routed_remote"] else "local",
+            bytes=_safe_size(layout.clip_file(ledger.root.parent, c["output"]["path"], for_write=True))
+            if c["output"].get("path")
+            else None,
+            sha256_prefix=_sha256_prefix(c["output"].get("sha256")),
+            ms=round((time.monotonic() - fetch_started_at) * 1000),
         )
+    return c
+
+
+def _apply_fetch(args, ledger, c):
+    """Aplica `fetch` por completo (rota local/plugin/download, corte, hash) e devolve o candidato salvo."""
+    fetch_started_at = time.monotonic()
+    require_fetch(c)
+    _drop_staged_leftovers(ledger, c)
+    source = _fetch_source(args, ledger, c)
+    if c.get("media", {}).get("kind") == "image":
+        return _fetch_finish_image(ledger, c, source, fetch_started_at)
+    return _fetch_finish_video(ledger, c, source, fetch_started_at)
+
+
+def _log_approve(args, c):
+    """Loga a decisão de `approve` para um candidato."""
+    logs.event(
+        _log,
+        logging.INFO,
+        "approve",
+        candidate=c["id"],
+        channel=args.channel,
+        revision=c["segment"]["revision"],
+        by_present=bool((args.by or "").strip()),
+        statement_present=bool((args.statement or "").strip()),
+    )
+
+
+def _log_permit(c, permit_route, permit_preset_name):
+    """Loga a rota de `permit` (preset/declaração/evidência) usada para o candidato."""
+    logs.event(_log, logging.INFO, "permit", candidate=c["id"], route=permit_route, preset=permit_preset_name)
+
+
+def _log_reject(c):
+    """Loga a rejeição de um candidato, com o motivo (se houver) e o que foi invalidado."""
+    rejection = c.get("rejection") or {}
+    logs.event(
+        _log,
+        logging.INFO,
+        "reject",
+        candidate=c["id"],
+        had_review=bool(rejection.get("invalidated_review")),
+        reason_present=bool(rejection.get("reason")),
+        output_cleared=True,
+    )
+
+
+def _log_preview(c, approval_invalidated, preview_mode):
+    """Loga a geração de prévia e, se a aprovação anterior caiu, o aviso correspondente."""
+    if approval_invalidated:
+        logs.event(
+            _log,
+            logging.INFO,
+            "approval_invalidated",
+            candidate=c["id"],
+            reason="segment_changed",
+            revision=c["segment"]["revision"],
+        )
+    logs.event(
+        _log,
+        logging.INFO,
+        "preview",
+        candidate=c["id"],
+        start_s=c["segment"]["start_s"],
+        end_s=c["segment"]["end_s"],
+        revision=c["segment"]["revision"],
+        mode=preview_mode,
+    )
+
+
+def _log_candidate_command(cmd, args, c, extra):
+    """Loga approve/permit/reject/preview; nunca deixa uma falha de log derrubar o comando.
+
+    `extra` = {permit_route, permit_preset_name, approval_invalidated, preview_mode}.
+    """
+    try:
+        if cmd == "approve":
+            _log_approve(args, c)
+        elif cmd == "permit":
+            _log_permit(c, extra["permit_route"], extra["permit_preset_name"])
+        elif cmd == "reject":
+            _log_reject(c)
+        elif cmd == "preview":
+            _log_preview(c, extra["approval_invalidated"], extra["preview_mode"])
+    except Exception:  # noqa: BLE001, S110 -- pylint: disable=broad-exception-caught
+        # logging must never break a command
+        pass
+
+
+def _execute_candidate_command(cmd, args, config, rules, ledger):
+    """Pipeline compartilhado de preview/approve/permit/reject/fetch/remember para um candidato só."""
+    _validate_scan_flags(cmd, args)
+    bulk = _bulk_candidate_result(cmd, args, ledger, rules)
+    if bulk is not None:
+        return bulk
+    c = ledger.get(args.candidate)
+    _validate_candidate_guard(c, rules, cmd)
+    if cmd == "remember":
+        from getbrolls.memory import remember
+
+        return remember(ledger, c, args.decision, args.reason, args.by)
+    if cmd == "preview" and args.scan:
+        return scan_candidate(ledger, c, config)
+    _apply_start_end(cmd, c, args)
+    # Defaults for the audit-trail fields the elif branches below fill in;
+    # only used after the shared save at the end of this function, for logging.
+    permit_route = None
+    permit_preset_name = None
+    preview_mode = None
+    approval_invalidated = False
+    if cmd == "approve":
+        # Depois de `_apply_start_end`: um intervalo novo no `approve` derruba a
+        # prévia, e o trecho que ninguém viu não pode ser aprovado.
+        _refuse_ungated_approval(c, rules)
+        approve(c, args.by, args.channel, args.statement)
+    elif cmd == "permit":
+        permit_route, permit_preset_name = _apply_permit(c, args, rules)
+    elif cmd == "reject":
+        mark_rejected(c, getattr(args, "reason", None))
+    elif cmd == "preview":
+        preview_mode, approval_invalidated = _apply_preview(c, args, ledger, config)
+    elif cmd == "fetch":
+        return _apply_fetch(args, ledger, c)
+    # O journal distingue a decisão dita no chat da que veio assinada pelo Storyboard.
+    ledger.save("approve-chat" if cmd == "approve" and args.channel == "chat" else cmd, c)
+    render(ledger)
+    _log_candidate_command(
+        cmd,
+        args,
+        c,
+        {
+            "permit_route": permit_route,
+            "permit_preset_name": permit_preset_name,
+            "approval_invalidated": approval_invalidated,
+            "preview_mode": preview_mode,
+        },
+    )
+    if cmd == "preview":
+        # Absolute paths for the agent to open the exact files the Storyboard shows.
+        # They live only in this response, never in the manifest.
+        return {**c, "files": preview_files(ledger, c)}
+    return c
+
+
+def _doctor_plugin_inventory(result, summary):
+    """Sobrepõe status/reason reais do registro no inventário de plugins do `doctor`."""
+    from getbrolls.sdk import loader as sdk_loader
+    from getbrolls.sdk import requirements
+    from getbrolls.sdk.marketplace_install import plugin_origins
+    from getbrolls.sdk.registry import get_registry
+
+    try:
+        origins = plugin_origins()
+        installed = [
+            {**row, "requires": requirements.report(manifest)} if manifest is not None else row
+            for row, _folder, manifest in sdk_loader.entries()
+        ]
+    except ValueError as exc:
+        from getbrolls.sdk.marketplace import portable_text
+
+        result["plugins_error"] = portable_text(exc)
+        return
+    installed = [{**row, "origin": origins.get(row["id"])} for row in installed]
+    if not installed:
+        return
+    # `loader.inventory()` só lê manifesto e pin (pré-carga: nunca roda
+    # código). `get_registry().plugins` reflete o carregamento de verdade
+    # (já rodou, porque `providers.capabilities()` acima monta o registro
+    # antes) — sobrepomos status/reason por id, sem perder nenhuma pasta
+    # que o inventário viu.
+    loaded = get_registry().plugins
+    result["plugins"] = [
+        {**row, "status": loaded[row["id"]]["status"], "reason": loaded[row["id"]]["reason"]}
+        if row["id"] in loaded
+        else row
+        for row in installed
+    ]
+    problems = doctor_plugin_problems(result["plugins"])
+    if problems:
+        summary["plugins"] = problems
+    # Só informa: requisito faltando não muda `ready` (o plugin carrega mesmo assim).
+    lacking = requirements.missing_summary(result["plugins"])
+    if lacking:
+        summary["plugins_requires"] = lacking
+
+
+def _doctor_marketplaces(result):
+    """Marketplaces fixados (nome, commit, plugins, permitido), só quando há algum; sem rede."""
+    from getbrolls.sdk import marketplace
+
+    try:
+        rows = marketplace.summary()
+    except ValueError as exc:
+        result["marketplaces_error"] = marketplace.portable_text(exc)
+        return
+    if rows:
+        result["marketplaces"] = rows
+
+
+def _doctor_executables(overrides, social):
+    """Presença de cada executável sondado: pin, `PATH` ou o runtime da instalação."""
+    from getbrolls.config import TOOL_PATH_KEYS
+
+    executables = {
+        name: bool(overrides.get(TOOL_PATH_KEYS.get(name) or "") or shutil.which(name)) for name in PROBED_EXECUTABLES
+    }
+    executables["yt-dlp"] = social["installed"]
+    executables["playwright-cli"] = bool(_local_playwright() or shutil.which("playwright-cli"))
+    return executables
+
+
+def _warn_old_env_names() -> None:
+    """Um `OLD_SHAPE` com os `GETBROLLS_X` do ambiente que a 2.6 não lê mais (só o `doctor` avisa)."""
+    old_names = _paths.old_env_names()
+    if old_names:
+        from getbrolls import renamed
+
+        renamed.old_shape(
+            "o conjunto de variáveis " + ", ".join(old_names) + " do ambiente",
+            "Troque cada GETBROLLS_X por GB_X (só GETBROLLS_CACHE_DIR, da 2.5, continua valendo).",
+        )
+
+
+def _doctor_report(config, providers_result, live, env_flag=None):
+    """Monta o relatório completo de `doctor`: executáveis, engine social, plugins e instalação."""
+    from getbrolls import profile
+
+    overrides, pin_problems, social, executables = readiness_probe()
+    install = _paths.install_report(env_flag)
+    _warn_old_env_names()
+    # Onde o log do app da instalação grava (o arquivo só nasce no primeiro comando que muda a instalação).
+    install["app_log"] = str(logs.home_log_path())
+    # A chave dos hashes do `event=op` (`$GB_HOME/.log-salt`): `missing` até a primeira linha que a usa.
+    install["log_salt"] = effects.salt_state()
+    install["profile"] = profile.report()
+    # A pasta pessoal que valeu e de onde veio (`env`, `env_file`, `profile` ou `default`).
+    install["gb_home_source"] = install["profile"]["values"]["home"]["source"]
+    summary = doctor_summary(
+        executables, pin_problems, install.get("data_missing") or (), install.get("data_unreadable") or ()
+    )
+    if social.get("problem"):
+        for entry in summary["missing"]:
+            if entry["item"] == "yt-dlp":
+                entry["note"] = social["problem"]
+    summary["missing"] += profile.doctor_problems(profile.current())
+    sheet = doctor_contact_sheet(executables.get("ffmpeg"))
+    summary["optional"] += sheet["optional"]
+    result = {
+        # Veredito primeiro: o JSON continua completo logo abaixo dele. `ready` decide a
+        # saída (4 quando falta algo obrigatório; ver `cli.result_exit`).
+        "summary": summary,
+        "ready": not summary["missing"],
+        "contact_sheet": sheet["status"],
+        "get_brolls": __version__,
+        "preview": config,
+        "python": sys.version.split()[0],
+        "tool_paths": overrides,
+        "executables": executables,
+        "resolved": doctor_resolved(overrides),
+        "providers": providers_result,
+        "social": social,
+        "install": install,
+    }
+    _doctor_plugin_inventory(result, summary)
+    _doctor_marketplaces(result)
+    if live:
+        from getbrolls.health import live_checks
+
+        result["live"] = live_checks()
+    return result
+
+
+def _execute_providers_or_doctor(args, config):
+    """`providers`/`doctor`: capacidades das fontes e, para `doctor`, o diagnóstico completo."""
     from getbrolls import providers
 
-    if args.command in ("providers", "doctor"):
-        result = providers.capabilities()
-        if args.command == "doctor":
-            from getbrolls.config import TOOL_PATH_KEYS
-
-            from .social import doctor as social_doctor
-
-            # Pin inválido vira item de `missing`, não morte do diagnóstico.
-            overrides, pin_problems = doctor_overrides()
-            resolved = doctor_resolved(overrides)
-            try:
-                social = social_doctor()
-            except ValueError as exc:
-                social = {"engine": "yt-dlp", "installed": False, "error": str(exc)}
-            executables = {
-                name: bool(overrides.get(TOOL_PATH_KEYS.get(name) or "") or shutil.which(name))
-                for name in PROBED_EXECUTABLES
-            }
-            executables["yt-dlp"] = social["installed"]
-            executables["playwright-cli"] = bool(_local_playwright() or shutil.which("playwright-cli"))
-            summary = doctor_summary(executables, pin_problems)
-            sheet = doctor_contact_sheet(executables.get("ffmpeg"))
-            summary["optional"] += sheet["optional"]
-            result = {
-                # Veredito primeiro: o JSON continua completo logo abaixo dele.
-                "summary": summary,
-                "contact_sheet": sheet["status"],
-                "get_brolls": __version__,
-                "preview": config,
-                "python": sys.version.split()[0],
-                "tool_paths": overrides,
-                "executables": executables,
-                "resolved": resolved,
-                "providers": result,
-                "social": social,
-            }
-            if args.live:
-                from getbrolls.health import live_checks
-
-                result["live"] = live_checks()
+    result = providers.capabilities()
+    if args.command != "doctor":
         return result
-    cmd = args.command
-    if cmd == "serve":
-        from getbrolls import serve as serve_module
+    return _doctor_report(config, result, args.live, getattr(args, "env_file", None))
 
-        port = getattr(args, "port", None) or serve_module.DEFAULT_PORT
-        if getattr(args, "stop", False):
-            return serve_module.stop(args.project)
-        if getattr(args, "background", False):
-            return serve_module.start_background(args.project, port)
-        return serve_module.run(args.project, port)
-    from getbrolls.rules import allowed, domain_matches, format_report, load_rules
+
+_TOOLCHAIN_RUNNERS = {
+    "profile": "getbrolls.profile",
+    "client": "getbrolls.clients",
+    "template": "getbrolls.templates",
+    "recipe": "getbrolls.recipes",
+    "setup": "getbrolls.bootstrap",
+    "plugins": "getbrolls.sdk.cli",
+    "x": "getbrolls.sdk.plugin_commands",
+    "environment": "getbrolls.sdk.environments",
+}
+
+
+def _execute_toolchain(args):
+    """`plugins`/`x` vão ao SDK, `setup` ao `bootstrap`, `capabilities` ao manifesto, `profile` ao perfil,
+    `client` ao registro de clientes e `template` e `recipe` às receitas; nenhum toca projeto."""
+    if args.command == "capabilities":
+        from getbrolls import capabilities
+        from getbrolls.cli import build_parser
+
+        return capabilities.describe(build_parser())
+    # lenient: dynamic import of a toolchain runner module, never os or os.path
+    return effects.import_module(_TOOLCHAIN_RUNNERS[args.command], operation="code.import").run(args)
+
+
+def _execute_serve(args):
+    """`serve`: sobe/derruba o servidor local do Storyboard em segundo plano, ou roda em primeiro plano."""
+    from getbrolls import serve as serve_module
+
+    port = getattr(args, "port", None) or serve_module.DEFAULT_PORT
+    if getattr(args, "stop", False):
+        return serve_module.stop(args.project)
+    if getattr(args, "background", False):
+        return serve_module.start_background(args.project, port)
+    return serve_module.run(args.project, port)
+
+
+def _execute_init(args):
+    """`init`: cria um projeto novo de layout 1 (`project.json` e as pastas de trabalho)."""
+    from getbrolls import project_init
+
+    return project_init.run(args)
+
+
+def _execute_migrate(args):
+    """`migrate`: adota o layout 1 sem mover arquivos (`plan` só mostra, `apply` grava `project.json`)."""
+    from getbrolls import migrate
+
+    return migrate.run(args)
+
+
+def _execute_init_rules(args):
+    """`init-rules`: cria RULES.md a partir do template, ou regrava só o bloco JSON com --force."""
+    dest = Path(args.project) / "RULES.md"
+    effects.mkdir(dest.parent, parents=True, exist_ok=True)
+    video_format = getattr(args, "video_format", None)
+    has_flags = bool(args.mode or args.responsible or args.declaration or video_format)
+    if _paths.strict_exists(dest) and not args.force:
+        raise ValueError(
+            "RULES.md já existe; edite sem sobrescrever suas regras. "
+            "Use --force com --mode/--responsible/--declaration/--format para regravar só o bloco JSON."
+        )
+    if args.force and not has_flags:
+        raise ValueError("--force só regrava o bloco JSON: informe --mode, --responsible, --declaration ou --format.")
+    template = _paths.data_path("docs", "RULES.md")
+    if has_flags:
+        from getbrolls.brief import read_utf8
+
+        # Regravar preserva o que o usuário já escolheu: a base é o arquivo dele.
+        source = dest if _paths.strict_exists(dest) else template
+        text, rights = rules_from_flags(
+            read_utf8(source),
+            args.mode,
+            args.responsible,
+            args.declaration,
+            video_format=video_format,
+            model=template.read_text(encoding="utf-8"),
+        )
+        # Temporário + troca: um disco cheio no meio nunca deixa o RULES.md truncado. RULES.md
+        # pode ser link (nota do Obsidian): grava no arquivo de verdade e o link continua link.
+        atomic_write(dest.resolve(), text)
+        result = {"rules": str(dest), "copyright": rights}
+        if video_format:
+            result["video_format"] = video_format
+        return result
+    effects.copy_file(template, dest)
+    return {"rules": str(dest)}
+
+
+def _execute_status_or_queue(cmd, args):
+    """`status`/`queue`: leem RULES.md se conseguirem, mas nunca travam nele."""
+    from getbrolls.rules import load_rules
 
     if cmd == "status":
         # Somente leitura: nada é criado, nem a árvore do projeto, nem pendências.
         project = Path(args.project).expanduser().resolve()
-        if not (project / "brolls").is_dir():
-            raise ValueError(f"Projeto não encontrado em {project}; nenhum arquivo foi criado.")
+        if not _paths.strict_is_dir(project / "brolls"):
+            # A pasta como a pessoa a digitou: resolvida, um link no caminho mudaria a grafia.
+            typed = getattr(args, "project_typed", None) or args.project
+            raise ValueError(f"Projeto não encontrado em {typed}; nenhum arquivo foi criado.")
         rules = None
         rules_error = None
         try:
             rules = load_rules(args.project)
         except (ValueError, OSError) as exc:
-            rules_error = str(exc)
+            rules_error = labels.reason(exc)
+        from getbrolls import recipe_init
+
+        recipe_init.record_lock_warnings(project)
         return status_report(Ledger(project, recover=False), rules, rules_error, queue_hint(project))
-    if cmd == "queue":
-        rules = None
-        try:
-            rules = load_rules(args.project)
-        except (ValueError, OSError) as exc:
-            record_warning("RULES_UNAVAILABLE", f"RULES.md ignorado para o ritmo: {exc}")
-        return queue_execute(args, rules)
-    if cmd == "init-rules":
-        dest = Path(args.project) / "RULES.md"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        video_format = getattr(args, "video_format", None)
-        has_flags = bool(args.mode or args.responsible or args.declaration or video_format)
-        if dest.exists() and not args.force:
-            raise ValueError(
-                "RULES.md já existe; edite sem sobrescrever suas regras. "
-                "Use --force com --mode/--responsible/--declaration/--format para regravar só o bloco JSON."
-            )
-        if args.force and not has_flags:
-            raise ValueError(
-                "--force só regrava o bloco JSON: informe --mode, --responsible, --declaration ou --format."
-            )
-        template = SKILL_ROOT / "docs" / "RULES.md"
-        if has_flags:
-            # Regravar preserva o que o usuário já escolheu: a base é o arquivo dele.
-            source = dest if dest.exists() else template
-            text, rights = rules_from_flags(
-                source.read_text(encoding="utf-8"),
-                args.mode,
-                args.responsible,
-                args.declaration,
-                video_format=video_format,
-            )
-            dest.write_text(text, encoding="utf-8")
-            result = {"rules": str(dest), "copyright": rights}
-            if video_format:
-                result["video_format"] = video_format
-            return result
-        shutil.copyfile(template, dest)
-        return {"rules": str(dest)}
-    if cmd == "init-brief":
-        from getbrolls.brief import brief_path
+    rules = None
+    try:
+        rules = load_rules(args.project)
+    except (ValueError, OSError) as exc:
+        record_warning("RULES_UNAVAILABLE", f"RULES.md ignorado para o ritmo: {labels.reason(exc)}")
+    return queue_execute(args, rules)
 
-        # O arquivo que conta é o mesmo que `brief` vai ler, GB_BRIEF_FILE incluído:
-        # criar um BRIEF.md que ninguém lê seria pior que recusar.
-        dest = brief_path(args.project)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.exists():
-            raise ValueError(
-                f"{dest} já existe; edite o plano deste vídeo sem sobrescrever o que "
-                "você já respondeu. Rode `brief --validate --project ...` para conferi-lo."
-            )
-        shutil.copyfile(SKILL_ROOT / "docs" / "BRIEF.md", dest)
-        return {"brief": str(dest)}
-    if cmd == "brief":
-        # Somente leitura, como status: orienta a coleta sem criar nada no projeto.
-        return brief_report(args)
-    if cmd in ("learn", "library"):
-        # A biblioteca é pessoal e vive fora do projeto: não depende das regras
-        # dele nem passa pelo portão de formato.
-        return library_command(args)
-    rules = load_rules(args.project)
-    if cmd == "rules":
-        return rules
-    ledger = Ledger(args.project)
-    from getbrolls.rules import sync_formats
 
-    # Consultas (`references`, `inspect`) não decidem nada sobre formato: como o
-    # `status`, elas nunca podem ser barradas pelo portão de `--confirm-format-change`.
-    # `deliver --dry-run` é ensaio: não pode reescrever o manifesto nem por tabela.
-    if cmd not in READ_ONLY_CONSULTS and not (cmd == "deliver" and getattr(args, "dry_run", False)):
-        sync_formats(ledger, rules, confirm=getattr(args, "confirm_format_change", False))
+def _execute_init_brief(args):
+    """`init-brief`: cria BRIEF.md a partir do template, recusando sobrescrever um existente."""
+    from getbrolls.brief import brief_path
+
+    # O arquivo que conta é o mesmo que `brief` vai ler, GB_BRIEF_FILE incluído:
+    # criar um BRIEF.md que ninguém lê seria pior que recusar.
+    dest = brief_path(args.project)
+    effects.mkdir(dest.parent, parents=True, exist_ok=True)
+    if _paths.strict_exists(dest):
+        raise ValueError(
+            f"{labels.shown(dest)} já existe; edite o plano deste vídeo sem sobrescrever o que "
+            "você já respondeu. Rode `brief --validate --project PROJETO` para conferi-lo."
+        )
+    template = _paths.data_path("docs", "BRIEF.md")
+    from getbrolls.roteiro_frontmatter import is_roteiro, roteiro_format
+
+    if not is_roteiro(args.project):
+        effects.copy_file(template, dest)
+        return {"brief": str(dest), "summary": {"line": "BRIEF.md criado do modelo: preencha o plano e os beats."}}
+    # Com ROTEIRO.md do getbrolls, os beats nascem do sync e o formato é o do roteiro:
+    # nada de beat de exemplo, nem "native" contra um roteiro em 9:16.
+    text = template.read_text(encoding="utf-8")
+    block = re.findall(r"```json\s*\n(.*?)\n```", text, re.DOTALL)[0]
+    data = json.loads(block)
+    video_format = roteiro_format(args.project)
+    if video_format:
+        data["video"]["delivery"]["format"] = video_format
+    data["beats"] = []
+    effects.write_text(dest, text.replace(block, json.dumps(data, ensure_ascii=False, indent=2), 1), encoding="utf-8")
+    shown = f'"{video_format}"' if video_format else "o do modelo"
+    return {
+        "brief": str(dest),
+        "summary": {
+            "line": (
+                f"BRIEF.md criado com o formato {shown} do ROTEIRO.md e sem beats: eles nascem do "
+                "roteiro --action sync, depois da revisão."
+            )
+        },
+    }
+
+
+def _execute_roteiro_or_assets(args):
+    """`roteiro`/`assets`: organização de conteúdo, sem portão de formato — o roteiro confere o
+    aspecto contra RULES.md/BRIEF.md por conta própria."""
+    from getbrolls import roteiro_commands
+
+    return roteiro_commands.run(args)
+
+
+def _execute_analysis(args):
+    """`analysis`: índice de mídias por conteúdo e arquivos de `analysis/`, com trava própria."""
+    from getbrolls import analysis
+
+    return analysis.run(args)
+
+
+def _execute_export(args):
+    """`export`: delega ao exporter escolhido; sem portão de formato, sem `sync_formats`, sem
+    recuperar o manifesto (os portões recusam gravação pendente antes disso)."""
+    from getbrolls import export
+
+    return export.run(args)
+
+
+# Comandos administrativos que não tocam em `rules`/`ledger` do vídeo. `learn`/`library` são a
+# biblioteca pessoal, que vive fora do projeto e não depende das regras dele.
+_ADMIN_COMMAND_HANDLERS = {
+    "init": _execute_init,
+    "migrate": _execute_migrate,
+    "init-rules": _execute_init_rules,
+    "init-brief": _execute_init_brief,
+    # Somente leitura, como status: orienta a coleta sem criar nada no projeto.
+    "brief": brief_report,
+    "learn": library_command,
+    "library": library_command,
+    "roteiro": _execute_roteiro_or_assets,
+    "assets": _execute_roteiro_or_assets,
+    "export": _execute_export,
+    "analysis": _execute_analysis,
+}
+
+
+def _execute_config_free_command(cmd, args):
+    """Comandos que não dependem de `rules`/`ledger`: status, queue e os administrativos."""
+    if cmd in ("status", "queue"):
+        return _execute_status_or_queue(cmd, args)
+    handler = _ADMIN_COMMAND_HANDLERS.get(cmd)
+    return handler(args) if handler else None
+
+
+def _execute_read_only_project_command(cmd, args, config, rules, ledger):
+    """Consultas e `deliver`: já com `rules`/`ledger` prontos, mas sem tocar num candidato só."""
     if cmd == "deliver":
         return deliver_report(ledger, rules, getattr(args, "dry_run", False))
     if cmd == "browser-plan":
@@ -1489,248 +2997,491 @@ def execute(args):  # noqa: C901, PLR0911, PLR0912, PLR0915 - existing size; shr
 
         return plan(ledger, args.url, rules)
     if cmd == "references":
-        path = ledger.root / "references.json"
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"items": []}
+        from getbrolls.memory import load_references
 
+        return load_references(ledger.root)
     if cmd == "inspect":
         return inspect_source(ledger, args, config)
+    return None
 
-    if cmd == "search":
-        from getbrolls import library
 
-        if "video" not in rules["asset_types"]:
-            return {
-                "items": [],
-                "errors": [],
-                "note": "APIs atuais pesquisam vídeos. Para imagem/notícia use importação local ou browser-plan.",
-            }
-        args.provider = {"pixel": "pexels", "getbrolls": "auto"}.get(args.provider, args.provider)
-        if not 1 <= args.limit <= 50:  # noqa: PLR2004 - matches the "--limit entre 1 e 50" message below
-            raise ValueError("Use --limit entre 1 e 50.")
-        shot = (getattr(args, "shot", None) or "").strip() or None
-        # Mesma regra de `resolve --shot`: o beat vira sufixo do id, e é isso que
-        # liga o candidato ao BRIEF.md sem precisar re-registrar por URL depois.
-        if shot and not re.fullmatch(SHOT_RE, shot):
-            raise ValueError("--shot: use 1–80 letras, números, hífen ou underscore.")
-        dry_run = bool(getattr(args, "dry_run", False))
-        names = rules["preferred_providers"][args.intent] if args.provider == "auto" else [args.provider]
-        if not names:
-            raise ValueError(
-                "Nenhuma fonte configurada: use resolve --file, Commons/NASA ou configure a chave de um banco."
-            )
+class _SearchContext:  # pylint: disable=too-few-public-methods
+    # Contêiner simples de estado, não um objeto com comportamento.
+    """Estado compartilhado de uma chamada `search`: request, regras, ledger e fontes escolhidas."""
 
-        def sweep(query, retry=False):
-            """Uma varredura pelos provedores escolhidos, com esta query exata."""
-            items, errors, excluded = [], [], 0
-            for name in names:
-                if len(items) >= args.limit:
-                    break
-                before = len(items)
-                try:
-                    candidates = providers.search(
-                        name, query, args.limit - len(items), media=getattr(args, "media", "any")
-                    )
-                except ValueError as e:
-                    errors.append({"provider": name, "error": str(e)})
-                    record_warning("PROVIDER_FAILED", f"{name}: {e}")
-                    # Fonte que falhou é aprendizado barato e honesto; fica marcado
-                    # como `auto` porque ninguém digitou esse registro. Em `--dry-run`,
-                    # não: a busca de diagnóstico não escreve em lugar nenhum, e uma
-                    # falha de teste não pode virar memória editorial do usuário.
-                    if not dry_run:
-                        try:
-                            library.learn_query(query, name, "miss", note=str(e), auto=True)
-                        except (ValueError, OSError) as failure:
-                            record_warning("LIBRARY_WRITE_FAILED", str(failure))
-                    continue
-                # ledger.add/save stay outside the provider try: a disk/write error here is not the
-                # provider's fault and must not be attributed to it as a search failure.
-                for c in candidates:
-                    if not allowed(c, rules):
-                        excluded += 1
-                        continue
-                    c["format"] = format_report(c, rules)
-                    c["match"] = {
-                        "kind": args.intent,
-                        "reason": "Candidato de busca: correspondência visual deve ser revisada.",
-                    }
-                    if shot:
-                        c["id"] += ":shot:" + shot
-                        c["shot"] = shot
-                    if dry_run:
-                        # Busca de diagnóstico não entra no manifesto: a contagem do
-                        # `status` é do vídeo, não do que o agente experimentou.
-                        items.append(c)
-                        continue
-                    added = ledger.add(c)
-                    ledger.save("search", added)
-                    items.append(added)
-                logs.event(
-                    _log,
-                    logging.INFO,
-                    "search",
-                    provider=name,
-                    media=getattr(args, "media", "any"),
-                    intent=args.intent,
-                    shot=shot,
-                    query_words=len(query.split()),
-                    results=len(items) - before,
-                    retry=retry,
-                )
-            return items, errors, excluded
+    def __init__(  # noqa: PLR0913, PLR0917 -- pylint: disable=too-many-arguments,too-many-positional-arguments
+        self, args, rules, ledger, names, shot, dry_run
+    ):
+        self.args = args
+        self.rules = rules
+        self.ledger = ledger
+        self.names = names
+        self.shot = shot
+        self.dry_run = dry_run
+        # Ids que as regras barraram, somando a frase inteira e o retry encurtado: a query
+        # curta é mais ampla e costuma devolver os mesmos barrados, que contam uma vez só.
+        self.excluded = set()
 
-        query_used = args.query
-        items, errors, excluded = sweep(query_used)
-        # Frase inteira vira query e volta vazia: as APIs casam por palavra, e uma
-        # oração de doze palavras não casa com título nenhum. Em vez de devolver
-        # `items: []` calado, encurta uma vez e conta o que fez.
-        retry = None
-        tokens = args.query.split()
-        if not items and not errors and len(tokens) > SEARCH_QUERY_TOKENS:
-            # Mesmo corte que `brief --beat` usa para montar a query do beat: tira as
-            # palavras que não estreitam nada e fica com as primeiras que sobraram.
-            from getbrolls.brief import search_query
 
-            short = search_query({"target": args.query, "queries": []}, SEARCH_QUERY_TOKENS)
-            items, errors, excluded = sweep(short, retry=True)
-            retry = {
-                "from": args.query,
-                "to": short,
-                "note": (
-                    f'A busca por "{args.query}" não trouxe nada, então repeti uma vez '
-                    f'com as {SEARCH_QUERY_TOKENS} primeiras palavras ("{short}"): '
-                    "banco e YouTube casam por palavra, não por frase inteira."
-                ),
-            }
-            query_used = short
-        if not items and errors:
-            raise ValueError("; ".join(f"{e['provider']}: {e['error']}" for e in errors))
-        items.sort(key=lambda c: not domain_matches(c.get("source_url"), rules["preferred_domains"]))
-        shown = [_search_row(c) for c in items]
-        result = {
-            # Veredito primeiro: quem lê o JSON quer saber o que apareceu antes de
-            # abrir a lista inteira.
-            "summary": {"line": search_summary_line(shown, excluded, errors, dry_run, query_used, retry)},
-            "items": shown,
-            "errors": errors,
-            "excluded_by_rules": excluded,
-            "editorial_rules": rules["editorial_rules"],
-            "dry_run": dry_run,
-            "query": args.query,
-            # O que a fonte recebeu de fato: sem isto o encurtamento seria invisível.
-            "query_used": query_used,
-        }
-        if retry:
-            result["retry"] = retry
-        if dry_run:
-            result["note"] = (
-                "Busca de diagnóstico: nada foi registrado no projeto. Repita sem "
-                "`--dry-run` para guardar os candidatos que você quiser."
-            )
-        # Pistas da biblioteca são memória editorial, não permissão: cada uma
-        # repete `rights_not_transferable` e nenhuma toca no candidato.
-        found = library.hints(args.query)
-        if found:
-            result["library_hints"] = found
-        return result
-    if cmd == "resolve":
-        for flag, value in (("--file", args.file), ("--url", args.url)):
-            if value is not None and not value.strip():
-                raise ValueError(f"{flag} não pode ser vazio: informe o caminho ou a URL real.")
-        if args.file:
-            path = Path(args.file).expanduser().resolve()
-            if not path.is_file():
-                raise ValueError("Arquivo local inexistente.")
-            sha = digest(path)
-            c = candidate("local", sha[:16], path.name)
-            c["local_path"] = str(path)
-            c["local_sha256"] = sha
-            c["media"] = probe(path)
-            c["acquisition"] = {
-                "status": "available",
-                "method": "local",
-                "evidence": [],
-            }
-            c["preview"]["seek_mode"] = "local"
-        else:
-            c = providers.resolve(args.url)
-            fill_remote_metadata(c)
-        # Mesmo registro que `search` faz: a intenção é da pessoa, e sem ela o
-        # candidato de URL entrava sempre como "literal", inclusive quando não era.
-        c["match"]["kind"] = getattr(args, "intent", None) or c["match"].get("kind") or "literal"
-        for argument, field in (
-            (args.context_image, "context_image"),
-            (args.full_preview_file, "full_preview"),
-        ):
-            if argument:
-                if not args.file:
-                    raise ValueError("Contexto/composição exigem um B-roll local em --file.")
-                auxiliary = Path(argument).expanduser().resolve()
-                if not auxiliary.is_file():
-                    raise ValueError("Arquivo de contexto/composição não encontrado.")
-                if field == "context_image" and auxiliary.suffix.lower() not in (
-                    ".png",
-                    ".jpg",
-                    ".jpeg",
-                    ".webp",
-                ):
-                    raise ValueError("--context-image deve ser um print PNG/JPG/WebP.")
-                c[field + "_path"] = str(auxiliary)
-                c[field + "_sha256"] = digest(auxiliary)
-                c[field + "_media"] = probe(auxiliary)
-        if args.file:
-            inferred = (
-                "image" if path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff") else "video"
-            )
-            c["asset_type"] = args.asset_type or inferred
-            if (c["asset_type"] == "video") != (inferred == "video"):
-                raise ValueError("asset-type não corresponde ao formato do arquivo.")
-            c["media"]["kind"] = "video" if c["asset_type"] == "video" else "image"
-            if args.title:
-                c["title"] = args.title
-            if args.captured_at:
-                from datetime import datetime
+def _search_keep_candidates(ctx, candidates):
+    """Filtra/decora os candidatos de uma fonte; devolve (itens mantidos, registrados).
 
-                datetime.fromisoformat(args.captured_at)
-                c["captured_at"] = args.captured_at
-        elif args.asset_type or args.title or args.captured_at:
-            raise ValueError("Metadados locais exigem --file.")
-        if args.source_url or args.creator:
-            if not args.file:
-                raise ValueError("--source-url/--creator são exclusivos de --file.")
-            if args.source_url:
-                from getbrolls.http import public_url
+    Os barrados pelas regras vão para `ctx.excluded`.
+    """
+    from getbrolls.rules import allowed, format_report
 
-                url = public_url(args.source_url)
-                if not url:
-                    raise ValueError("Fonte deve ser URL HTTPS pública sem credenciais.")
-                c["source_url"] = url
-            if args.creator:
-                c["creator"]["name"] = args.creator
-        if args.shot:
-            if not re.fullmatch(SHOT_RE, args.shot):
-                raise ValueError("--shot: use 1–80 letras, números, hífen ou underscore.")
-            c["id"] += ":shot:" + args.shot
-            c["shot"] = args.shot
-        if c.get("asset_type") in ("news_screenshot", "web_screenshot") and not c.get("source_url"):
-            raise ValueError("Screenshot exige --source-url para manter a origem.")
+    args, rules, ledger = ctx.args, ctx.rules, ctx.ledger
+    kept_items = []
+    registered = 0
+    for c in candidates:
         if not allowed(c, rules):
-            raise ValueError("Fonte ou tipo de asset bloqueado pelas regras do usuário.")
+            ctx.excluded.add(c["id"])
+            continue
         c["format"] = format_report(c, rules)
-        c = ledger.add(c)
-        ledger.save(cmd, c)
-        logs.event(
-            _log,
-            logging.INFO,
-            "resolve",
-            provider=c["provider"],
-            candidate=c["id"],
-            kind="file" if args.file else "url",
+        c["match"] = {
+            "kind": args.intent,
+            "reason": "Candidato de busca: correspondência visual deve ser revisada.",
+        }
+        if ctx.shot:
+            c["id"] += ":shot:" + ctx.shot
+            c["shot"] = ctx.shot
+        if ctx.dry_run:
+            # Busca de diagnóstico não entra no manifesto: a contagem do
+            # `status` é do vídeo, não do que o agente experimentou.
+            kept_items.append(c)
+            continue
+        # Já registrado: vale o que está no manifesto. A fonte pode ter editado o
+        # título desde então, e o `add` recusaria a procedência nova — derrubando a
+        # busca inteira no meio, com metade já gravada. O `resolve` continua recusando.
+        known = next((x for x in ledger.data["items"] if x["id"] == c["id"]), None)
+        added = known if known is not None else ledger.add(c)
+        ledger.save("search", added)
+        kept_items.append(added)
+        registered += 1
+    return kept_items, registered
+
+
+def _search_record_provider_failure(ctx, name, query, exc):
+    """Registra a falha de uma fonte na busca e, fora de --dry-run, na biblioteca como `miss`."""
+    from getbrolls import library
+
+    record_warning("PROVIDER_FAILED", provider_error_text(name, exc))
+    # Fonte que falhou é aprendizado barato e honesto; fica marcado
+    # como `auto` porque ninguém digitou esse registro. Em `--dry-run`,
+    # não: a busca de diagnóstico não escreve em lugar nenhum, e uma
+    # falha de teste não pode virar memória editorial do usuário.
+    if ctx.dry_run:
+        return
+    try:
+        library.learn_query(query, name, "miss", note=str(exc), auto=True)
+    except (ValueError, OSError) as failure:
+        record_warning("LIBRARY_WRITE_FAILED", labels.reason(failure))
+
+
+def _search_one_provider(ctx, name, query, so_far, retry):
+    """Busca numa fonte só; devolve (itens mantidos, erro-ou-None, quantos ficaram registrados)."""
+    from getbrolls import providers
+
+    args = ctx.args
+    try:
+        candidates = providers.search(name, query, args.limit - so_far, media=getattr(args, "media", "any"))
+    except ValueError as exc:
+        _search_record_provider_failure(ctx, name, query, exc)
+        return [], {"provider": name, "error": str(exc)}, 0
+    # ledger.add/save stay outside the provider try: a disk/write error here is not the
+    # provider's fault and must not be attributed to it as a search failure.
+    kept_items, registered = _search_keep_candidates(ctx, candidates)
+    logs.event(
+        _log,
+        logging.INFO,
+        "search",
+        provider=name,
+        media=getattr(args, "media", "any"),
+        intent=args.intent,
+        shot=ctx.shot,
+        query_words=len(query.split()),
+        results=len(kept_items),
+        retry=retry,
+    )
+    return kept_items, None, registered
+
+
+def _search_sweep(ctx, query, retry=False):
+    """Uma varredura pelos provedores escolhidos, com esta query exata."""
+    args = ctx.args
+    items, errors = [], []
+    answered = []
+    for name in ctx.names:
+        if len(items) >= args.limit:
+            break
+        kept_items, error, registered = _search_one_provider(ctx, name, query, len(items), retry)
+        items.extend(kept_items)
+        if error is not None:
+            errors.append(error)
+            continue
+        answered.append((name, query, registered))
+    return items, errors, answered
+
+
+def _search_with_shortening(ctx):
+    """Varre com a query pedida; se vier vazia e for longa, tenta de novo encurtada uma vez."""
+    args = ctx.args
+    query_used = args.query
+    items, errors, answered = _search_sweep(ctx, query_used)
+    # Frase inteira vira query e volta vazia: as APIs casam por palavra, e uma
+    # oração de doze palavras não casa com título nenhum. Em vez de devolver
+    # `items: []` calado, encurta uma vez e conta o que fez.
+    retry = None
+    tokens = args.query.split()
+    if not items and not errors and len(tokens) > SEARCH_QUERY_TOKENS:
+        # Mesmo corte que `brief --beat` usa para montar a query do beat: tira as
+        # palavras que não estreitam nada e fica com as primeiras que sobraram.
+        from getbrolls.brief import search_query
+
+        short = search_query({"target": args.query, "queries": []}, SEARCH_QUERY_TOKENS)
+        # Veio e foi barrado não é "não trouxe nada": a nota diz qual dos dois aconteceu.
+        outcome = "só trouxe material barrado pelas regras" if ctx.excluded else "não trouxe nada"
+        items, errors, retry_answered = _search_sweep(ctx, short, retry=True)
+        answered = answered + retry_answered
+        retry = {
+            "from": args.query,
+            "to": short,
+            "note": (
+                f'A busca por "{args.query}" {outcome}, então repeti uma vez '
+                f'com as {SEARCH_QUERY_TOKENS} primeiras palavras ("{short}"): '
+                "banco e YouTube casam por palavra, não por frase inteira."
+            ),
+        }
+        query_used = short
+    return {
+        "query_used": query_used,
+        "items": items,
+        "errors": errors,
+        # O que as regras barraram na frase inteira continua barrado depois do retry.
+        "excluded": len(ctx.excluded),
+        "retry": retry,
+        "answered": answered,
+    }
+
+
+def _build_search_result(ctx, outcome):
+    """Monta o envelope de resposta de `search`: resumo, aviso de dry-run e pistas da biblioteca."""
+    from getbrolls import library
+    from getbrolls.rules import domain_matches
+
+    args, rules, dry_run = ctx.args, ctx.rules, ctx.dry_run
+    query_used, items, errors, excluded, retry = (
+        outcome["query_used"],
+        outcome["items"],
+        outcome["errors"],
+        outcome["excluded"],
+        outcome["retry"],
+    )
+    items.sort(key=lambda c: not domain_matches(c.get("source_url"), rules["preferred_domains"]))
+    shown = [_search_row(c) for c in items]
+    result = {
+        # Veredito primeiro: quem lê o JSON quer saber o que apareceu antes de
+        # abrir a lista inteira.
+        "summary": {"line": search_summary_line(shown, excluded, errors, dry_run, query_used, retry)},
+        "items": shown,
+        "errors": errors,
+        "excluded_by_rules": excluded,
+        "editorial_rules": rules["editorial_rules"],
+        "dry_run": dry_run,
+        "query": args.query,
+        # O que a fonte recebeu de fato: sem isto o encurtamento seria invisível.
+        "query_used": query_used,
+    }
+    if retry:
+        result["retry"] = retry
+    if dry_run:
+        result["note"] = (
+            "Busca de diagnóstico: nada foi registrado no projeto. Repita sem "
+            "`--dry-run` para guardar os candidatos que você quiser."
         )
-        # Mesmos atalhos planos que a busca devolve (`channel`, `uploader`,
-        # `duration_s`): quem lista o C2 lê os dois comandos do mesmo jeito. São só
-        # da resposta — no manifesto continuam em `creator.name` e `media.duration_s`.
-        return _search_row(c)
+    # Pistas da biblioteca são memória editorial, não permissão: cada uma
+    # repete `rights_not_transferable` e nenhuma toca no candidato.
+    found = library.hints(args.query)
+    if found:
+        result["library_hints"] = found
+    return result
+
+
+def _search_names(args, rules, shot):
+    """Lista de fontes a varrer: as preferidas do usuário, ou uma só se --provider foi explícito."""
+    names = rules["preferred_providers"][args.intent] if args.provider == "auto" else [args.provider]
+    if shot:
+        names = _beat_search_names(args.project, shot, rules, args.provider, names)
+    if not names:
+        raise ValueError(
+            "Nenhuma fonte configurada: use resolve --file, Commons/NASA ou configure a chave de um banco."
+        )
+    return names
+
+
+def _execute_search(args, rules, ledger):
+    """`search`: varre os provedores escolhidos, com o encurtamento automático de frase longa."""
+    if "video" not in rules["asset_types"]:
+        return {
+            "items": [],
+            "errors": [],
+            "note": "APIs atuais pesquisam vídeos. Para imagem/notícia use importação local ou browser-plan.",
+        }
+    args.provider = {"pixel": "pexels", "getbrolls": "auto"}.get(args.provider, args.provider)
+    if not 1 <= args.limit <= 50:  # noqa: PLR2004 - matches the "--limit entre 1 e 50" message below
+        raise ValueError("Use --limit entre 1 e 50.")
+    shot = (getattr(args, "shot", None) or "").strip() or None
+    # Mesma regra de `resolve --shot`: o beat vira sufixo do id, e é isso que
+    # liga o candidato ao BRIEF.md sem precisar re-registrar por URL depois.
+    if shot and not re.fullmatch(SHOT_RE, shot):
+        raise ValueError("--shot: use 1–80 letras, números, hífen ou underscore.")
+    dry_run = bool(getattr(args, "dry_run", False))
+    names = _search_names(args, rules, shot)
+    ctx = _SearchContext(args, rules, ledger, names, shot, dry_run)
+    outcome = _search_with_shortening(ctx)
+    # Fonte que respondeu sem nada para este beat: a escada não sugere de novo.
+    # Só o resultado final conta: se o encurtamento achou algo, a busca não foi vazia.
+    # O registro leva a query pedida, que é a que a escada sugere de novo.
+    if shot and not outcome["items"] and not dry_run:
+        empty = [(name, args.query) for name, _query, _kept in outcome["answered"]]
+        if empty:
+            record_empty_searches(ledger, shot, empty)
+    if not outcome["items"] and outcome["errors"]:
+        raise ValueError("; ".join(provider_error_text(e["provider"], e["error"]) for e in outcome["errors"]))
+    return _build_search_result(ctx, outcome)
+
+
+def _resolve_build_candidate(args):
+    """Cria o candidato a partir de --file (import local) ou --url (fonte remota)."""
+    from getbrolls import providers
+
+    if args.file:
+        path = Path(args.file).expanduser().resolve()
+        if not _paths.strict_is_file(path):
+            raise ValueError("Arquivo local inexistente.")
+        sha = digest(path)
+        c = candidate("local", sha[:16], path.name)
+        c["local_path"] = str(path)
+        c["local_sha256"] = sha
+        c["media"] = probe(path)
+        c["acquisition"] = {
+            "status": "available",
+            "method": "local",
+            "evidence": [],
+        }
+        c["preview"]["seek_mode"] = "local"
+        return c
+    c = providers.resolve(args.url)
+    fill_remote_metadata(c)
+    return c
+
+
+def _resolve_context_files(c, args):
+    """Anexa --context-image/--full-preview-file ao candidato, com hash e mídia."""
+    for argument, field in (
+        (args.context_image, "context_image"),
+        (args.full_preview_file, "full_preview"),
+    ):
+        if not argument:
+            continue
+        if not args.file:
+            raise ValueError("Contexto/composição exigem um B-roll local em --file.")
+        auxiliary = Path(argument).expanduser().resolve()
+        if not _paths.strict_is_file(auxiliary):
+            raise ValueError("Arquivo de contexto/composição não encontrado.")
+        if field == "context_image" and auxiliary.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+            raise ValueError("--context-image deve ser um print PNG/JPG/WebP.")
+        c[field + "_path"] = str(auxiliary)
+        c[field + "_sha256"] = digest(auxiliary)
+        c[field + "_media"] = probe(auxiliary)
+
+
+def _resolve_local_metadata(c, args):
+    """Infere/valida asset-type, título e data de captura para um `resolve --file`."""
+    if not args.file:
+        if args.asset_type or args.title or args.captured_at:
+            raise ValueError("Metadados locais exigem --file.")
+        return
+    path = Path(args.file).expanduser().resolve()
+    inferred = "image" if path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff") else "video"
+    c["asset_type"] = args.asset_type or inferred
+    if (c["asset_type"] == "video") != (inferred == "video"):
+        raise ValueError("asset-type não corresponde ao formato do arquivo.")
+    c["media"]["kind"] = "video" if c["asset_type"] == "video" else "image"
+    if args.title:
+        c["title"] = args.title
+    if args.captured_at:
+        from datetime import datetime
+
+        datetime.fromisoformat(args.captured_at)
+        c["captured_at"] = args.captured_at
+
+
+def _resolve_source_info(c, args):
+    """Grava --source-url/--creator, exclusivos de --file."""
+    if not (args.source_url or args.creator):
+        return
+    if not args.file:
+        raise ValueError("--source-url/--creator são exclusivos de --file.")
+    if args.source_url:
+        from getbrolls.http import public_url
+
+        url = public_url(args.source_url)
+        if not url:
+            raise ValueError("Fonte deve ser URL HTTPS pública sem credenciais.")
+        c["source_url"] = url
+    if args.creator:
+        c["creator"]["name"] = args.creator
+
+
+def _resolve_shot_suffix(c, args):
+    """Sufixa o id do candidato com o beat, quando --shot foi informado."""
+    if not args.shot:
+        return
+    if not re.fullmatch(SHOT_RE, args.shot):
+        raise ValueError("--shot: use 1–80 letras, números, hífen ou underscore.")
+    c["id"] += ":shot:" + args.shot
+    c["shot"] = args.shot
+
+
+def _execute_resolve(args, rules, ledger):
+    """`resolve`: registra um candidato a partir de URL pública ou arquivo local já autorizado."""
+    from getbrolls.rules import allowed, format_report
+
+    for flag, value in (("--file", args.file), ("--url", args.url)):
+        if value is not None and not value.strip():
+            raise ValueError(f"{flag} não pode ser vazio: informe o caminho ou a URL real.")
+    if args.shot:
+        # Antes de ler o arquivo ou a URL: nada novo entra num beat aposentado.
+        _refuse_retired_shot(args.project, args.shot)
+    c = _resolve_build_candidate(args)
+    # Mesmo registro que `search` faz: a intenção é da pessoa, e sem ela o
+    # candidato de URL entrava sempre como "literal", inclusive quando não era.
+    c["match"]["kind"] = getattr(args, "intent", None) or c["match"].get("kind") or "literal"
+    _resolve_context_files(c, args)
+    _resolve_local_metadata(c, args)
+    _resolve_source_info(c, args)
+    _resolve_shot_suffix(c, args)
+    if c.get("asset_type") in ("news_screenshot", "web_screenshot") and not c.get("source_url"):
+        raise ValueError("Screenshot exige --source-url para manter a origem.")
+    if not allowed(c, rules):
+        raise ValueError("Fonte ou tipo de asset bloqueado pelas regras do usuário.")
+    c["format"] = format_report(c, rules)
+    c = ledger.add(c)
+    ledger.save("resolve", c)
+    logs.event(
+        _log,
+        logging.INFO,
+        "resolve",
+        provider=c["provider"],
+        candidate=c["id"],
+        kind="file" if args.file else "url",
+    )
+    # Mesmos atalhos planos que a busca devolve (`channel`, `uploader`,
+    # `duration_s`): quem lista o C2 lê os dois comandos do mesmo jeito. São só
+    # da resposta — no manifesto continuam em `creator.name` e `media.duration_s`.
+    return _search_row(c)
+
+
+def _verify_failure_result(exc, existed):
+    """Classifica a falha de verificação (missing/mismatch/undecodable) para o log."""
+    if not existed:
+        return "missing"
+    if "Arquivo alterado após coleta" in str(exc):
+        return "mismatch"
+    return "undecodable"
+
+
+def _verify_clip_failure(ledger, c, exc, existed):
+    """Reage a uma falha de verificação: derruba `verified` (se estava true) e loga."""
+    # Um clipe que não bate mais com o registrado, ou que não decodifica,
+    # não pode continuar marcado como verificado: quem entrega depois
+    # confiaria num hash velho. `sha256` fica como está — é a prova do
+    # que foi coletado — só `verified` cai (e o estado volta a
+    # `approved`), e uma nova `verify` bem-sucedida volta a marcar.
+    if c["output"]["verified"]:
+        c["output"]["verified"] = False
+        if c["state"] == "verified":
+            c["state"] = "approved"
+        ledger.save("verify", c)
+    with contextlib.suppress(Exception):  # logging must never break a command
+        logs.event(_log, logging.WARNING, "verify", candidate=c["id"], result=_verify_failure_result(exc, existed))
+
+
+def _verify_clip_success(ledger, c, info):
+    """Registra a verificação bem-sucedida e devolve a entrada de `checked`."""
+    # Probe, hash e decodificação bateram: se uma verificação anterior tinha
+    # derrubado a flag (arquivo trocado e depois restaurado), volta a True.
+    if not c["output"]["verified"]:
+        c["output"]["verified"] = True
+        if c["state"] == "approved":
+            c["state"] = "verified"
+        ledger.save("verify", c)
+    logs.event(_log, logging.INFO, "verify", candidate=c["id"], result="ok")
+    is_hd = min(info["width"], info["height"]) >= 1080  # noqa: PLR2004 - short side of 1080p, the usual floor for "HD"
+    return {"id": c["id"], "media": info, "hd": is_hd}
+
+
+def _verify_one_clip(ledger, c):
+    """Reconfere um clipe coletado: devolve (entrada p/ `checked`, exceção de falha) — um dos dois é None."""
+    if not c["output"]["path"]:
+        return None, None
+    try:
+        # Layout 1 lê `broll/` e a antiga `brolls/clips/`; o sha256 registrado
+        # desempata o mesmo nome nas duas, e sem desempate a falha diz as duas.
+        path = layout.output_file(ledger.root.parent, c["output"]["path"], sha256=c["output"].get("sha256"))
+    except ValueError as exc:
+        _verify_clip_failure(ledger, c, exc, True)
+        return None, exc
+    existed = _paths.strict_exists(path)
+    try:
+        info = probe(path)
+        if digest(path) != c["output"]["sha256"]:
+            raise ValueError("Arquivo alterado após coleta: " + c["id"])
+        run(["ffmpeg", "-v", "error", "-i", str(path), "-f", "null", "-"])
+    except PrerequisiteError:
+        # Faltar ffprobe/ffmpeg é defeito da instalação, não do clipe: nada de
+        # derrubar `verified` de um clipe que ninguém conseguiu conferir.
+        raise
+    except ValueError as exc:
+        _verify_clip_failure(ledger, c, exc, existed)
+        return None, exc
+    return _verify_clip_success(ledger, c, info), None
+
+
+def _execute_verify(args, rules, ledger):
+    """`verify`: reconfere hash/decodificação de cada clipe coletado e tenta refazer entrega/."""
+    checked = []
+    # Every collected clip is checked even after one fails: stopping at the first
+    # would leave a second altered clip marked as verified, and `deliver` would
+    # ship it. The first failure is raised once the whole list has been flagged.
+    first_failure = None
+    for c in ledger.data["items"]:
+        entry, failure = _verify_one_clip(ledger, c)
+        if entry is not None:
+            checked.append(entry)
+        if failure is not None and first_failure is None:
+            first_failure = failure
+    if first_failure is not None:
+        raise first_failure
+    # `entrega/` é camada derivada: refazê-la nunca pode reprovar a conferência dos
+    # arquivos canônicos. Se o sistema não deixar ligar/copiar, isso vira aviso.
+    from getbrolls import delivery as delivery_module
+
+    try:
+        delivery_module.build_delivery(
+            args.project, ledger=ledger, for_human=lambda: _flow_next(ledger, rules), rules=rules
+        )
+    except (ValueError, OSError) as exc:
+        record_warning(
+            "DELIVERY_LINK_FAILED",
+            f"Os arquivos estão íntegros, mas não consegui refazer entrega/: {labels.reason(exc)}",
+        )
+    return {"verified": checked, "count": len(checked)}
+
+
+def _execute_review_command(cmd, args, rules, ledger):
+    """`import-review`/`review`/`verify`: publica ou confere a página, sem tocar num candidato só."""
     if cmd == "import-review":
         from getbrolls.review import import_review
 
@@ -1745,377 +3496,71 @@ def execute(args):  # noqa: C901, PLR0911, PLR0912, PLR0915 - existing size; shr
             record_warning("EMPTY_STORYBOARD", EMPTY_STORYBOARD)
         return {"review": page}
     if cmd == "verify":
-        checked = []
-        # Every collected clip is checked even after one fails: stopping at the first
-        # would leave a second altered clip marked as verified, and `deliver` would
-        # ship it. The first failure is raised once the whole list has been flagged.
-        first_failure = None
-        for c in ledger.data["items"]:
-            if c["output"]["path"]:
-                path = ledger.root / c["output"]["path"]
-                existed = path.exists()
-                try:
-                    info = probe(path)
-                    if digest(path) != c["output"]["sha256"]:
-                        raise ValueError("Arquivo alterado após coleta: " + c["id"])
-                    run(["ffmpeg", "-v", "error", "-i", str(path), "-f", "null", "-"])
-                except ValueError as exc:
-                    # Um clipe que não bate mais com o registrado, ou que não decodifica,
-                    # não pode continuar marcado como verificado: quem entrega depois
-                    # confiaria num hash velho. `sha256` fica como está — é a prova do
-                    # que foi coletado — só `verified` cai (e o estado volta a
-                    # `approved`), e uma nova `verify` bem-sucedida volta a marcar.
-                    if c["output"]["verified"]:
-                        c["output"]["verified"] = False
-                        if c["state"] == "verified":
-                            c["state"] = "approved"
-                        ledger.save("verify", c)
-                    try:
-                        if not existed:
-                            result = "missing"
-                        elif "Arquivo alterado após coleta" in str(exc):
-                            result = "mismatch"
-                        else:
-                            result = "undecodable"
-                        logs.event(_log, logging.WARNING, "verify", candidate=c["id"], result=result)
-                    except Exception:  # noqa: BLE001, S110 - logging must never break a command
-                        pass
-                    if first_failure is None:
-                        first_failure = exc
-                    continue
-                # Probe, hash e decodificação bateram: se uma verificação anterior tinha
-                # derrubado a flag (arquivo trocado e depois restaurado), volta a True.
-                if not c["output"]["verified"]:
-                    c["output"]["verified"] = True
-                    if c["state"] == "approved":
-                        c["state"] = "verified"
-                    ledger.save("verify", c)
-                logs.event(_log, logging.INFO, "verify", candidate=c["id"], result="ok")
-                checked.append(
-                    {
-                        "id": c["id"],
-                        "media": info,
-                        "hd": min(info["width"], info["height"]) >= 1080,  # noqa: PLR2004 - short side of 1080p, the usual floor for "HD"
-                    }
-                )
-        if first_failure is not None:
-            raise first_failure
-        # `entrega/` é camada derivada: refazê-la nunca pode reprovar a conferência dos
-        # arquivos canônicos. Se o sistema não deixar ligar/copiar, isso vira aviso.
-        from getbrolls import delivery as delivery_module
+        return _execute_verify(args, rules, ledger)
+    return None
 
-        try:
-            delivery_module.build_delivery(args.project, ledger=ledger, for_human=lambda: _flow_next(ledger, rules))
-        except (ValueError, OSError) as exc:
-            record_warning(
-                "DELIVERY_LINK_FAILED",
-                f"Os arquivos estão íntegros, mas não consegui refazer entrega/: {exc}",
-            )
-        return {"verified": checked, "count": len(checked)}
-    if cmd == "preview" and args.scan:
-        if args.start is not None or args.end is not None:
-            raise ValueError(
-                "--scan varre o vídeo inteiro: não combine com --start/--end. "
-                "Escolha o intervalo depois, olhando a varredura."
-            )
-        if args.reference_only:
-            raise ValueError("--scan precisa da mídia de trabalho; não use com --reference-only.")
 
-    if cmd == "approve":
-        chosen = list(args.candidate or [])
-        if args.channel == "chat" and not (args.statement or "").strip():
-            raise ValueError("Aprovação pelo chat exige --statement com a frase exata dita pela pessoa.")
-        if args.all and chosen:
-            raise ValueError("Use --all sozinho ou --candidate ID (repetindo a flag), nunca os dois juntos.")
-        if args.all and (args.start is not None or args.end is not None):
-            raise ValueError("--all aprova os intervalos já escolhidos; não use --start/--end.")
-        if not args.all and not chosen:
-            raise ValueError(
-                "Informe --candidate ID (repita a flag para vários), ou use --all para todos os candidatos com prévia."
-            )
-        if len(chosen) > 1 and (args.start is not None or args.end is not None):
-            raise ValueError("--start/--end valem para um candidato só; aprove um por vez para mudar o intervalo.")
-        if args.all:
-            return approve_all(ledger, args, rules)
-        if len(chosen) > 1:
-            return approve_all(ledger, args, rules, only=chosen)
-        args.candidate = chosen[0]
-    if cmd == "reject":
-        # `--candidate` é repetível: `argparse` entrega lista mesmo com um ID só.
-        chosen = list(args.candidate or [])
-        if len(chosen) > 1:
-            return reject_all(ledger, chosen, getattr(args, "reason", None))
-        args.candidate = chosen[0]
-    c = ledger.get(args.candidate)
-    if not allowed(c, rules) and cmd in ("preview", "approve", "permit", "fetch"):
-        raise ValueError("Asset bloqueado pelas regras atuais do usuário.")
-    if cmd == "remember":
-        from getbrolls.memory import remember
+def _execute_project_command(cmd, args, config, rules, ledger):
+    """Comandos que já têm `rules`/`ledger` prontos e passaram pelo portão de formato."""
+    read_only = _execute_read_only_project_command(cmd, args, config, rules, ledger)
+    if read_only is not None:
+        return read_only
+    if cmd == "search":
+        return _execute_search(args, rules, ledger)
+    if cmd == "resolve":
+        return _execute_resolve(args, rules, ledger)
+    review_result = _execute_review_command(cmd, args, rules, ledger)
+    if review_result is not None:
+        return review_result
+    return _execute_candidate_command(cmd, args, config, rules, ledger)
 
-        return remember(ledger, c, args.decision, args.reason, args.by)
-    if cmd == "preview" and args.scan:
-        return scan_candidate(ledger, c, config)
-    if cmd in ("preview", "approve"):
-        # `--reference-only` não pede mídia nenhuma: é o cartaz estático de um vídeo que
-        # a fonte não deixa baixar. Exigir intervalo aqui obrigaria a inventar um.
-        reference_without_range = cmd == "preview" and args.reference_only and args.start is None and args.end is None
-        # `approve --candidate ID` sozinho confirma o intervalo que a pessoa acabou de
-        # ver na prévia: exigir `--start/--end` de novo obrigaria a redigitar o que já
-        # está gravado, e digitar errado apagaria a prévia que ela aprovou.
-        approving_current = cmd == "approve" and args.start is None and args.end is None
-        if approving_current:
-            pass
-        elif c.get("media", {}).get("kind") != "image" and not reference_without_range:
-            if args.start is None or args.end is None:
-                raise ValueError(
-                    "Vídeo exige --start e --end. Se a fonte não libera o trecho, use "
-                    "`--reference-only` sozinho e eu gero só o cartaz estático."
-                )
-            set_segment(c, args.start, args.end)
-        elif args.start is not None or args.end is not None:
-            raise ValueError("Imagem estática não precisa de intervalo de origem.")
-    # Defaults for the audit-trail fields the elif branches below fill in;
-    # only used after the shared save at the end of this function, for logging.
-    permit_route = None
-    permit_preset_name = None
-    preview_mode = None
-    approval_invalidated = False
-    if cmd == "approve":
-        approve(c, args.by, args.channel, args.statement)
-    elif cmd == "permit":
-        preset = getattr(args, "preset", None)
-        if preset and (args.declaration or args.declared_by or args.declaration_text):
-            raise ValueError(
-                "--preset registra as condições genéricas da fonte; não combine com "
-                "declaração de responsabilidade. Escolha um dos dois."
-            )
-        if preset:
-            # O preset nunca vira licença: ele diz o que a fonte costuma exigir e manda
-            # conferir a página do item. Quem assina continua responsável, e `fetch`
-            # continua exigindo a aprovação humana.
-            evidence = PERMIT_PRESETS[preset]["text"]
-            if args.evidence is not None:
-                if not args.evidence.strip():
-                    raise ValueError("Evidência não pode ser vazia.")
-                evidence += " | Verificado por quem pediu: " + args.evidence.strip()
-            c["rights"]["basis"] = "per_item_evidence"
-            permit_route, permit_preset_name = "preset", preset
-        elif args.declared_by or args.declaration_text:
-            name = (args.declared_by or "").strip()
-            text = (args.declaration_text or "").strip()
-            _check_declared_by(name)
-            if len(text) < 20:  # noqa: PLR2004 - matches the "20 caracteres ou mais" message below
-                raise ValueError("--declaration-text precisa da frase literal da pessoa, com 20 caracteres ou mais.")
-            evidence = "Declaração do usuário " + name + ": " + text
-            c["rights"]["basis"] = "user_declaration"
-            c["rights"]["responsible_person"] = name
-            c["rights"]["declaration_channel"] = "chat"
-            permit_route = "declaration"
-        elif args.declaration:
-            rights = rules["copyright"]
-            if rights["mode"] != "user_declaration":
-                raise ValueError("Usuário deve configurar sua declaração em RULES.md primeiro.")
-            evidence = "Declaração do usuário " + rights["responsible_person"] + ": " + rights["declaration"]
-            c["rights"]["basis"] = "user_declaration"
-            c["rights"]["responsible_person"] = rights["responsible_person"]
-            permit_route = "declaration"
-        else:
-            if args.evidence is None:
-                raise ValueError(
-                    "Diga as condições de uso: --evidence TEXTO, ou "
-                    '--declared-by NOME --declaration-text "frase da pessoa".'
-                )
-            if not args.evidence.strip():
-                raise ValueError("Evidência não pode ser vazia.")
-            evidence = args.evidence
-            c["rights"]["basis"] = "per_item_evidence"
-            permit_route = "evidence"
-        c["rights"]["status"] = "permitted"
-        c["rights"]["evidence"].append(evidence)
-    elif cmd == "reject":
-        mark_rejected(c, getattr(args, "reason", None))
-    elif cmd == "preview":
-        context_before = signature(c)
-        if not args.reference_only and c["provider"] != "local":
-            # Vídeo sem --start/--end já parou antes, no guard de `preview`/`approve`.
-            asked = args.end - args.start  # pyright: ignore[reportOptionalOperand]
-            if asked > float(config["max_seconds"]) + CAP_EPSILON:
-                raise ValueError(
-                    f"Trecho de {asked:g} s excede o teto de prévia: GB_PREVIEW_MAX_SECONDS "
-                    f"está em {config['max_seconds']} s. Encurte o intervalo, ou aumente a "
-                    "variável se você realmente precisa de uma prévia mais longa."
-                )
-            from .acquisition import prepare_source
 
-            prepare_source(ledger, c, args.start, args.end)
-        if c.get("local_path") and not args.reference_only:
-            from .previewing import prepare_preview
+def execute(args):
+    """Prepara ambiente/config e despacha o comando para o handler certo, em ordem de dependência crescente."""
+    from getbrolls.config import load_environment, settings
 
-            prepare_preview(ledger, c, args.start, args.end, config)
-            if c["approval"]["status"] == "approved" and c["approval"].get("signature") == signature(c):
-                c["state"] = "verified" if c["output"].get("verified") else "approved"
-            else:
-                c["state"] = "rejected" if c["approval"]["status"] == "rejected" else "awaiting_approval"
-            preview_mode = "image" if c.get("media", {}).get("kind") == "image" else "cut"
-        else:
-            c["preview"]["warning"] = "Somente referência estática; o trecho animado requer original local autorizado."
-            c["state"] = "reference_only"
-            # Sem um arquivo de imagem ninguém decide nada, e `status` nem conta o item
-            # como tendo prévia. A miniatura pública da fonte já basta para isso.
-            reference_poster(ledger, c)
-            preview_mode = "reference_only"
-        if c["preview"].get("warning"):
-            record_warning("PREVIEW_LIMITATION", c["preview"]["warning"])
-        if args.narration is not None:
-            c["narration"] = args.narration
-        if args.reason is not None:
-            c["match"]["reason"] = args.reason
-        if context_before != signature(c):
-            c["approval"] = {
-                "status": "pending",
-                "by": None,
-                "at": None,
-                "revision": None,
-            }
-            c.pop("review", None)
-            c["state"] = "awaiting_approval" if c.get("local_path") else "reference_only"
-            approval_invalidated = True
-    elif cmd == "fetch":
-        _fetch_started_at = time.monotonic()
-        require_fetch(c)
-        src = c.get("local_path")
-        temp = None
-        if src:
-            if digest(src) != c["local_sha256"]:
-                raise ValueError("Original local mudou: importe novamente e aprove a nova versão.")
-        else:
-            # Re-resolve from the provider to refresh temporary variant URLs.
-            fresh = providers.refresh(c)
-            url = fresh.get("media_url")
-            if not url:
-                raise ValueError(
-                    "Esta fonte não disponibilizou arquivo por transporte permitido; "
-                    f"execute antes: preview --candidate {c['id']} --start ... --end ..."
-                )
-            from getbrolls.http import download
+    # `UsageError` quando `--env-file` ou `GB_ENV_FILE` apontam para um arquivo que não existe,
+    # ou quando o getbrolls.toml não vale para este comando (ver `profile.activate`).
+    choice = load_environment(args, warn=True)
+    config = settings()
+    with contextlib.suppress(Exception):
+        logs.event(
+            _log,
+            logging.DEBUG,
+            "config",
+            env_file_present=bool(getattr(args, "env_file", None)),
+            env_file_source=choice.source,
+            rules_project=_rules_project_present(args),
+            brief_present=_brief_present(args),
+            provider_keys=_provider_keys_set(),
+        )
+    if args.command == "capabilities" or args.command in _TOOLCHAIN_RUNNERS:
+        return _execute_toolchain(args)
+    if args.command in ("providers", "doctor"):
+        return _execute_providers_or_doctor(args, config)
+    cmd = args.command
+    if cmd == "serve":
+        return _execute_serve(args)
+    config_free = _execute_config_free_command(cmd, args)
+    if config_free is not None:
+        return config_free
+    from getbrolls.rules import load_rules, sync_formats
 
-            temp = ledger.root / "previews" / ("download-" + id_stem(c["id"]) + ".part")
-            download(url, temp)
-            src = temp
-        if c.get("media", {}).get("kind") == "image":
-            rel = "clips/" + id_stem(c["id"]) + f"-r{c['segment']['revision']}" + Path(src).suffix.lower()
-            dest = ledger.root / rel
-            if dest.exists():
-                raise ValueError(_already_collected(rel))
-            from .media import copy_image
-
-            copy_image(src, dest)
-            c["output"] = {"path": rel, "sha256": digest(dest), "verified": True}
-            c["state"] = "verified"
-            ledger.save(cmd, c)
-            render(ledger)
-            logs.event(
-                _log,
-                logging.INFO,
-                "fetch",
-                candidate=c["id"],
-                kind="remote" if temp else "local",
-                bytes=_safe_size(dest),
-                sha256_prefix=_sha256_prefix(c["output"]["sha256"]),
-                ms=round((time.monotonic() - _fetch_started_at) * 1000),
-            )
-            return c
-        rel = "clips/" + id_stem(c["id"]) + f"-r{c['segment']['revision']}.mp4"
-        # O arquivo entregue nasce somente-leitura (delivery._freeze congela o inode
-        # compartilhado): sem esta checagem o ffmpeg falharia por permissão, sem dizer
-        # o motivo. Recusar aqui, antes de gastar a fonte, explica o que fazer.
-        if (ledger.root / rel).exists():
-            if temp:
-                temp.unlink(missing_ok=True)
-            raise ValueError(_already_collected(rel))
-        try:
-            offset = c.get("local_start_s", 0)
-            start = c["segment"]["start_s"] - offset
-            end = c["segment"]["end_s"] - offset
-            if start < 0 or (c.get("local_duration_s") is not None and end > c["local_duration_s"] + 0.1):
-                raise ValueError("Gere uma nova prévia para este intervalo antes da coleta.")
-            cut(src, ledger.root / rel, start, end)
-        finally:
-            if temp:
-                temp.unlink(missing_ok=True)
-        c["output"] = {
-            "path": rel,
-            "sha256": digest(ledger.root / rel),
-            "verified": True,
-        }
-        c["state"] = "verified"
-        c["output_media"] = probe(ledger.root / rel)
-    # O journal distingue a decisão dita no chat da que veio assinada pelo Storyboard.
-    ledger.save("approve-chat" if cmd == "approve" and args.channel == "chat" else cmd, c)
-    render(ledger)
-    try:
-        if cmd == "approve":
-            logs.event(
-                _log,
-                logging.INFO,
-                "approve",
-                candidate=c["id"],
-                channel=args.channel,
-                revision=c["segment"]["revision"],
-                by_present=bool((args.by or "").strip()),
-                statement_present=bool((args.statement or "").strip()),
-            )
-        elif cmd == "permit":
-            logs.event(_log, logging.INFO, "permit", candidate=c["id"], route=permit_route, preset=permit_preset_name)
-        elif cmd == "reject":
-            rejection = c.get("rejection") or {}
-            logs.event(
-                _log,
-                logging.INFO,
-                "reject",
-                candidate=c["id"],
-                had_review=bool(rejection.get("invalidated_review")),
-                reason_present=bool(rejection.get("reason")),
-                output_cleared=True,
-            )
-        elif cmd == "preview":
-            if approval_invalidated:
-                logs.event(
-                    _log,
-                    logging.INFO,
-                    "approval_invalidated",
-                    candidate=c["id"],
-                    reason="segment_changed",
-                    revision=c["segment"]["revision"],
-                )
-            logs.event(
-                _log,
-                logging.INFO,
-                "preview",
-                candidate=c["id"],
-                start_s=c["segment"]["start_s"],
-                end_s=c["segment"]["end_s"],
-                revision=c["segment"]["revision"],
-                mode=preview_mode,
-            )
-        elif cmd == "fetch":
-            logs.event(
-                _log,
-                logging.INFO,
-                "fetch",
-                candidate=c["id"],
-                kind="remote" if temp else "local",
-                bytes=_safe_size(ledger.root / c["output"]["path"]) if c["output"].get("path") else None,
-                sha256_prefix=_sha256_prefix(c["output"].get("sha256")),
-                ms=round((time.monotonic() - _fetch_started_at) * 1000),
-            )
-    except Exception:  # noqa: BLE001, S110 - logging must never break a command
-        pass
-    if cmd == "preview":
-        # Absolute paths for the agent to open the exact files the Storyboard shows.
-        # They live only in this response, never in the manifest.
-        return {**c, "files": preview_files(ledger, c)}
-    return c
+    rules = load_rules(args.project)
+    if cmd == "rules":
+        return rules
+    dry_run = cmd in DRY_RUN_COMMANDS and bool(getattr(args, "dry_run", False))
+    # `references` roda sem a trava do projeto (READ_ONLY_COMMANDS) e só lê
+    # `references.json`, e o ensaio não grava: os dois abrem o manifesto sem criar
+    # pastas nem concluir a gravação pendente de quem segura a trava.
+    ledger = Ledger(args.project, recover=not (dry_run or cmd == "references"))
+    # Consultas (`references`, `inspect`) não decidem nada sobre formato: como o
+    # `status`, elas nunca podem ser barradas pelo portão de `--confirm-format-change`.
+    # `deliver --dry-run` e `search --dry-run` são ensaio: não podem reescrever o
+    # manifesto nem por tabela.
+    if cmd not in READ_ONLY_CONSULTS and not dry_run:
+        sync_formats(ledger, rules, confirm=getattr(args, "confirm_format_change", False))
+    return _execute_project_command(cmd, args, config, rules, ledger)
 
 
 def reference_poster(ledger, c):
@@ -2131,7 +3576,7 @@ def reference_poster(ledger, c):
         return c["preview"]["poster_path"]
     stem = id_stem(c["id"]) + "-ref"
     previews = ledger.root / "previews"
-    previews.mkdir(parents=True, exist_ok=True)
+    effects.mkdir(previews, parents=True, exist_ok=True)
     source = c.get("local_path")
     temp = None
     try:
@@ -2146,19 +3591,19 @@ def reference_poster(ledger, c):
             from .http import download
 
             temp = previews / (stem + ".part")
-            temp.unlink(missing_ok=True)
+            effects.unlink(temp, missing_ok=True)
             download(url, temp, max_bytes=32 * 1024 * 1024)
             source = temp
         result = image_preview(source, previews, stem)
     except (OSError, ValueError, RuntimeError) as error:
         record_warning(
             "REFERENCE_POSTER_MISSING",
-            f"Não consegui montar o cartaz estático desta referência ({error}).",
+            f"Não consegui montar o cartaz estático desta referência ({labels.reason(error)}).",
         )
         return None
     finally:
         if temp is not None:
-            temp.unlink(missing_ok=True)
+            effects.unlink(temp, missing_ok=True)
     c["preview"]["poster_path"] = result["poster_path"]
     return result["poster_path"]
 
@@ -2168,7 +3613,7 @@ def _already_collected(rel):
     return (
         f"Arquivo final já existe e não foi sobrescrito: `{rel}`. Esta revisão do "
         "trecho já está coletada — rode `verify` para conferir, ou gere uma prévia "
-        "nova (novo `--start`/`--end`) se quiser outro corte."
+        "nova (com outro `preview --start` e `--end`) se quiser outro corte."
     )
 
 
@@ -2248,7 +3693,8 @@ def clamp_windows(windows, cap):
 LANGUAGE_NAMES = {"pt": "PT", "en": "EN", "es": "ES", "fr": "FR", "de": "DE", "it": "IT", "ja": "JA"}
 
 
-def language_warning(probe, query):
+def language_warning(probe, query):  # pylint: disable=redefined-outer-name
+    # Legado: ocorrência pré-existente (corpo idêntico ao código anterior à 2.6.0).
     """Aviso de idioma: a frase da pessoa e a legenda da fonte não se falam."""
     from .inspecting import language_mismatch
 
@@ -2262,20 +3708,35 @@ def language_warning(probe, query):
     )
 
 
-def inspect_warnings(probe, query=None):
+def _byte_size(size):
+    """MB com uma casa; abaixo de 0,1 MB, KB inteiro — "0.0 MB" não diz nada."""
+    megabytes = size / (1024 * 1024)
+    if megabytes >= 0.1:  # noqa: PLR2004 - 0,1 MB: abaixo disso "0.0 MB"
+        return f"{megabytes:.1f} MB"
+    return f"{max(1, round(size / 1024))} KB"
+
+
+def inspect_warnings(probe_data, query=None):
     """Avisos sobre a fonte em si — o que costuma virar retrabalho depois da prévia."""
     found = []
-    language = language_warning(probe, query)
+    language = language_warning(probe_data, query)
     if language:
         found.append(language)
-    duration = probe.get("duration_s")
+    duration = probe_data.get("duration_s")
     if duration and float(duration) > LONG_SOURCE_S:
         found.append(f"fonte longa: {round(float(duration) / 60)} min")
-    haystack = " ".join([str(probe.get("title") or ""), *(probe.get("tags") or [])])
+    haystack = " ".join([str(probe_data.get("title") or ""), *(probe_data.get("tags") or [])])
     if _THREE_SIXTY.search(haystack):
         found.append("vídeo 360°")
-    downloaded = probe.get("downloaded_bytes")
-    if downloaded:
+    downloaded = probe_data.get("downloaded_bytes")
+    if downloaded and probe_data.get("local_copy"):
+        # Rota de plugin: o arquivo chegou pela rota (cópia local ou download do próprio
+        # plugin), não por um download do core — "baixar ... (0.0 MB)" confundia.
+        found.append(
+            f"esta fonte não tem metadados públicos, então a análise usou a cópia local do arquivo "
+            f"({_byte_size(downloaded)}), trazida pela rota {probe_data['local_copy']} para o cache privado"
+        )
+    elif downloaded:
         # Esta fonte não tem página de metadados: a análise só existe porque o arquivo
         # veio inteiro. Dizer o preço evita repetir a conta sem perceber.
         found.append(
@@ -2289,10 +3750,10 @@ def inspect_source(ledger, args, config=None):
     """O que a fonte já conta sobre si, antes de escolher intervalo.
 
     Na rota normal (página que o yt-dlp lê) nada de mídia é pedido: só metadados e
-    legenda. Numa fonte de arquivo direto (NASA, Commons, bancos) não existe metadado
-    para pedir: a duração só sai do arquivo, então o `inspect` **baixa o arquivo
-    inteiro** uma vez para o cache privado — e diz isso, com o tamanho, no resumo e
-    em `warnings[]`.
+    legenda. Numa fonte de arquivo direto (NASA, Commons, bancos), a duração que a
+    própria fonte publicou vale e nada é baixado. Sem ela (vídeo da NASA), a duração
+    só sai do arquivo, então o `inspect` **baixa o arquivo inteiro** uma vez para o
+    cache privado — e diz isso, com o tamanho, no resumo e em `warnings[]`.
 
     Somente leitura sobre decisão e intervalo em qualquer rota: com `--candidate`, o
     único campo que passa a existir no projeto é `media.duration_s` — nada de
@@ -2302,11 +3763,17 @@ def inspect_source(ledger, args, config=None):
     from .inspecting import candidate_windows
     from .social import probe_remote
 
-    if args.max_windows is not None and not 1 <= args.max_windows <= 20:  # noqa: PLR2004 - matches the "--max-windows entre 1 e 20" message below
+    max_windows = args.max_windows
+    if max_windows is not None and not 1 <= max_windows <= 20:  # noqa: PLR2004 - ints do msg abaixo
         raise ValueError("Use --max-windows entre 1 e 20.")
     c = None
     if args.candidate:
         c = ledger.get(args.candidate)
+        if (c.get("media") or {}).get("kind") == "image":
+            raise ValueError(
+                "Imagem estática não tem duração nem trecho para analisar: gere a prévia "
+                f"dela direto com `preview --candidate {candidate_arg(c)}`, sem `--start` e `--end`."
+            )
         url = c.get("source_url")
         if not url and not direct_media(c):
             raise ValueError(
@@ -2323,18 +3790,23 @@ def inspect_source(ledger, args, config=None):
         from getbrolls import providers
 
         source = providers.resolve(url)
+        if (source.get("media") or {}).get("kind") == "image":
+            raise ValueError(
+                "Esta URL é uma imagem estática, sem trecho para analisar: registre com "
+                "`resolve --url` e gere a prévia com `preview --candidate ID`, sem `--start` e `--end`."
+            )
     if direct_media(source):
         # NASA, Commons e os bancos publicam o arquivo; `source_url` é a página do
         # item, e o yt-dlp responde "Unsupported URL" para ela. A duração sai do
         # ffprobe do próprio arquivo, e legenda não existe nessa rota.
-        probe = probe_direct(ledger, source, url)
+        probe_data = probe_direct(ledger, source, url)
     else:
-        probe = probe_remote(url, cache=ledger.root.parent / ".getbrolls-sources")
+        probe_data = probe_remote(url, cache=ledger.root.parent / ".getbrolls-sources")
     cap = float((config or {}).get("max_seconds") or 0)
-    windows = clamp_windows(candidate_windows(probe, args.query, args.max_windows or 3), cap)
-    if c is not None and probe["duration_s"]:
+    windows = clamp_windows(candidate_windows(probe_data, args.query, args.max_windows or 3), cap)
+    if c is not None and probe_data["duration_s"]:
         # Único efeito no projeto: agora `set_segment` sabe recusar o que não cabe.
-        c["media"]["duration_s"] = probe["duration_s"]
+        c["media"]["duration_s"] = probe_data["duration_s"]
         ledger.save("inspect", c)
     logs.event(
         _log,
@@ -2346,37 +3818,62 @@ def inspect_source(ledger, args, config=None):
     )
     return {
         # Veredito primeiro, como nos outros comandos: quantas janelas e qual a melhor.
-        "summary": inspect_summary(windows, probe, cap, args.query),
-        "warnings": inspect_warnings(probe, args.query),
+        "summary": inspect_summary(windows, probe_data, cap, args.query),
+        "warnings": inspect_warnings(probe_data, args.query),
         "candidate": c["id"] if c is not None else None,
         "url": url,
-        "title": probe.get("title"),
-        "duration_s": probe["duration_s"],
-        "chapters": probe["chapters"],
-        "subtitle_langs": probe["subtitle_langs"],
-        "subtitle_langs_total": probe.get("subtitle_langs_total", len(probe["subtitle_langs"])),
+        "title": probe_data.get("title"),
+        "duration_s": probe_data["duration_s"],
+        "chapters": probe_data["chapters"],
+        "subtitle_langs": probe_data["subtitle_langs"],
+        "subtitle_langs_total": probe_data.get("subtitle_langs_total", len(probe_data["subtitle_langs"])),
         "candidate_windows": windows,
     }
 
 
-def probe_direct(ledger, source, url=None):
+def probe_direct(ledger, source, url=None, stage="inspect"):
     """O mesmo contrato de `social.probe_remote`, lido do arquivo direto da fonte.
 
     Sem capítulo e sem legenda: um mp4 servido por URL não traz nenhum dos dois. O
-    que ele traz é a duração real, que é o que separa a janela do palpite.
+    que ele traz é a duração real, que é o que separa a janela do palpite. Quando a
+    fonte já publicou a duração (Commons, bancos), ela vale e nada é baixado; só a
+    fonte sem esse metadado (vídeo da NASA) custa o download do arquivo inteiro.
     """
-    from .acquisition import cache_direct_media
+    from .acquisition import cache_direct_media, route_name
 
-    path = cache_direct_media(ledger, source)
+    known = (source.get("media") or {}).get("duration_s")
+    # Rota de plugin segue pelo `cache_direct_media`, que recusa a rota de `fetch` e diz
+    # o estágio: o atalho da duração publicada vale só para as fontes embutidas.
+    if route_name(source) is None and isinstance(known, (int, float)) and not isinstance(known, bool) and known > 0:
+        # A fonte já publicou a duração nos metadados (o Commons manda no `imageinfo`):
+        # baixar o arquivo inteiro só para medir o que já se sabe custava dezenas de MB
+        # antes de a pessoa confirmar qualquer coisa.
+        return {
+            "downloaded_bytes": 0,
+            "local_copy": None,
+            "url": url or source.get("source_url") or source.get("media_url"),
+            "title": source.get("title"),
+            "duration_s": float(known),
+            "chapters": [],
+            "subtitle_langs": [],
+            "subtitle_langs_total": 0,
+            "description": "",
+            "tags": [],
+            "subtitles": {},
+        }
+    path = cache_direct_media(ledger, source, stage=stage)
     info = probe(path)
     duration = info.get("duration_s")
     try:
         downloaded = Path(path).stat().st_size
+    # lenient: size for the report only: zero when the downloaded file cannot be read
     except OSError:
         downloaded = 0
     return {
         # Analisar esta fonte custou o arquivo inteiro; quem lê o resumo precisa saber.
         "downloaded_bytes": downloaded,
+        # Rota de plugin: nome da rota que trouxe a cópia local (o aviso muda de frase).
+        "local_copy": route_name(source),
         "url": url or source.get("source_url") or source.get("media_url"),
         "title": source.get("title"),
         "duration_s": float(duration) if duration else None,
@@ -2394,12 +3891,14 @@ def _clock(seconds):
     return f"{total // 60}:{total % 60:02d}"
 
 
-def _has_cues(probe):
+def _has_cues(probe):  # pylint: disable=redefined-outer-name
+    # Legado: ocorrência pré-existente (corpo idêntico ao código anterior à 2.6.0).
     """Alguma legenda chegou de fato, com falas dentro? Anunciar idioma não é ter legenda."""
     return any((entry or {}).get("cues") for entry in (probe.get("subtitles") or {}).values())
 
 
-def inspect_summary(windows, probe, cap=0.0, query=None):
+def inspect_summary(windows, probe, cap=0.0, query=None):  # pylint: disable=redefined-outer-name
+    # Legado: ocorrência pré-existente (corpo idêntico ao código anterior à 2.6.0).
     """`{line, next}` em PT-BR: quantas janelas saíram, qual a melhor e o que fazer com ela."""
     # Sem isto, "nenhuma janela casou" parece resposta sobre o conteúdo da fonte
     # quando o que houve foi a frase e a legenda estarem em idiomas diferentes.
@@ -2479,30 +3978,29 @@ def _scan_note(start, end, duration, ceiling, has_segment=False):
     )
 
 
-def scan_candidate(ledger, c, config):  # noqa: C901 - existing size; contact-sheet setup with one branch per cache/state check
-    """Contact sheet de baixa resolução do vídeo inteiro; não escolhe intervalo nenhum."""
-    from .media import scan_sheet
-
-    if c.get("media", {}).get("kind") == "image":
-        raise ValueError("Imagem estática não tem o que varrer; gere a prévia normal.")
+def _scan_known_duration(ledger, c):
+    """Duração conhecida do candidato, consultando a fonte se ela ainda não tiver sido inspecionada."""
     duration = c["media"].get("duration_s")
-    if not duration and c["provider"] != "local":
-        from .acquisition import direct_media
+    if duration or c["provider"] == "local":
+        return duration
+    from .acquisition import direct_media
 
-        if direct_media(c):
-            # Fonte de arquivo direto: o yt-dlp não lê a página dela, mas o ffprobe lê
-            # o arquivo — e é o mesmo arquivo que a varredura vai usar logo em seguida.
-            probe_data = probe_direct(ledger, c)
-        else:
-            from .social import probe_remote
+    if direct_media(c):
+        # Fonte de arquivo direto: o yt-dlp não lê a página dela, mas o ffprobe lê
+        # o arquivo — e é o mesmo arquivo que a varredura vai usar logo em seguida.
+        probe_data = probe_direct(ledger, c, stage="scan")
+    else:
+        from .social import probe_remote
 
-            probe_data = probe_remote(c["source_url"], cache=ledger.root.parent / ".getbrolls-sources")
-        duration = probe_data["duration_s"]
-        if duration:
-            c["media"]["duration_s"] = duration
-    if not duration:
-        raise ValueError("Duração desconhecida: rode `inspect --candidate " + c["id"] + "` antes de varrer.")
-    duration = float(duration)
+        probe_data = probe_remote(c["source_url"], cache=ledger.root.parent / ".getbrolls-sources")
+    duration = probe_data["duration_s"]
+    if duration:
+        c["media"]["duration_s"] = duration
+    return duration
+
+
+def _scan_prepare_span(ledger, c, config, duration):
+    """Garante a mídia de trabalho e devolve {source, offset, local_start, span, duration}."""
     # O teto vale sobre a duração real: pedir 900 s de um vídeo de 126 s faz a fonte
     # devolver menos do que o pedido, e a grade sairia rotulada com tempos que não existem.
     span = min(duration, float(config["scan_max_seconds"]))
@@ -2511,12 +4009,11 @@ def scan_candidate(ledger, c, config):  # noqa: C901 - existing size; contact-sh
 
         # `tolerant`: varrer o vídeo inteiro não pode falhar porque a fonte entregou
         # alguns segundos a menos do que anunciou.
-        prepare_source(ledger, c, 0, span, tolerant=True)
+        prepare_source(ledger, c, 0, span, tolerant=True, stage="scan")
     source = c.get("local_path")
     if not source:
         raise ValueError("A varredura precisa da mídia de trabalho; esta fonte só permite referência estática.")
     offset = c.get("local_start_s", 0)
-    stem = id_stem(c["id"])
     # Tempo do arquivo de trabalho para o ffmpeg; tempo da fonte nos rótulos.
     local_start = max(0, -offset)
     # A grade se mede pelo que existe no arquivo de trabalho, não pelo que foi pedido:
@@ -2530,13 +4027,16 @@ def scan_candidate(ledger, c, config):  # noqa: C901 - existing size; contact-sh
         span = min(span, max(0.0, float(available) - local_start))
     if span <= 0:
         raise ValueError("A mídia de trabalho não tem quadros para varrer; gere uma prévia do trecho que te interessa.")
-    result = scan_sheet(
-        source,
-        ledger.root / "previews",
-        stem,
-        local_start,
-        span,
-        source_offset=offset,
+    return {"source": source, "offset": offset, "local_start": local_start, "span": span, "duration": duration}
+
+
+def _scan_record(ledger, c, config, result, span_info):
+    """Grava o resultado da varredura no candidato e loga o evento de preview."""
+    offset, local_start, span, duration = (
+        span_info["offset"],
+        span_info["local_start"],
+        span_info["span"],
+        span_info["duration"],
     )
     # `scan` fica fora de `preview`/`segment`: varrer não decide nem invalida nada.
     # Os rótulos saem em tempo da fonte, e é esse mesmo trecho que a nota descreve.
@@ -2572,6 +4072,31 @@ def scan_candidate(ledger, c, config):  # noqa: C901 - existing size; contact-sh
         revision=c["segment"]["revision"],
         mode="scan",
     )
+
+
+def scan_candidate(ledger, c, config):
+    """Contact sheet de baixa resolução do vídeo inteiro; não escolhe intervalo nenhum."""
+    from .media import scan_sheet
+
+    if c.get("media", {}).get("kind") == "image":
+        raise ValueError(
+            "Imagem estática não tem o que varrer: gere a prévia dela com "
+            f"`preview --candidate {candidate_arg(c)}`, sem `--start` e `--end`."
+        )
+    duration = _scan_known_duration(ledger, c)
+    if not duration:
+        raise ValueError("Duração desconhecida: rode `inspect --candidate " + candidate_arg(c) + "` antes de varrer.")
+    span_info = _scan_prepare_span(ledger, c, config, float(duration))
+    stem = id_stem(c["id"])
+    result = scan_sheet(
+        span_info["source"],
+        ledger.root / "previews",
+        stem,
+        span_info["local_start"],
+        span_info["span"],
+        source_offset=span_info["offset"],
+    )
+    _scan_record(ledger, c, config, result, span_info)
     return {
         **c,
         # Mesmo contrato das outras rotas de `preview`: caminho absoluto de tudo o que

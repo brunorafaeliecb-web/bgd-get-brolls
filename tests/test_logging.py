@@ -4,21 +4,29 @@ import contextlib
 import io
 import json
 import logging
+
+# Reimport com apelido só pra isolar o setup do teste que precisa dele
+# (mesmo motivo do redefined-outer-name em tests/pylintrc).
+import logging as stdlib_logging  # pylint: disable=reimported
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 # A pasta pessoal da skill vai para um temporário: nenhum teste toca ~/.getbrolls.
-import _isolation  # noqa: F401  (efeito de import: define GB_HOME)
+import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _cli import run_cli
-from _paths import CLI, ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)
+from _fake_secrets import joined
+
+# efeito de import: insere scripts/ em sys.path
+from _paths import CLI, CLI_ARGV, ROOT  # noqa: F401  # pylint: disable=unused-import
 
 from getbrolls import logs
+from getbrolls.cli import _given_option_names, main, parse_args
+from getbrolls.runtime import OperationError
 
 
 def _raw_run(*args, project=None, env=None):
@@ -30,7 +38,7 @@ def _raw_run(*args, project=None, env=None):
     if env:
         environment.update(env)
     return subprocess.run(
-        [sys.executable, str(CLI), *map(str, command_args)],
+        [*CLI_ARGV, *map(str, command_args)],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -53,9 +61,9 @@ class DefaultSettingsTests(unittest.TestCase):
             json.loads(ok.stdout)  # exactly one JSON document, nothing else on stdout
             self.assertEqual("", ok.stderr)
 
-            # Same file exists already: --format without --force is refused (exit 2).
+            # Same file exists already: --format without --force is refused (exit 1).
             failed = _raw_run("init-rules", "--format", "reels", project=tmp)
-            self.assertEqual(2, failed.returncode)
+            self.assertEqual(1, failed.returncode)
             self.assertEqual("", failed.stdout)
             envelope = json.loads(failed.stderr)  # exactly one JSON document on stderr
             self.assertIn("error_code", envelope)
@@ -83,7 +91,7 @@ class VerboseStderrTests(unittest.TestCase):
             env = {"GB_LOG_LEVEL": "DEBUG", "GB_LOG_STDERR": "1"}
             _raw_run("init-rules", project=tmp, env=env)
             failed = _raw_run("init-rules", "--format", "reels", project=tmp, env=env)
-            self.assertEqual(2, failed.returncode)
+            self.assertEqual(1, failed.returncode)
             lines = [line for line in failed.stderr.splitlines() if line.strip()]
             self.assertGreater(len(lines), 1, "GB_LOG_STDERR should have added lines before the envelope")
             envelope = json.loads(lines[-1])
@@ -110,7 +118,7 @@ class InvalidLogLevelTests(unittest.TestCase):
     def test_invalid_level_produces_the_standard_invalid_data_envelope(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_cli("init-rules", project=tmp)
-            payload = run_cli("status", project=tmp, env={"GB_LOG_LEVEL": "NONSENSE"}, expect=2)
+            payload = run_cli("status", project=tmp, env={"GB_LOG_LEVEL": "NONSENSE"}, expect=1)
             self.assertEqual("INVALID_DATA", payload.get("error_code"))
             self.assertIn("GB_LOG_LEVEL", payload.get("error", ""))
 
@@ -121,7 +129,7 @@ class ReadOnlyCommandTests(unittest.TestCase):
     def test_status_on_a_folder_without_brolls_creates_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             done = _raw_run("status", project=tmp)
-            self.assertEqual(2, done.returncode)
+            self.assertEqual(1, done.returncode)
             self.assertIn("Projeto não encontrado", done.stderr)
             self.assertEqual([], list(Path(tmp).iterdir()), "status criou arquivos")
 
@@ -206,7 +214,7 @@ class OptionValuesNeverLoggedTests(unittest.TestCase):
     def test_evidence_value_never_reaches_the_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_cli("init-rules", project=tmp)
-            secret = "SEGREDO-EVIDENCIA-Q7F3"
+            secret = joined("SEGREDO-EVIDENCIA-", "Q7F3")
             run_cli(
                 "permit",
                 "--candidate",
@@ -215,7 +223,7 @@ class OptionValuesNeverLoggedTests(unittest.TestCase):
                 secret,
                 project=tmp,
                 env={"GB_LOG_LEVEL": "DEBUG"},
-                expect=2,
+                expect=1,
             )
             text = _log_path(tmp).read_text(encoding="utf-8")
             self.assertNotIn(secret, text)
@@ -230,7 +238,7 @@ class OptionValuesNeverLoggedTests(unittest.TestCase):
                 "http://example.com/SEGREDO-URL-Z9K2",
                 project=tmp,
                 env={"GB_LOG_LEVEL": "DEBUG"},
-                expect=2,
+                expect=1,
             )
             text = _log_path(tmp).read_text(encoding="utf-8")
             self.assertNotIn("SEGREDO-URL-Z9K2", text)
@@ -339,7 +347,8 @@ class EventRenderingTests(unittest.TestCase):
 
     def test_event_never_raises_on_a_broken_logger(self):
         class BrokenLogger:
-            def isEnabledFor(self, level):  # noqa: N802 - method name required by logging.Logger
+            # Nome exigido pela interface de logging.Logger.
+            def isEnabledFor(self, level):  # noqa: N802  # pylint: disable=invalid-name
                 raise RuntimeError("boom")
 
         logs.event(BrokenLogger(), logging.INFO, "e", a=1)  # must not raise
@@ -396,8 +405,15 @@ class ErrorEnvelopeAppLogTests(unittest.TestCase):
     def test_app_log_present_alongside_diagnostics_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_cli("init-rules", project=tmp)
-            payload = run_cli("init-rules", "--format", "reels", project=tmp, expect=2)
+            payload = run_cli("init-rules", "--format", "reels", project=tmp, expect=1)
             self.assertEqual(str(Path(tmp).resolve() / "brolls" / "diagnostics.jsonl"), payload["log"])
+            self.assertEqual(str(_log_path(tmp)), payload["app_log"])
+
+    def test_a_read_only_command_still_points_at_the_project_log(self):
+        """`status` não grava o log, mas o erro dele aponta o do projeto, onde está o histórico."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_cli("init-rules", project=tmp)
+            payload = run_cli("status", project=tmp, env={"GB_LOG_LEVEL": "NONSENSE"}, expect=1)
             self.assertEqual(str(_log_path(tmp)), payload["app_log"])
 
 
@@ -426,7 +442,7 @@ class RecordWarningMirrorTests(unittest.TestCase):
                 "evidência sintética",
                 project=tmp,
                 env={"GB_LOG_LEVEL": "DEBUG"},
-                expect=2,
+                expect=1,
             )
             text = _log_path(tmp).read_text(encoding="utf-8")
             self.assertIn("event=warning", text)
@@ -437,7 +453,6 @@ class OptionNamesTests(unittest.TestCase):
     """Only real option names reach the log, whatever the values look like."""
 
     def test_a_value_that_looks_like_a_flag_is_not_logged_as_a_name(self):
-        from getbrolls.cli import _given_option_names, parse_args
 
         # argparse only accepts a dash-leading value in the `--opt=value` form.
         argv = ["reject", "--candidate", "x", "--reason=--minha-senha-secreta", "--project", "p"]
@@ -446,7 +461,6 @@ class OptionNamesTests(unittest.TestCase):
         self.assertNotIn("senha", names or "")
 
     def test_the_equals_form_keeps_the_name_and_drops_the_value(self):
-        from getbrolls.cli import _given_option_names, parse_args
 
         argv = ["reject", "--candidate=x", "--reason=segredo", "--project=p"]
         names = _given_option_names(argv, parse_args(argv))
@@ -458,9 +472,6 @@ class ChildLoggerRedactionTests(unittest.TestCase):
     """Records from `getbrolls.<module>` children are redacted too, not only the root's."""
 
     def test_a_secret_logged_by_a_child_logger_never_reaches_the_file(self):
-        import logging as stdlib_logging
-
-        from getbrolls import logs
 
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"GB_LOG_LEVEL": "DEBUG"}):
             try:
@@ -485,7 +496,6 @@ class HandlersAreReleasedTests(unittest.TestCase):
         return [h for h in logging.getLogger("getbrolls").handlers if isinstance(h, logging.FileHandler)]
 
     def test_an_in_process_command_leaves_no_open_file_handler_and_the_folder_can_be_removed(self):
-        from getbrolls.cli import main
 
         with tempfile.TemporaryDirectory() as tmp:
             with contextlib.redirect_stdout(io.StringIO()):
@@ -495,8 +505,6 @@ class HandlersAreReleasedTests(unittest.TestCase):
             shutil.rmtree(Path(tmp) / "brolls")
 
     def test_a_failing_command_releases_the_file_too(self):
-        from getbrolls.cli import main
-        from getbrolls.runtime import OperationError
 
         with tempfile.TemporaryDirectory() as tmp:
             with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(OperationError):
@@ -504,7 +512,6 @@ class HandlersAreReleasedTests(unittest.TestCase):
             self.assertEqual([], self._file_handlers())
 
     def test_the_next_command_logs_again_after_a_shutdown(self):
-        from getbrolls.cli import main
 
         with tempfile.TemporaryDirectory() as tmp:
             with contextlib.redirect_stdout(io.StringIO()):

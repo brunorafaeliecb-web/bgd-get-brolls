@@ -6,7 +6,7 @@ updated: 2026-09-17
 tags: [get-brolls, eval, blind-tests, quality]
 ---
 
-# Testes cegos — medição editorial do Get B-rolls
+# Testes cegos — medição editorial do getbrolls
 
 Esta pasta guarda o processo de **teste cego**: o jeito de medir se a skill entrega o que promete a um criador de conteúdo real. É medição **editorial**, não de código. A suíte `python3 -m unittest discover -s tests` responde se o programa funciona; o teste cego responde outra pergunta: *dado um roteiro que o agente nunca viu, ele acha a fonte literal certa, mostra a prévia certa e para na hora certa?*
 
@@ -50,8 +50,8 @@ O executor **nunca** abre `## Gabarito`. É isso que torna o teste cego: se ele 
 ## Fluxo de uma rodada
 
 1. Escolha os casos (rodada completa = os 16 de [corpus/](corpus/); smoke = 3).
-2. Para cada caso, dispare o executor com `/get-brolls-eval` ([commands/get-brolls-eval.md](../commands/get-brolls-eval.md)) passando só o id ou o texto do roteiro.
-3. O executor cria um projeto isolado, executa `search` → `preview` → `review`, para no Storyboard e coleta `python3 scripts/gb.py status --project <projeto>`.
+2. Para cada caso, dispare o executor com `/getbrolls:get-brolls-eval` ([commands/get-brolls-eval.md](../commands/get-brolls-eval.md)) passando só o id ou o texto do roteiro.
+3. O executor cria um projeto isolado, executa `search` → `preview` → `review`, para no Storyboard e coleta a saída do `status --project <projeto>` da instalação em teste, rodado pela raiz dela (no plugin, `${CLAUDE_PLUGIN_ROOT}`), como manda o comando.
 4. O executor preenche um relatório a partir de [runs/TEMPLATE.md](runs/TEMPLATE.md).
 5. O juiz abre o gabarito, pontua cada beat pela rubrica e escreve as métricas da rodada no mesmo relatório.
 6. A amostragem humana confere ao menos 3 beats, incluindo todo beat marcado como indisponível.

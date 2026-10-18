@@ -28,7 +28,7 @@ python3 scripts/getbrolls/instagram_pairs.py
 5. Importe o MP4 resultante como candidato:
 
 ```sh
-python3 scripts/gb.py resolve --file <MP4> --source-url <URL do post> --creator <@autor> --shot <beat.id> --project <projeto>
+python3 scripts/gb.py resolve --file MP4 --source-url URL_DO_POST --creator AUTOR --shot BEAT_ID --project PROJETO
 ```
 
 Preserve a sessão e **nunca publique URLs assinadas nem os arquivos `.conf`**.
@@ -38,17 +38,17 @@ Preserve a sessão e **nunca publique URLs assinadas nem os arquivos `.conf`**.
 Enfileire, respeite o ritmo e feche cada item:
 
 ```sh
-python3 scripts/gb.py queue --action add --provider instagram --project <projeto> <URLs>
-python3 scripts/gb.py queue --action next --project <projeto>
-python3 scripts/gb.py queue --action mark --id <ID> --done --project <projeto>
-python3 scripts/gb.py queue --action mark --id <ID> --failed --reason "..." --project <projeto>
+python3 scripts/gb.py queue --action add --provider instagram --project PROJETO URLS
+python3 scripts/gb.py queue --action next --project PROJETO
+python3 scripts/gb.py queue --action mark --id ID --done --project PROJETO
+python3 scripts/gb.py queue --action mark --id ID --failed --reason "..." --project PROJETO
 ```
 
 Quando a resposta de `next` trouxer `wait_seconds` sem `item`, **aguarde esse tempo** antes de chamar de novo. Capture os pares do item retornado e só então feche com `mark`.
 
-Rode o coletor em lote com `--pace 20-60 --max-per-run 25 --continue-on-error --project <projeto>`. Use sempre `--project`, não `--config-output-root`, para o cooldown ir para a fila certa.
+Rode o coletor em lote (`python3 scripts/getbrolls/instagram_pairs.py`) com `--pace 20-60 --max-per-run 25 --continue-on-error --project PROJETO`. Use sempre `--project`, não `--config-output-root`, para o cooldown ir para a fila certa.
 
-Em batch, use `--fail-on-duplicate-audio`: é o que pega o erro de colar o áudio de um post noutro.
+Em batch, use `python3 scripts/getbrolls/instagram_pairs.py --fail-on-duplicate-audio`: é o que pega o erro de colar o áudio de um post noutro.
 
 Um HTTP 403 ou 429 abre cooldown na fila. **Pare. Não insista.** Avise o usuário e volte depois do tempo indicado.
 

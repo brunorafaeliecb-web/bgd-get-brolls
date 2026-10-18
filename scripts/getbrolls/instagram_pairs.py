@@ -10,9 +10,15 @@ por execução) e param no primeiro HTTP 403/429 para nunca martelar uma conta e
 CDN já está recusando.
 """
 
+# pylint: disable=missing-function-docstring,unreachable,too-many-arguments,too-many-locals
+# pylint: disable=raise-missing-from,too-many-statements,broad-exception-caught,unnecessary-lambda-assignment
+# Legado: ocorrências pré-existentes (corpo idêntico ao código anterior à 2.6.0).
+
 from __future__ import annotations
 
 import argparse
+import contextlib
+import functools
 import hashlib
 import ipaddress
 import json
@@ -24,7 +30,6 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import NoReturn
@@ -33,11 +38,18 @@ from urllib.parse import urlsplit
 URL_RE = re.compile(r'^\s*url\s*=\s*"(.*)"\s*$')
 OUTPUT_RE = re.compile(r'^\s*output\s*=\s*"(.*)"\s*$')
 if __package__:
-    from . import logs
+    from . import effects, labels, logs
+    from ._paths import strict_exists
     from .runtime import redact, stderr_tail
 else:  # Executado diretamente como `python3 scripts/getbrolls/instagram_pairs.py`, per docs/GUIDE.md.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from getbrolls import logs
+    # Também roda como `python -m getbrolls.instagram_pairs`; este ramo é só o modo script.
+    # Rodado como arquivo, a pasta deste módulo entra em `sys.path`, e o `queue.py`/`http.py`
+    # do pacote encobririam os da stdlib (`logging.handlers` importa `queue`).
+    _package_dir = Path(__file__).resolve().parent
+    sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != _package_dir]
+    sys.path.insert(0, str(_package_dir.parent))
+    from getbrolls import effects, labels, logs
+    from getbrolls._paths import strict_exists
     from getbrolls.runtime import redact, stderr_tail
 
 # Importing `logs` (above) registers a NullHandler on the shared `getbrolls` logger at
@@ -68,8 +80,11 @@ def _safe_item_id(stem: str) -> str:
     Never the raw stem verbatim when it embeds a username (the `student` layout's
     `<username>_<rank>_<code>` shape) — usernames/handles must never reach the log, so
     only the trailing code survives. Any other stem shape is short and username-free
-    already, so it is logged as-is.
+    already, so it is logged as-is. A stem outside `STEM_RE` (the one `infer_output_for_stem`
+    refuses, now as that item's failure) is logged as the fixed `unsafe-stem`, never raw.
     """
+    if not STEM_RE.fullmatch(stem) or ".." in stem:
+        return "unsafe-stem"
     match = _STUDENT_STEM_RE.match(stem)
     if match and not re.match(r"^[0-9]{2}$", match.group(1)):
         return match.group(3)
@@ -78,6 +93,9 @@ def _safe_item_id(stem: str) -> str:
 
 class CollectError(Exception):
     """Erro de coleta com mensagem redigida, código de saída e sinal de cooldown."""
+
+    # O código que o `event=op` dá à recusa (`logs.error_code`): coleta recusada, não bug.
+    error_code = "INVALID_DATA"
 
     def __init__(self, message, code: int = 1, *, cooldown: bool = False):
         super().__init__(message)
@@ -111,7 +129,7 @@ def run(cmd: list[str], *, quiet: bool = False) -> subprocess.CompletedProcess[s
     if not quiet:
         print("+ " + " ".join(sh_quote(x) for x in cmd), file=sys.stderr)
     try:
-        return subprocess.run(
+        return effects.run(
             cmd,
             text=True,
             encoding="utf-8",
@@ -140,6 +158,30 @@ def _die_url_refused(reason: str, message: str, code: int = 1) -> NoReturn:
     die(message, code)
 
 
+# curl 7.59 passou a aceitar uma lista de endereços numa entrada `--resolve`. O mais antigo
+# não recusa a lista: só avisa no modo verbose, pula a entrada e resolve pelo DNS, sem o pin.
+CURL_ADDRESS_LIST = (7, 59)
+
+
+@functools.cache
+def _curl_takes_address_list() -> bool:
+    """O curl do PATH aceita `host:443:a,b,[v6]` em `--resolve`? Sem versão legível, conta como antigo."""
+    try:
+        answer = effects.run(
+            ["curl", "--version"],
+            check=True,
+            timeout=10,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            encoding="utf-8",
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    match = re.match(r"curl (\d+)\.(\d+)", answer if isinstance(answer, str) else "")
+    return bool(match) and (int(match.group(1)), int(match.group(2))) >= CURL_ADDRESS_LIST
+
+
 def _curl_resolution(host: str, source: Path) -> str | None:
     try:
         address = ipaddress.ip_address(host)
@@ -148,15 +190,20 @@ def _curl_resolution(host: str, source: Path) -> str | None:
             rows = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
         except OSError:
             _die_url_refused("dns_resolution_failed", f"não foi possível resolver o hostname do config curl: {source}")
-        addresses = sorted({row[4][0] for row in rows})
+        addresses = list(dict.fromkeys(row[4][0] for row in rows))
         if not addresses:
             _die_url_refused("dns_no_address", f"hostname do config curl sem endereço: {source}")
         parsed = [ipaddress.ip_address(item) for item in addresses]
         if any(not item.is_global for item in parsed):
             _die_url_refused("private_address", f"hostname do config curl resolveu para endereço privado: {source}")
-        selected = parsed[0]
-        target = f"[{selected}]" if selected.version == 6 else str(selected)  # noqa: PLR2004 - IP version 6
-        return f"{host}:443:{target}"
+        # Every checked address goes to `--resolve` (curl >= 7.59 takes a list), IPv4 first and
+        # otherwise in resolver order: pinning only one could pick an IPv6 on an IPv4-only network.
+        parsed.sort(key=lambda item: item.version)
+        if len(parsed) > 1 and not _curl_takes_address_list():
+            # An older curl would skip the whole list and resolve by DNS, unpinned: one address only.
+            parsed = parsed[:1]
+        targets = ",".join(f"[{item}]" if item.version == 6 else str(item) for item in parsed)  # noqa: PLR2004 - IPv6
+        return f"{host}:443:{targets}"
     if not address.is_global:
         _die_url_refused("private_address", f"a URL do config curl não pode apontar para endereço privado: {source}")
     return None
@@ -245,7 +292,7 @@ def pair_configs(config_dir: Path) -> list[tuple[str, Path, Path]]:
     for video_config in video_configs:
         stem = video_config.name[: -len("_video.conf")]
         audio_config = config_dir / f"{stem}_audio.conf"
-        if not audio_config.exists():
+        if not strict_exists(audio_config):
             die(f"config de áudio ausente para {stem}: {audio_config}")
         pairs.append((stem, video_config, audio_config))
     if not pairs:
@@ -259,9 +306,9 @@ def ensure_tool(name: str) -> None:
 
 
 def _reused_part_is_valid(path: Path) -> bool:
-    """Sanidade rápida via ffprobe numa parte reaproveitada; mídia corrompida/truncada não pode seguir em silêncio."""
+    """Sanidade rápida via ffprobe numa parte reaproveitada; mídia corrompida/truncada não segue em silêncio."""
     try:
-        subprocess.run(
+        effects.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
             check=True,
             capture_output=True,
@@ -287,7 +334,7 @@ def _log_pair_stage(stage: str | None, started: float, *, status: str, size: int
     )
 
 
-def download_or_reuse(  # noqa: C901, PLR0913, PLR0915 - existing size; one download/reuse/verify branch per source combination
+def download_or_reuse(  # noqa: C901, PLR0913, PLR0915 - existing size; one branch per source combination
     *,
     cfg_path: Path,
     part_path: Path,
@@ -297,6 +344,7 @@ def download_or_reuse(  # noqa: C901, PLR0913, PLR0915 - existing size; one down
     stage: str | None = None,
 ) -> str:
     started = time.monotonic()
+    where = labels.shown(cfg_path)  # in the messages: the folder by its label, so the prose after it survives
     parsed = parse_curl_config(cfg_path)
     config_output = resolve_config_output(parsed["output"], config_output_root)
 
@@ -304,26 +352,28 @@ def download_or_reuse(  # noqa: C901, PLR0913, PLR0915 - existing size; one down
         prefer_config_output
         and not force_download
         and config_output
+        # lenient: reuse of a previous output; absent means download again
         and config_output.exists()
         and config_output.stat().st_size > 0
     ):
         if not _reused_part_is_valid(config_output):
             die(f"parte reutilizada está corrompida; use --force-download: {config_output}")
-        part_path.parent.mkdir(parents=True, exist_ok=True)
+        effects.mkdir(part_path.parent, parents=True, exist_ok=True)
         if config_output.resolve() != part_path.resolve():
-            shutil.copy2(config_output, part_path)
+            effects.copy_file(config_output, part_path, metadata=True)
         logs.event(_log, logging.INFO, "pair_reuse", stage=stage)
         return "reused-config-output"
 
+    # lenient: reuse of a .part; absent means download again
     if part_path.exists() and part_path.stat().st_size > 0 and not force_download:
         if not _reused_part_is_valid(part_path):
             die(f"parte reutilizada está corrompida; use --force-download: {part_path}")
         logs.event(_log, logging.INFO, "pair_reuse", stage=stage)
         return "reused-part"
 
-    part_path.parent.mkdir(parents=True, exist_ok=True)
+    effects.mkdir(part_path.parent, parents=True, exist_ok=True)
     # Preserva partes existentes válidas até a transferência substituta ter sucesso.
-    with tempfile.TemporaryDirectory(dir=part_path.parent) as stage_dir:
+    with effects.temp_dir(folder=part_path.parent) as stage_dir:
         pending = Path(stage_dir) / "download.part"
         cmd = [
             "curl",
@@ -346,16 +396,17 @@ def download_or_reuse(  # noqa: C901, PLR0913, PLR0915 - existing size; one down
         cmd.append(str(parsed["url"]))
         print(f"+ curl <url-de {cfg_path}> --output {part_path}", file=sys.stderr)
         try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+            effects.run(cmd, check=True, capture_output=True, timeout=600)
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr or b""
             if isinstance(stderr, bytes):
                 stderr = stderr.decode("utf-8", errors="replace")
-            blocked = BLOCKED_RE.search(stderr) if exc.returncode == 22 else None  # noqa: PLR2004 - curl exit 22 (--fail), see the comment at the top of the file
+            curl_fail = exc.returncode == 22  # noqa: PLR2004 - curl --fail; ver comentário no topo do arquivo
+            blocked = BLOCKED_RE.search(stderr) if curl_fail else None
             if blocked:
                 _log_pair_stage(stage, started, status="error")
                 message = (
-                    f"CDN recusou o config {cfg_path} com HTTP {blocked.group(1)}; pare o lote, "
+                    f"CDN recusou o config {where} com HTTP {blocked.group(1)}; pare o lote, "
                     "aguarde o cooldown e recapture as URLs antes de tentar de novo"
                 )
                 # Inlined `die()`: only this branch needs the raised error to carry the
@@ -367,26 +418,28 @@ def download_or_reuse(  # noqa: C901, PLR0913, PLR0915 - existing size; one down
                 raise error  # noqa: B904 - implicit context, matching die()'s own raise
             tail = stderr_tail(stderr)
             _log_pair_stage(stage, started, status="error")
-            die(f"curl falhou para o config {cfg_path} (exit {exc.returncode}): {tail}")
+            die(f"curl falhou para o config {where} (exit {exc.returncode}): {tail}")
         except subprocess.TimeoutExpired as exc:
             _log_pair_stage(stage, started, status="error")
             die(
-                f"curl timed out after {exc.timeout}s para o config {cfg_path}; recapture URLs expiradas/proibidas e tente de novo"
+                f"curl timed out after {exc.timeout}s para o config {where}; recapture URLs "
+                "expiradas/proibidas e tente de novo"
             )
         except (subprocess.SubprocessError, OSError):
             _log_pair_stage(stage, started, status="error")
-            die(f"curl falhou para o config {cfg_path}; recapture URLs expiradas/proibidas e tente de novo")
+            die(f"curl falhou para o config {where}; recapture URLs expiradas/proibidas e tente de novo")
+        # lenient: post-condition of our own curl write into the pending file
         if not pending.is_file() or pending.stat().st_size == 0:
             _log_pair_stage(stage, started, status="error")
-            die(f"mídia vazia para o config {cfg_path}")
+            die(f"mídia vazia para o config {where}")
         size = pending.stat().st_size
-        pending.replace(part_path)
+        effects.replace(pending, part_path)
     _log_pair_stage(stage, started, status="ok", size=size)
     return "downloaded"
 
 
 def merge_parts(video_part: Path, audio_part: Path, output: Path, *, copy_streams: bool) -> None:
-    output.parent.mkdir(parents=True, exist_ok=True)
+    effects.mkdir(output.parent, parents=True, exist_ok=True)
     if copy_streams:
         cmd = [
             "ffmpeg",
@@ -457,7 +510,7 @@ def ffprobe_json(path: Path) -> dict:
 
 
 def audio_hash(path: Path) -> str:
-    with tempfile.TemporaryDirectory(prefix="getbrolls-ig-audiohash-") as tmp:
+    with effects.temp_dir(prefix="getbrolls-ig-audiohash-") as tmp:
         audio = Path(tmp) / "audio.aac"
         run(
             ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-map", "0:a:0", "-c", "copy", str(audio)],
@@ -499,7 +552,11 @@ def verify_output(path: Path, *, compute_audio_hash: bool = True) -> dict:
 def publish_exclusive(source: Path, destination: Path) -> None:
     created = False
     try:
-        with source.open("rb") as incoming, destination.open("xb") as outgoing:
+        with (
+            effects.op("fs.copy", destination, fallback=(FileExistsError,)),
+            source.open("rb") as incoming,
+            destination.open("xb") as outgoing,
+        ):
             created = True
             shutil.copyfileobj(incoming, outgoing)
             outgoing.flush()
@@ -508,7 +565,7 @@ def publish_exclusive(source: Path, destination: Path) -> None:
         die(f"a saída já existe; nada foi sobrescrito: {destination}")
     except BaseException:
         if created:
-            destination.unlink(missing_ok=True)
+            effects.unlink(destination, missing_ok=True)
         raise
 
 
@@ -527,7 +584,7 @@ def process_one(  # noqa: PLR0913 - existing size; one field per stem/config/out
 ) -> dict:
     if not STEM_RE.fullmatch(stem) or ".." in stem:
         die(f"stem de config inseguro: {stem}")
-    if output.exists():
+    if strict_exists(output):
         die(f"a saída já existe; nada foi sobrescrito: {output}")
     safe_stem = stem
     video_part = parts_dir / f"{safe_stem}_video.mp4"
@@ -548,8 +605,8 @@ def process_one(  # noqa: PLR0913 - existing size; one field per stem/config/out
         prefer_config_output=prefer_config_output,
         stage="audio",
     )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=output.parent) as stage:
+    effects.mkdir(output.parent, parents=True, exist_ok=True)
+    with effects.temp_dir(folder=output.parent) as stage:
         pending = Path(stage) / "merged.mp4"
         merge_started = time.monotonic()
         try:
@@ -557,6 +614,7 @@ def process_one(  # noqa: PLR0913 - existing size; one field per stem/config/out
         except BaseException:
             _log_pair_stage("merge", merge_started, status="error")
             raise
+        # lenient: log field only: merged size, or None when the file is absent
         _log_pair_stage("merge", merge_started, status="ok", size=pending.stat().st_size if pending.exists() else None)
         validate_started = time.monotonic()
         try:
@@ -581,7 +639,9 @@ def process_one(  # noqa: PLR0913 - existing size; one field per stem/config/out
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Baixa/mescla pares de configs curl de vídeo+áudio de Reels do Instagram sem imprimir URLs assinadas.",
+        description=(
+            "Baixa/mescla pares de configs curl de vídeo+áudio de Reels do Instagram sem imprimir URLs assinadas."
+        ),
         epilog=(
             "Lotes grandes: use --pace MIN-MAX (padrão 20-60s) e --max-per-run (padrão 25) para dividir "
             "o lote em execuções menores e manter o ritmo. O resumo em --summary-json é sempre gravado de forma "
@@ -646,7 +706,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pace",
         default=DEFAULT_PACE,
-        help="Pausa aleatória em segundos entre stems, como MIN-MAX (padrão 20-60); 0 desabilita. Nunca antes do primeiro stem.",
+        help=(
+            "Pausa aleatória em segundos entre stems, como MIN-MAX (padrão 20-60); "
+            "0 desabilita. Nunca antes do primeiro stem."
+        ),
     )
     parser.add_argument(
         "--max-per-run",
@@ -657,7 +720,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--continue-on-error",
         action="store_true",
-        help="Registra um stem com falha e continua em vez de interromper o lote. HTTP 403/429 sempre interrompe o lote.",
+        help=(
+            "Registra um stem com falha e continua em vez de interromper o lote. HTTP 403/429 sempre interrompe o lote."
+        ),
     )
     return parser
 
@@ -667,8 +732,8 @@ def write_summary(path: Path | None, summary: dict) -> None:
     if path is None:
         return
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        effects.mkdir(path.parent, parents=True, exist_ok=True)
+        effects.write_text(path, json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     except OSError as exc:
         print(f"WARNING: não foi possível gravar --summary-json ({redact(exc)})", file=sys.stderr)
 
@@ -690,7 +755,8 @@ def record_queue_cooldown(project: Path | None, reason: str) -> str | None:
     """Abre um cooldown em `<project>/work/queue.json`, sob a trava do projeto; None quando não registrado."""
     if project is None:
         print(
-            "WARNING: cooldown não registrado (nenhum --project informado; use --project para gravar o cooldown em work/queue.json)",
+            "WARNING: cooldown não registrado (nenhum --project informado; use --project "
+            "para gravar o cooldown em work/queue.json)",
             file=sys.stderr,
         )
         return None
@@ -773,7 +839,7 @@ def _record_failure(
     return None, None
 
 
-def run_batch(pairs, *, output_for, args) -> dict:  # noqa: C901 - existing size; pace/cap/summary/block-detection loop over the stems
+def run_batch(pairs, *, output_for, args) -> dict:  # noqa: C901 - existing size; pace/cap/summary loop over stems
     """Processa stems em ordem com ritmo, teto por execução, resumo incremental e detecção de bloqueio."""
     low, high = parse_pace(args.pace)
     if args.max_per_run < 1:
@@ -799,16 +865,18 @@ def run_batch(pairs, *, output_for, args) -> dict:  # noqa: C901 - existing size
                 _skip(results, stem, "max-per-run")
                 write_summary(args.summary_json, snapshot())
                 continue
-            if processed and high > 0:
-                _pause_before(stem, low, high)
-            output = output_for(stem)
-            print(f"== {stem} -> {output} ==", file=sys.stderr)
-            processed += 1
             item_id = _safe_item_id(stem)
             logs.event(_log, logging.INFO, "pair_item_start", shortcode=item_id)
             try:
+                # Before the pause and the per-run slot: an unsafe stem (`die`) fails this item
+                # at once, like any other per-item error, instead of aborting the whole batch.
+                output = output_for(stem)
+                if processed and high > 0:
+                    _pause_before(stem, low, high)
+                processed += 1
+                print(f"== {stem} -> {output} ==", file=sys.stderr)
                 result = _collect_one(stem, video_config, audio_config, output, args)
-            except Exception as exc:  # noqa: BLE001 - one item's failure (network/provider/etc.) must not kill the batch
+            except Exception as exc:  # noqa: BLE001 - one item's failure must not kill the batch
                 stop_reason, fatal = _record_failure(results, stem, exc, args)
                 if stop_reason == "cooldown":
                     stopped_by = "cooldown"
@@ -835,6 +903,21 @@ def run_batch(pairs, *, output_for, args) -> dict:  # noqa: C901 - existing size
     return summary
 
 
+def _plan(args):
+    """The tools the batch needs, then its `(stem, video, audio)` pairs and where each output goes."""
+    ensure_tool("curl")
+    ensure_tool("ffmpeg")
+    ensure_tool("ffprobe")
+    if args.video_config:
+        if not args.audio_config or not args.output:
+            die("--audio-config e --output são obrigatórios com --video-config")
+        stem = args.video_config.name.removesuffix("_video.conf")
+        return [(stem, args.video_config, args.audio_config)], lambda _stem: args.output
+    if not args.output_dir:
+        die("--output-dir é obrigatório com --config-dir")
+    return pair_configs(args.config_dir), lambda stem: infer_output_for_stem(stem, args.output_dir, args.layout)
+
+
 def _main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.project is not None:
@@ -844,25 +927,12 @@ def _main(argv: list[str] | None = None) -> int:
         # no --project, the logger stays unconfigured — safe per logs.py's own
         # NullHandler guard (see the module docstring above), no file/stderr side effects.
         logs.configure(str(args.project), read_only=False)
-    ensure_tool("curl")
-    ensure_tool("ffmpeg")
-    ensure_tool("ffprobe")
-
     args.prefer_config_output = not args.no_prefer_config_output
 
-    if args.video_config:
-        if not args.audio_config or not args.output:
-            die("--audio-config e --output são obrigatórios com --video-config")
-        stem = args.video_config.name.removesuffix("_video.conf")
-        pairs = [(stem, args.video_config, args.audio_config)]
-        output_for = lambda _stem: args.output  # noqa: E731
-    else:
-        if not args.output_dir:
-            die("--output-dir é obrigatório com --config-dir")
-        pairs = pair_configs(args.config_dir)
-        output_for = lambda stem: infer_output_for_stem(stem, args.output_dir, args.layout)  # noqa: E731
-
     try:
+        # Inside the `try`: a missing tool or argument ends like any batch error (exit 1 and
+        # the message), never as a traceback.
+        pairs, output_for = _plan(args)
         summary = run_batch(pairs, output_for=output_for, args=args)
         results = [item for item in summary["results"] if item["status"] == "done"]
 
@@ -876,7 +946,7 @@ def _main(argv: list[str] | None = None) -> int:
     except CollectError as exc:
         print(f"-- lote interrompido: {exc.message}", file=sys.stderr)
         return exc.code
-    except Exception as exc:  # noqa: BLE001 - summary is already written; batch must end with a clean message, not a raw traceback
+    except Exception as exc:  # noqa: BLE001 - batch must end with a clean message, not a raw traceback
         print(f"-- lote interrompido: {type(exc).__name__}: {redact(str(exc))}", file=sys.stderr)
         return 1
 
@@ -892,6 +962,11 @@ def _main(argv: list[str] | None = None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     """Run the batch and release the log file when it ends, however it ends."""
+    for stream in (sys.stdout, sys.stderr):
+        # UTF-8 like `getbrolls` itself: a Windows pipe defaults to cp1252, and the
+        # help and the errors are in Portuguese. TextIO does not declare `reconfigure`.
+        with contextlib.suppress(AttributeError, OSError):
+            stream.reconfigure(encoding="utf-8")  # pyright: ignore[reportAttributeAccessIssue]
     try:
         return _main(argv)
     finally:

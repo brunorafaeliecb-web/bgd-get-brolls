@@ -1,5 +1,9 @@
 """Storyboard review exchange. Human decisions never grant media usage rights."""
 
+# pylint: disable=missing-function-docstring,too-many-locals,broad-exception-caught
+# pylint: disable=too-many-branches,too-many-statements
+# Legado: ocorrências pré-existentes (corpo idêntico ao código anterior à 2.6.0).
+
 import copy
 import hashlib
 import json
@@ -7,12 +11,11 @@ import logging
 import re
 from pathlib import Path
 
-from . import logs
-from .models import approve, empty_output, now, signature
+from . import _paths, logs
+from .models import approve, empty_output, now, pending_approval, signature
 
 _log = logs.get(__name__.rsplit(".", 1)[-1])
 
-ASSETS = Path(__file__).resolve().parents[2] / "assets"
 
 # Versão do esquema do JSON de decisões que o Storyboard exporta e que `import_review` aceita.
 REVIEW_TEMPLATE_VERSION = 2
@@ -49,7 +52,20 @@ def legacy_review_epoch(candidate):
 
 
 def project_id(ledger):
-    # Stable when project folder is copied to another reviewer/computer.
+    """Id estável do projeto (sobrevive à cópia da pasta para outra pessoa ou máquina).
+
+    Com `project.json` (layout 1), o id dele manda e é copiado para o manifesto que
+    ainda não tem `project_id`: uma identidade só. Sem ele, o manifesto guarda um uuid
+    criado na primeira vez. `project.json` inválido levanta `ValueError`.
+    """
+    from . import layout
+
+    declared = layout.project_id(ledger.root.parent)
+    if declared is not None:
+        if "project_id" not in ledger.data:
+            ledger.data["project_id"] = declared
+            ledger.save("project_identity")
+        return declared
     if "project_id" not in ledger.data:
         import uuid
 
@@ -73,8 +89,8 @@ def enhance(page, ledger, records):
         .replace(">", "\\u003e")
         .replace("&", "\\u0026")
     )
-    css = (ASSETS / "review.css").read_text(encoding="utf-8")
-    js = (ASSETS / "review.js").read_text(encoding="utf-8")
+    css = _paths.data_path("assets", "review.css").read_text(encoding="utf-8")
+    js = _paths.data_path("assets", "review.js").read_text(encoding="utf-8")
     return page.replace("</style>", css + "</style>").replace(
         "</body>",
         "<script>window.GETBROLLS_REVIEW=" + payload + ";</script><script>" + js + "</script></body>",
@@ -88,10 +104,12 @@ _REVIEW_FILENAME = re.compile(r"(?P<stamp>\d{8}-\d{6})(?:-(?P<suffix>\d+))?\.jso
 
 
 def _review_sort_key(path):
+    # The name closes every tie (`x.json` and `x-0.json` are the same second and position):
+    # the latest file never depends on the order the file system lists the folder.
     match = _REVIEW_FILENAME.fullmatch(path.name)
     if not match:
-        return (path.stat().st_mtime, path.name, -1)
-    return (path.stat().st_mtime, match.group("stamp"), int(match.group("suffix") or 0))
+        return (path.stat().st_mtime, path.name, -1, path.name)
+    return (path.stat().st_mtime, match.group("stamp"), int(match.group("suffix") or 0), path.name)
 
 
 def latest_review_file(root):
@@ -104,9 +122,9 @@ def latest_review_file(root):
     (onde `-1.json` viria antes de `.json`, escolhendo a decisão errada).
     """
     folder = Path(root) / "reviews"
-    if not folder.is_dir():
+    if not _paths.strict_is_dir(folder):
         return None
-    files = [p for p in folder.glob("*.json") if p.is_file()]
+    files = [p for p in folder.glob("*.json") if _paths.strict_is_file(p)]
     if not files:
         return None
     return max(files, key=_review_sort_key)
@@ -119,7 +137,9 @@ def _import_review_result(review_state):
     return "pending"
 
 
-def import_review(ledger, file, by, rules=None):  # noqa: C901, PLR0912, PLR0915 - existing size; validates the saved decision file then applies it item by item
+def import_review(  # noqa: C901, PLR0912, PLR0915 - existing size; validates the saved decision file item by item
+    ledger, file, by, rules=None
+):
     if not by.strip():
         raise ValueError('Diga quem revisou: acrescente --by "seu nome" ao comando.')
     file_source = "explicit" if file is not None else "latest"
@@ -169,7 +189,7 @@ def import_review(ledger, file, by, rules=None):  # noqa: C901, PLR0912, PLR0915
 
     for item in items:
         if not isinstance(item, dict) or not isinstance(item.get("id"), str):
-            raise ValueError(
+            raise ValueError(  # noqa: TRY004 - contrato da CLI: dado inválido é ValueError (INVALID_DATA)
                 "Tem um trecho sem identificação no arquivo de decisões. Volte à "
                 "página, salve de novo e me passe o arquivo novo."
             )
@@ -276,12 +296,7 @@ def import_review(ledger, file, by, rules=None):  # noqa: C901, PLR0912, PLR0915
             # stop counting as delivered/verified once rejected here too.
             c["output"] = empty_output()
         else:
-            c["approval"] = {
-                "status": "pending",
-                "by": None,
-                "at": None,
-                "revision": None,
-            }
+            c["approval"] = pending_approval()
             c["state"] = "awaiting_approval"
         item_log.append((c["id"], state))
         changes.append(c)

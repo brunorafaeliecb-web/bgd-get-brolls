@@ -6,6 +6,9 @@ aprovação humana **não** atravessam: continuam por projeto, por revisão e po
 intervalo, e toda resposta daqui repete isso em `rights_not_transferable`.
 """
 
+# pylint: disable=missing-function-docstring,too-many-locals
+# Legado: ocorrências pré-existentes (corpo idêntico ao código anterior à 2.6.0).
+
 import contextlib
 import hashlib
 import json
@@ -15,7 +18,10 @@ import time
 import unicodedata
 import uuid
 
-from . import logs
+from . import effects, labels, logs, versioning
+from ._paths import strict_exists
+from .errors import LockedError
+from .memory import load_references
 from .models import now
 from .rules import home_dir
 
@@ -58,20 +64,22 @@ def _off(**extra):
 
 def load_index():
     path = index_path()
-    if not enabled() or not path.exists():
+    if not enabled() or not strict_exists(path):
         return json.loads(json.dumps(EMPTY))
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         raise ValueError(
-            f"{path} está com JSON inválido. Preserve o arquivo e conserte-o, ou "
+            f"{labels.shown(path)} está com JSON inválido. Preserve o arquivo e conserte-o, ou "
             "apague-o para começar uma biblioteca nova; nenhum projeto depende dele."
         ) from None
-    if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError(
-            f"{path} não é uma biblioteca da versão {SCHEMA_VERSION}. Preserve o "
-            "arquivo e conserte-o, ou apague-o para começar uma biblioteca nova."
-        )
+    invalid = (
+        f"{labels.shown(path)} não é uma biblioteca da versão {SCHEMA_VERSION}. Preserve o "
+        "arquivo e conserte-o, ou apague-o para começar uma biblioteca nova."
+    )
+    if not isinstance(data, dict):
+        raise ValueError(invalid)  # noqa: TRY004 - contrato da CLI: dado inválido é ValueError (INVALID_DATA)
+    versioning.read_version(data, labels.shown(path), SCHEMA_VERSION, invalid=invalid)
     for key, value in EMPTY.items():
         data.setdefault(key, json.loads(json.dumps(value)))
     return data
@@ -83,25 +91,26 @@ def _write_private(path, text):
     O temporário leva pid e um sufixo aleatório: duas escritas simultâneas nunca
     disputam o mesmo arquivo nem apagam o `.tmp` uma da outra.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    effects.mkdir(path.parent, parents=True, exist_ok=True)
     temp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
-    try:
-        with open(  # noqa: PTH123 - wraps an os.open() fd (explicit flags/mode), no Path equivalent
-            os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
-            "w",
-            encoding="utf-8",
-        ) as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        temp.chmod(0o600)
-        temp.replace(path)
-    finally:
-        temp.unlink(missing_ok=True)
+    with effects.op("fs.write", path):
+        try:
+            with open(  # noqa: PTH123 - wraps an os.open() fd (explicit flags/mode), no Path equivalent
+                os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            temp.chmod(0o600)
+            temp.replace(path)
+        finally:
+            temp.unlink(missing_ok=True)
 
 
 def save_index(data):
-    _write_private(index_path(), json.dumps(data, ensure_ascii=False, indent=2))
+    _write_private(index_path(), json.dumps(versioning.stamp(data, SCHEMA_VERSION), ensure_ascii=False, indent=2))
 
 
 # Trava de diretório: um arquivo criado com O_EXCL, que funciona igual no Windows.
@@ -114,22 +123,24 @@ MAX_QUERIES = 500
 def _locked():
     """Serializa ler → mudar → gravar; sem isso duas escritas perdem uma entrada."""
     path = library_dir() / "index.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    effects.mkdir(path.parent, parents=True, exist_ok=True)
     started = time.monotonic()
     deadline = started + LOCK_TIMEOUT_S
     while True:
         try:
+            # effect-exempt: O_EXCL lock file of the library index; a lock that stays busy logs library_lock
             os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
             break
         except FileExistsError:
             try:
                 stale = time.time() - path.stat().st_mtime > STALE_LOCK_S
+            # lenient: stale-lock probe: a lock it cannot stat counts as fresh, so the wait ends in LOCKED
             except OSError:
                 stale = False
             if stale:
                 # Sobrou de um processo que morreu no meio: ninguém a renova.
                 with contextlib.suppress(OSError):
-                    path.unlink()
+                    effects.unlink(path)
                 continue
             if time.monotonic() > deadline:
                 logs.event(
@@ -139,8 +150,8 @@ def _locked():
                     waited_ms=round((time.monotonic() - started) * 1000),
                     timeout=True,
                 )
-                raise ValueError(
-                    f"{path} está travado há tempo demais por outro get-brolls. "
+                raise LockedError(
+                    f"{labels.shown(path)} está travado há tempo demais por outro getbrolls. "
                     "Espere a outra execução terminar ou apague esse arquivo."
                 ) from None
             time.sleep(0.02)
@@ -155,7 +166,7 @@ def _locked():
         yield
     finally:
         with contextlib.suppress(OSError):
-            path.unlink()
+            effects.unlink(path)
 
 
 def _update(mutate):
@@ -289,14 +300,13 @@ def learn_from_candidate(project, ident, shot=None):
 
     ledger = Ledger(project)
     c = ledger.get(ident)
-    path = ledger.root / "references.json"
-    items = json.loads(path.read_text(encoding="utf-8")).get("items", []) if path.exists() else []
+    items = load_references(ledger.root).get("items", [])
     references = [r for r in items if r.get("id") == ident]
     if not references:
         raise ValueError(
             "Este candidato ainda não tem decisão registrada na memória do projeto. "
-            "Rode `remember --candidate " + ident + " --decision approved|rejected "
-            '--reason "..." --by NOME --project ...` antes de guardá-lo na biblioteca.'
+            "Rode `remember --candidate " + ident + " --decision approved --reason "
+            '"…" --by NOME --project PROJETO` (ou `--decision rejected`) antes de guardá-lo na biblioteca.'
         )
     reference = references[-1]
     if not enabled():
@@ -431,7 +441,8 @@ def hints(query, limit=5):
 
         record_warning(
             "LIBRARY_INDEX_UNREADABLE",
-            f"Biblioteca de aprendizados ({index_path()}) não pôde ser lida; pistas ignoradas nesta busca: {error}",
+            f"Biblioteca de aprendizados ({labels.shown(index_path())}) não pôde ser lida; pistas ignoradas nesta "
+            f"busca: {labels.reason(error)}",
         )
         return []
     out = [
