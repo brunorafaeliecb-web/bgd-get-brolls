@@ -331,13 +331,20 @@ acima dele) num erro de E/S sai como a pessoa o digitou (`~/travada/proj/brolls`
 A chave nasce na primeira linha que precisa dela: se o `$GB_HOME` ainda
 não existe, essa linha o cria (0700) só para guardar o `.log-salt`. Uma chave que é link (nunca
 seguido), uma pasta só de leitura ou um sistema sem como gravá-la fazem o processo usar uma chave
-só dele e avisar uma vez, com `event=log_salt_unavailable reason=link|readonly|nolink|malformed`;
-uma chave malformada é avisada e trocada por uma nova (gravada à parte e posta no lugar de uma
+só dele e avisar, uma vez para cada motivo, com
+`event=log_salt_unavailable reason=link|readonly|unreadable|nolink|busy|malformed` (mais `last=` e `errno=`, o que
+falhou por último; o campo `reason` é de log, não um `reason_code` do contrato);
+uma chave malformada é avisada (`malformed`) e trocada por uma nova (gravada à parte e posta no lugar de uma
 vez), sob uma trava (o `flock` do próprio `$GB_HOME`; no Windows, `$GB_HOME/.getbrolls-salt.lock`),
-para vários processos nunca ficarem com chaves diferentes. Sem hardlink (exFAT, alguns SMB), a chave é criada direto no nome final com `O_EXCL`. O
+para vários processos nunca ficarem com chaves diferentes: quem perde o conserto (no Windows, uma violação de
+compartilhamento ou de trava enquanto outro processo troca o arquivo, ou o arquivo no meio da troca) lê de novo o
+arquivo, por cerca de 5 s, e termina com a chave gravada; só se esse prazo acabar (`reason=busy`) usa uma só dele,
+e uma falha que não é espera por outro processo desiste com o motivo verdadeiro depois de poucas tentativas
+(`readonly`: a pasta não aceita um arquivo; `unreadable`: o arquivo não pode ser lido). Sem hardlink (exFAT, alguns
+SMB), a chave é criada direto no nome final com `O_EXCL`. O
 `doctor` mostra o estado em `install.log_salt` (`ok`, `missing`, `readonly` — a chave não
-existe e a pasta que a guardaria não aceita gravação —, `link`, `malformed`, `unreadable`), sem
-criar nada. Fora dessas pastas (a mídia da pessoa, a
+existe e a pasta que a guardaria não aceita um arquivo, o que ele confere criando e apagando um arquivo de prova
+—, `link`, `malformed`, `unreadable`). Fora dessas pastas (a mídia da pessoa, a
 pasta de um cliente, uma pasta temporária), só o hash do caminho inteiro
 (`#a3e1d325.mov`). Uma URL sai só pelo host (`api.pexels.com`), como em todo o log: o
 caminho dela pode ser a própria credencial (um webhook, um link de compartilhamento, o id de

@@ -39,9 +39,6 @@ def scaled(seconds: float) -> float:
 # 0,2 s nesta máquina; o teto do teste dá folga para uma máquina de CI lenta.
 BUDGET_S = 1.0
 
-# The slow-disk sibling probe sleeps 0.16 s at most; a probe per line would sleep over 2 s.
-SIBLING_BUDGET_S = 1.0
-
 
 class RedactionCostTests(unittest.TestCase):
     def setUp(self):
@@ -275,33 +272,26 @@ class SiblingProbeTests(unittest.TestCase):
     (a network `$GB_HOME`) never makes a log line slow."""
 
     def test_a_slow_disk_is_asked_a_bounded_number_of_times(self):
+        """What is bounded is the number of probes, so that is what is asserted, never a stopwatch: a probe per
+        line would be 200 consultations, the cap is 16, and a loaded shared runner cannot move a count (a
+        wall-clock budget did: 1.014 s against 1.0 s on a busy macOS runner while the sleeps summed to 0.16 s).
+        It also asks for at least one probe, so a sibling check removed altogether does not pass."""
         tmp = Path(tempfile.mkdtemp(prefix="gb-sib-"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         root = tmp / "gbh"
         root.mkdir()
         calls = []
-        per_pass = []
 
         def slow(path):
             calls.append(path)
-            time.sleep(0.01)
             return False
-
-        def one_pass():
-            calls.clear()
-            shown = labels.text(unit * 200)
-            per_pass.append(len(calls))
-            return shown
 
         unit = f"{root} a b c d e f g h i j k l m n o p q r s t u v w x y z\n"
         with patch.dict(os.environ, {"GB_HOME": str(root)}), patch("os.path.lexists", side_effect=slow):
-            # A pass sleeps 16 x 10 ms at most (0.16 s) however slow the machine or the tracer: sleeping is not
-            # traced. One probe per line would sleep 200 x 10 ms = 2 s or more. The budget sits between them, and
-            # the time is the best of a few passes, so one stalled pass cannot fail it.
-            elapsed, shown = best_sample(one_pass, SIBLING_BUDGET_S)
+            shown = labels.text(unit * 200)
         self.assertEqual(200, shown.count("$GB_HOME a b c"))
-        self.assertLessEqual(max(per_pass), 16, f"{max(per_pass)} consultas ao disco")
-        self.assertLess(elapsed, SIBLING_BUDGET_S)
+        self.assertGreater(len(calls), 0)
+        self.assertLessEqual(len(calls), 16, f"{len(calls)} consultas ao disco")
 
     def test_many_different_names_after_the_folder_cost_the_same_cap(self):
         tmp = Path(tempfile.mkdtemp(prefix="gb-sib-"))

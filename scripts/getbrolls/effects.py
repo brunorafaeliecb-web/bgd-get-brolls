@@ -77,7 +77,7 @@ import uuid
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from . import _paths, _tokens, logs, runtime
+from . import _paths, _salt_read, _tokens, logs, runtime
 
 # The same logger `logs.get("effects")` gives, taken directly: `logs` -> `_paths` -> this module
 # is an import cycle, so nothing of `logs` may be read while this module loads.
@@ -199,40 +199,26 @@ _URL_SCHEME = re.compile(r"(?i)^https?://")
 # The key of the HMAC that hashes names: random, one per installation, 0600 in `$GB_HOME`,
 # created the first time a line needs it and never logged. Without it a dictionary of client
 # names or titles would reverse a plain sha256 of 32 bits.
-SALT_FILE = ".log-salt"
-_SALT_HEX = re.compile(r"[0-9a-f]{64}")
-_SALT_PARTIAL = re.compile(r"[0-9a-f]{0,63}")
-_SALT_READ_TRIES = 25
-_SALT_READ_WAIT_S = 0.01
-# Windows refuses to open or rename a file another process is renaming or reading (a sharing violation, a
-# `PermissionError`): the salt's open and set-aside try this many times, this far apart, before giving up.
-_SHARING_TRIES = 5
-_SHARING_WAIT_S = 0.02
-_SHARING_WINERRORS = frozenset({5, 32})  # ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION
+SALT_FILE = _salt_read.SALT_FILE
+_SHARING_TRIES = _salt_read.SHARING_TRIES
+_SHARING_WAIT_S = _salt_read.SHARING_WAIT_S
+_while_shared = _salt_read.while_shared
+_inspect_salt = _salt_read.inspect_salt
+# How long `_settle_salt` rereads a salt another process is repairing before it uses one of its own (about: a pass
+# that started just before the end finishes), and how far apart the rereads are.
+_SALT_SETTLE_S = 5.0
+_SALT_SETTLE_WAIT_S = 0.05
 # Lock file of the salt repair where there is no `flock` (Windows); its name never matches `.log-salt*`.
 SALT_REPAIR_LOCK = ".getbrolls-salt.lock"
 # How long a repairer waits for another one that holds the folder (then repairs on its own).
 _SALT_LOCK_WAIT_S = 2.0
+# A `.tmp` of a salt whose unlink failed is swept by the next repair once it is this old.
+_SALT_TEMP_STALE_S = 60.0
 _salts: dict[str, bytes] = {}
 # Keys of this process only, for messages, where no salt was there yet (`message_key`): never written.
 _message_keys: dict[str, bytes] = {}
-# `$GB_HOME`s whose salt problem this process already warned about (one WARNING each).
-_salt_warned: set[str] = set()
-
-
-def _while_shared(operation, *args):
-    """`operation(*args)`, tried again after `_SHARING_WAIT_S` when it raises a Windows sharing violation
-    (`PermissionError` with `winerror` 5 or 32: another process holds or renames the file), up to
-    `_SHARING_TRIES` tries; the last error is raised as it came. Any other `PermissionError` (a real
-    `EACCES` on POSIX) is raised at once."""
-    for _attempt in range(_SHARING_TRIES - 1):
-        try:
-            return operation(*args)
-        except PermissionError as exc:
-            if getattr(exc, "winerror", None) not in _SHARING_WINERRORS:
-                raise
-            time.sleep(_SHARING_WAIT_S)
-    return operation(*args)
+# `($GB_HOME, reason)`s this process already warned about (one WARNING each).
+_salt_warned: set[tuple[str, str]] = set()
 
 
 def owned_stream(handle):
@@ -247,58 +233,11 @@ def owned_stream(handle):
         raise
 
 
-def _open_salt(path):
-    """The descriptor of the salt file for reading, or `None` when it is a link (never followed)."""
-    if stat.S_ISLNK(os.lstat(path).st_mode):
-        return None
-    return os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-
-
-def _read_salt_once(path):
-    """`(state, text)` of one read of `path`: `text` is what the file holds when `state` is None."""
-    try:
-        fd = _while_shared(_open_salt, path)
-        if fd is None:
-            return "link", None
-    except FileNotFoundError:
-        return "missing", None
-    except OSError as exc:
-        return ("link" if exc.errno in (errno.ELOOP, errno.EMLINK) else "unreadable"), None
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or (os.name != "nt" and info.st_uid != os.geteuid()):
-            return "link", None
-        return None, os.read(fd, 256).decode("ascii", "replace").strip()
-    except OSError:
-        return "unreadable", None
-    finally:
-        os.close(fd)
-
-
-def _inspect_salt(path, tries=_SALT_READ_TRIES):
-    """`(state, salt)` of the salt file `path`, never following a link; never raises.
-
-    `state`: `ok`, `missing`, `link` (a link, not a regular file, or a file of another user),
-    `unreadable` or `malformed`. An empty or short hex text is a salt still being written by
-    another process (`_create_in_place`): read again a few times before calling it malformed."""
-    attempt = 1
-    while True:  # every pass returns or reads again: at least one read, at most `tries`
-        state, text = _read_salt_once(path)
-        if state is not None or text is None:
-            return state or "unreadable", None
-        if _SALT_HEX.fullmatch(text):
-            return "ok", bytes.fromhex(text)
-        if not _SALT_PARTIAL.fullmatch(text) or attempt >= tries:
-            return "malformed", None
-        attempt += 1
-        time.sleep(_SALT_READ_WAIT_S)
-
-
 def salt_state():
     """The state of this installation's salt for `doctor` (`ok`, `missing`, `readonly`, `link`,
-    `malformed`, `unreadable`); only reads, never creates. `missing` is normal before the first log
+    `malformed`, `unreadable`); never creates the salt. `missing` is normal before the first log
     line; `readonly` is a missing salt that can never be created (the folder that would hold it, or
-    the nearest one that exists, is not writable), so every process will use a salt of its own."""
+    the nearest one that exists, does not accept a file), so every process will use a salt of its own."""
     try:
         path = _paths.gb_home() / SALT_FILE
     except (RuntimeError, OSError, ValueError):
@@ -311,7 +250,7 @@ def salt_state():
 
 def _creatable(folder):
     """Could a file be created in `folder` (or, if it does not exist, in the nearest folder that does)?
-    Only asks (`os.access`); never creates anything."""
+    Asks `os.access` and then tries a file of its own, removed at once: on Windows `os.access` ignores ACLs."""
     current = Path(folder)
     while True:
         try:
@@ -324,7 +263,21 @@ def _creatable(folder):
         # lenient: doctor probe only: a folder it cannot even stat cannot hold the salt either
         except OSError:
             return False
-        return stat.S_ISDIR(info.st_mode) and os.access(current, os.W_OK | os.X_OK)
+        return stat.S_ISDIR(info.st_mode) and os.access(current, os.W_OK | os.X_OK) and _accepts_a_file(current)
+
+
+def _accepts_a_file(folder):
+    """Does `folder` take a file? Tries one and always removes it. Raw writes on purpose: `effects.op` would
+    hash the target with the salt, and `doctor` must never create it."""
+    probe = folder / f".getbrolls-probe.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        os.close(os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        return True
+    except OSError:
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            _while_shared(probe.unlink)
 
 
 def _new_salt_file(path):
@@ -345,23 +298,24 @@ def _create_in_place(path):
             stream.write(secrets.token_hex(32) + "\n")
 
 
-def _create_salt(path, *, swap=False):
+def _create_salt(path, *, swap=False, wait_s=_SALT_LOCK_WAIT_S):
     """Write a new salt to `path` (0600) and return `(state, salt)` of what ended up there.
 
     A new file is a temporary one linked into place, so nobody reads half a salt, and the first
     process to link wins for everybody; with no hardlinks, `_create_in_place`. A malformed file
-    (`swap`) is repaired under a `flock` on its folder (POSIX; `SALT_REPAIR_LOCK` without it): the
-    first repairer moves it aside (`_set_aside`) and creates a new one by that same first-wins path,
-    and every repairer then rereads the one file that persisted, never a salt of its own."""
+    (`swap`) is repaired under a `flock` on its folder (POSIX; `SALT_REPAIR_LOCK` without it), waited
+    for up to `wait_s`: the first repairer moves it aside (`_set_aside`) and creates a new one by that
+    same first-wins path, and every repairer then rereads the one file that persisted, never a salt of
+    its own."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not swap:
         return _link_new_salt(path)
     # POSIX: `flock` on `$GB_HOME` itself; without it (Windows), a lock file of its own there, the way
     # the project log's rotation does it. A lock still busy after the wait: repair anyway.
     if logs.fcntl is not None:
-        lock = logs.folder_lock(path.parent, _SALT_LOCK_WAIT_S)
+        lock = logs.folder_lock(path.parent, wait_s)
     else:
-        lock = runtime.try_lock(path.parent / SALT_REPAIR_LOCK, _SALT_LOCK_WAIT_S)
+        lock = runtime.try_lock(path.parent / SALT_REPAIR_LOCK, wait_s)
     with lock:
         state, found = _inspect_salt(path)
         if state != "malformed":
@@ -372,17 +326,22 @@ def _create_salt(path, *, swap=False):
 
 
 def _link_new_salt(path):
+    """Link a fresh temporary salt to `path`, first wins; `(state, salt)` of what is there. A sharing or
+    lock violation goes up (`_settle_salt` reads again); any other refusal to link falls back to creating
+    the file in place."""
     temp = _new_salt_file(path)
     try:
         try:
             path.hardlink_to(temp)
         except FileExistsError:
             pass
-        except OSError:
+        except OSError as exc:
+            if _salt_read.patient(exc):
+                raise
             _create_in_place(path)
     finally:
         with contextlib.suppress(OSError):
-            temp.unlink()
+            _while_shared(temp.unlink)
     return _inspect_salt(path)
 
 
@@ -391,31 +350,126 @@ def _set_aside(path):
 
     Another repairer that moved it first leaves nothing to move (`FileNotFoundError`, ignored). The
     file is removed with the raw `unlink`, not `effects.unlink`, on purpose: this runs while a line
-    is being redacted, and logging it would recurse into the salt it is replacing."""
+    is being redacted, and logging it would recurse into the salt it is replacing.
+
+    A rename moves whatever is at `path`, so the file is inspected again before EVERY attempt, not once
+    before a retry loop: a repairer that won while this one waited out a sharing violation (or missed the
+    lock) has put a good salt there, and that one is left alone (the caller then reads it). Only the
+    instructions between the last inspect and the rename remain open, which no portable call closes."""
     aside = path.with_name(f"{path.name}.bad-{uuid.uuid4().hex}")
-    with contextlib.suppress(FileNotFoundError):
-        _while_shared(path.replace, aside)
-    # This one and any left by a repairer that died midway (best effort).
-    for leftover in path.parent.glob(f"{path.name}.bad-*"):
+    attempt = 1
+    while True:  # every pass returns, breaks or raises: at most `_SHARING_TRIES` renames
+        if _inspect_salt(path, tries=3)[0] != "malformed":
+            return
+        try:
+            path.replace(aside)
+            break
+        except FileNotFoundError:
+            break
+        except PermissionError as exc:
+            if not _salt_read.sharing(exc) or attempt >= _SHARING_TRIES:
+                raise
+            attempt += 1
+            time.sleep(_salt_read.SHARING_WAIT_S)
+    # This one, any left by a repairer that died midway and any `.tmp` whose unlink failed (best effort).
+    for leftover in path.parent.glob(f"{path.name}.*"):
         with contextlib.suppress(OSError):
-            leftover.unlink()  # effect-exempt: leftover of the salt repair; logging it would recurse into the salt
+            if ".bad-" in leftover.name or (
+                leftover.name.endswith(".tmp") and time.time() - leftover.stat().st_mtime > _SALT_TEMP_STALE_S
+            ):
+                leftover.unlink()  # effect-exempt: leftover of the salt repair; logging it would recurse into the salt
 
 
-def _warn_salt(key, reason):
-    """One WARNING per process and `$GB_HOME`: the hashes of this process will not match other runs."""
-    if key in _salt_warned:
+def _warn_salt(key, reason, last=("", None)):
+    """One WARNING per process, `$GB_HOME` and reason: the hashes of this process will not match other runs.
+    `last` is `(what failed, errno)` of the failure that ended it, when there was one."""
+    if (key, reason) in _salt_warned:
         return
-    _salt_warned.add(key)
-    logs.event(_logger, logging.WARNING, "log_salt_unavailable", reason=reason)
+    _salt_warned.add((key, reason))
+    fields = {"last": last[0]} if last[0] else {}
+    if last[1] is not None:
+        fields["errno"] = last[1]
+    logs.event(_logger, logging.WARNING, "log_salt_unavailable", reason=reason, **fields)
+
+
+_AGAIN = "again"  # a pass settled nothing: read again
+_NOTHING = ("", None)  # `last` of a pass that failed at nothing
+# What a failure that repeats ends as: the true reason, not `busy` (which is for a wait that outlasts the budget).
+_GIVES_UP_AS = {"create": "readonly", "unreadable": "unreadable"}
+
+
+def _settle_create(path, state, wait_s):
+    """One creation (`missing`) or repair (`malformed`) at `path`: `(salt, reason, last)`, `reason` being
+    `_AGAIN` when a sharing or lock violation (`busy`) or a refused access (`create`) may be passing."""
+    try:
+        state, found = _create_salt(path, swap=state == "malformed", wait_s=wait_s)
+    except OSError as exc:
+        last = ("busy" if _salt_read.patient(exc) else "create", exc.errno)
+        return None, (_AGAIN if _salt_read.sharing(exc) else "readonly"), last
+    if state == "ok":
+        return found, "ok", _NOTHING
+    if state in ("link", "missing"):
+        return None, "nolink" if state == "missing" else "link", _NOTHING
+    return None, _AGAIN, (state, None)  # unreadable or malformed again: read what persisted
+
+
+def _settle_unreadable(path):
+    """`(salt, reason, last)` of a salt that read as `unreadable`: reread when it is passing, else the true reason."""
+    kind, number = _salt_read.why_unreadable(path)
+    if kind == "link":
+        return None, "link", _NOTHING
+    if kind == "denied":
+        return None, "unreadable", ("unreadable", number)
+    return None, _AGAIN, ("busy" if kind == "busy" else "unreadable", number)
+
+
+def _settle_once(key, path, wait_s):
+    """One pass of `_settle_salt`: `(salt, reason, last)`."""
+    state, found = _inspect_salt(path)
+    if state == "ok":
+        return found, "ok", _NOTHING
+    if state == "link":
+        return None, "link", _NOTHING
+    if state == "unreadable":
+        return _settle_unreadable(path)
+    if state == "malformed":
+        _warn_salt(key, "malformed")
+    return _settle_create(path, state, wait_s)  # `missing` or `malformed`
+
+
+def _settle_salt(path):
+    """`(salt, reason, last)`: the salt that persisted at `path`, or `(None, reason, last)` when this process
+    must use one of its own: `link`, `readonly` (nothing can be written), `unreadable` (it cannot be read),
+    `nolink` or `busy` (the budget `_SALT_SETTLE_S` ran out); `last` says what failed last.
+
+    A transient failure (a sharing or lock violation, a file caught mid-rename, a repair lost to another
+    process) is never a reason to invent a salt: the file is read again, so every repairer ends with the same
+    one, for as long as the budget lasts (the deadline is checked before each pass, which waits for the lock
+    no longer than what is left). A failure that is not a wait on another process (`last` other than `busy`)
+    gives up as its true reason when it repeats `_SHARING_TRIES` passes in a row."""
+    key = str(path)
+    deadline = time.monotonic() + _SALT_SETTLE_S
+    last, same = _NOTHING, 0
+    while (left := deadline - time.monotonic()) > 0:
+        found, reason, now = _settle_once(key, path, min(_SALT_LOCK_WAIT_S, left))
+        if reason != _AGAIN:
+            return found, reason, now
+        same = same + 1 if now == last else 1
+        last = now
+        if now[0] != "busy" and same >= _SHARING_TRIES:
+            return None, _GIVES_UP_AS.get(now[0], "busy"), now
+        time.sleep(_SALT_SETTLE_WAIT_S)
+    return None, "busy", last
 
 
 def _salt():
     """This installation's salt (cached per `$GB_HOME`).
 
     A missing salt is created; a malformed one is warned about and replaced. When the file is a
-    link (never followed), the folder is read-only or nothing could be written, this process uses a
-    salt of its own (a name is never hashed without a secret) and warns once: `link`, `readonly`,
-    `nolink` or `malformed`."""
+    link (never followed), the folder is read-only, nothing could be written or read, or the file stayed
+    busy for the whole settle budget, this process uses a salt of its own (a name is never hashed without
+    a secret) and warns, once for each of `link`, `readonly`, `unreadable`, `nolink`, `busy` and
+    `malformed`."""
     try:
         path = _paths.gb_home() / SALT_FILE
     except (RuntimeError, OSError, ValueError):
@@ -423,20 +477,11 @@ def _salt():
     key = str(path)
     if key in _salts:
         return _salts[key]
-    found, reason = None, "readonly"
+    found, reason, last = None, "readonly", _NOTHING
     if path is not None:
-        state, found = _inspect_salt(path)
-        reason = state
-        if state == "malformed":
-            _warn_salt(key, "malformed")
-        if state in ("missing", "malformed"):
-            try:
-                state, found = _create_salt(path, swap=state == "malformed")
-                reason = "nolink" if state == "missing" else state
-            except OSError:
-                reason = "readonly"
+        found, reason, last = _settle_salt(path)
     if found is None:
-        _warn_salt(key, "readonly" if reason in ("missing", "unreadable") else reason)
+        _warn_salt(key, reason, last)
     _salts[key] = found or secrets.token_bytes(32)
     return _salts[key]
 

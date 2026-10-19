@@ -15,7 +15,7 @@ import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: d
 import _paths as _test_paths  # noqa: F401  (efeito de import: põe scripts/ no sys.path)  # pylint: disable=unused-import
 from test_effects import EffectsCase, target_of
 
-from getbrolls import effects
+from getbrolls import _salt_read, effects
 
 # pylint: disable=protected-access
 
@@ -71,7 +71,7 @@ class SaltFileStateTests(SaltCase):
         second = target_of("texto livre do cliente")
         self.assertRegex(first, f"^{HASH}$")
         self.assertEqual(first, second)  # o sal do processo vale até o fim dele
-        self.assertEqual(["readonly"], self.warnings())
+        self.assertEqual(["unreadable"], self.warnings())
         self.assertEqual([30], [level for level, name, _ in self.recorder.calls if name == "log_salt_unavailable"])
         self.salt_file().chmod(0o600)
         self.assertEqual(good, self.salt_file().read_text(encoding="ascii"))  # nunca trocado
@@ -127,13 +127,13 @@ class SaltFileStateTests(SaltCase):
         self.assertEqual(("ok", bytes.fromhex("ab" * 32)), effects._inspect_salt(self.salt_file()))
 
     @unittest.skipUnless(NOT_ROOT, "permissões POSIX, sem root")
-    def test_a_malformed_salt_in_a_read_only_home_warns_once_and_stays_on_disk(self):
+    def test_a_malformed_salt_in_a_read_only_home_says_both_and_stays_on_disk(self):
         self.write_salt("nao-e-sal\n")
         self.home.chmod(0o500)
         self.addCleanup(self.home.chmod, 0o700)
         shown = target_of("texto livre do cliente")
         self.assertRegex(shown, f"^{HASH}$")
-        self.assertEqual(["malformed"], self.warnings())  # um aviso só, mesmo com o conserto negado
+        self.assertEqual(["malformed", "readonly"], self.warnings())  # o conserto negado também é dito
         self.assertEqual("nao-e-sal\n", self.salt_file().read_text(encoding="ascii"))
         self.assertEqual([effects.SALT_FILE], sorted(p.name for p in self.home.iterdir()))
 
@@ -243,7 +243,7 @@ class SaltReadRetryTests(unittest.TestCase):
     def inspect(self, answers, tries):
         reads = iter(answers)
         with (
-            mock.patch.object(effects, "_read_salt_once", side_effect=lambda _path: next(reads)) as read,
+            mock.patch.object(_salt_read, "read_salt_once", side_effect=lambda _path: next(reads)) as read,
             mock.patch.object(effects.time, "sleep") as slept,
         ):
             result = effects._inspect_salt(Path("sal"), tries=tries)  # pylint: disable=protected-access
