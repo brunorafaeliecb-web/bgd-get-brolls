@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _posix import open_follows_links
 from _symlink import needs_symlink
 from test_sdk_loader import MANIFEST, LoaderTestCase
 
@@ -142,6 +143,28 @@ class CopyFromFdTests(SafeCopyTestCase):
             safe_copy.copy_from_fd(self.open(), target, 1024)
         self.assertFalse(planted.exists())
 
+    @needs_symlink
+    def test_a_dangling_link_is_refused_where_the_open_would_follow_it(self):
+        # Windows has no O_NOFOLLOW and O_EXCL does not stop a dangling link: the link is
+        # refused before the open, on every system, with the reason an existing name gets.
+        planted = self.base / "plantado.wav"
+        target = self.base / "copia.wav"
+        target.symlink_to(planted)
+        with open_follows_links():
+            self.refused(safe_copy.TARGET_EXISTS, safe_copy.copy_from_fd, self.open(), target, 1024)
+        self.assertFalse(planted.exists())
+        self.assertTrue(target.is_symlink())
+
+    @needs_symlink
+    def test_a_link_to_a_file_is_refused_and_the_file_is_not_touched(self):
+        victim = self.base / "da-pessoa.wav"
+        victim.write_bytes(b"da pessoa")
+        target = self.base / "copia.wav"
+        target.symlink_to(victim)
+        with open_follows_links():
+            self.refused(safe_copy.TARGET_EXISTS, safe_copy.copy_from_fd, self.open(), target, 1024)
+        self.assertEqual(b"da pessoa", victim.read_bytes())
+
 
 class RecheckTests(SafeCopyTestCase):
     def found(self):
@@ -192,13 +215,23 @@ class RootTests(SafeCopyTestCase):
 
     @needs_symlink
     def test_folder_swapped_after_the_open_is_caught(self):
-        fd, _ = safe_copy.open_regular(self.inner)
-        self.addCleanup(os.close, fd)
         outside = self.base / "fora"
         outside.mkdir()
         (outside / "eco.wav").write_bytes(b"outro eco")
-        (self.root / "sub").rename(self.base / "sub-original")
-        (self.root / "sub").symlink_to(outside)
+
+        def swap():
+            (self.root / "sub").rename(self.base / "sub-original")
+            (self.root / "sub").symlink_to(outside)
+
+        if os.name == "nt":
+            # Windows does not rename a folder with a file open inside it, so that swap cannot happen
+            # there: the end state is built directly, with the descriptor on the file the path now reaches.
+            swap()
+            fd, _ = safe_copy.open_regular(outside / "eco.wav")
+        else:
+            fd, _ = safe_copy.open_regular(self.inner)
+            swap()
+        self.addCleanup(os.close, fd)
         self.refused(safe_copy.OUTSIDE, safe_copy.still_under, self.inner, [self.root], fd)
 
 

@@ -204,6 +204,11 @@ _SALT_HEX = re.compile(r"[0-9a-f]{64}")
 _SALT_PARTIAL = re.compile(r"[0-9a-f]{0,63}")
 _SALT_READ_TRIES = 25
 _SALT_READ_WAIT_S = 0.01
+# Windows refuses to open or rename a file another process is renaming or reading (a sharing violation, a
+# `PermissionError`): the salt's open and set-aside try this many times, this far apart, before giving up.
+_SHARING_TRIES = 5
+_SHARING_WAIT_S = 0.02
+_SHARING_WINERRORS = frozenset({5, 32})  # ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION
 # Lock file of the salt repair where there is no `flock` (Windows); its name never matches `.log-salt*`.
 SALT_REPAIR_LOCK = ".getbrolls-salt.lock"
 # How long a repairer waits for another one that holds the folder (then repairs on its own).
@@ -215,12 +220,46 @@ _message_keys: dict[str, bytes] = {}
 _salt_warned: set[str] = set()
 
 
+def _while_shared(operation, *args):
+    """`operation(*args)`, tried again after `_SHARING_WAIT_S` when it raises a Windows sharing violation
+    (`PermissionError` with `winerror` 5 or 32: another process holds or renames the file), up to
+    `_SHARING_TRIES` tries; the last error is raised as it came. Any other `PermissionError` (a real
+    `EACCES` on POSIX) is raised at once."""
+    for _attempt in range(_SHARING_TRIES - 1):
+        try:
+            return operation(*args)
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in _SHARING_WINERRORS:
+                raise
+            time.sleep(_SHARING_WAIT_S)
+    return operation(*args)
+
+
+def owned_stream(handle):
+    """`os.fdopen(handle, "wb")` that closes `handle` when it fails: no stream owns the descriptor yet, and an
+    open handle stops the cleanup `unlink` on Windows. `io.open` may have closed it already: that `EBADF` does
+    not take the place of the error. The caller opened `handle` inside its own `op`."""
+    try:
+        return os.fdopen(handle, "wb")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(handle)
+        raise
+
+
+def _open_salt(path):
+    """The descriptor of the salt file for reading, or `None` when it is a link (never followed)."""
+    if stat.S_ISLNK(os.lstat(path).st_mode):
+        return None
+    return os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+
+
 def _read_salt_once(path):
     """`(state, text)` of one read of `path`: `text` is what the file holds when `state` is None."""
     try:
-        if stat.S_ISLNK(os.lstat(path).st_mode):
+        fd = _while_shared(_open_salt, path)
+        if fd is None:
             return "link", None
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
         return "missing", None
     except OSError as exc:
@@ -355,7 +394,7 @@ def _set_aside(path):
     is being redacted, and logging it would recurse into the salt it is replacing."""
     aside = path.with_name(f"{path.name}.bad-{uuid.uuid4().hex}")
     with contextlib.suppress(FileNotFoundError):
-        path.replace(aside)
+        _while_shared(path.replace, aside)
     # This one and any left by a repairer that died midway (best effort).
     for leftover in path.parent.glob(f"{path.name}.bad-*"):
         with contextlib.suppress(OSError):

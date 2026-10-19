@@ -44,6 +44,7 @@ def anchors(project=None, extra=()):
     project = project if project is not None else logs.project_root()
     if project is not None:
         found.append((Path(project).expanduser(), "<projeto>"))
+        found.extend((spelling, "<projeto>") for spelling in _typed_spellings(project))
     with contextlib.suppress(OSError, RuntimeError, ValueError):
         found.append((_paths.gb_home(), "$GB_HOME"))
     with contextlib.suppress(OSError, RuntimeError, ValueError):
@@ -58,6 +59,24 @@ def anchors(project=None, extra=()):
     with contextlib.suppress(OSError, RuntimeError, ValueError):
         found.append((Path.home(), "~"))
     return found
+
+
+def _typed_spellings(project):
+    """Como a pessoa escreveu o `--project` (`note_typed_project`) quando é a mesma pasta que `project`, comparada
+    pelo caminho de verdade: um link para a pasta, ou, no Windows, o nome curto (`RUNNER~1`) de uma pasta de nome
+    longo. Só a grafia lexical conta aqui; a resolvida é a que `project` já traz. Nunca levanta."""
+    typed = _TYPED[:1]  # one read: another thread may forget the typed project between a test and an index
+    if not typed:
+        return ()
+    try:
+        held = os.path.normcase(os.path.realpath(Path(project).expanduser()))
+        return tuple(
+            spelling
+            for spelling in typed[0][1]
+            if os.path.normcase(os.path.realpath(spelling)) == held and str(spelling) != str(project)
+        )
+    except (OSError, RuntimeError, ValueError):
+        return ()
 
 
 def shown(path, *, project=None, extra=()) -> str:
@@ -224,12 +243,16 @@ _ENCODED = re.compile(r"(?<![\w%.~+-])(?=[\w.~%+-]*%(?:25)*(?:2[Ff]|5[Cc]))[\w.~
 _TRAILING = ",;:()[]{}."
 # Onde acaba um caminho de texto livre fora de toda pasta conhecida (`_Ends`): o nome pode ter espaço e o texto
 # não diz onde ele acaba, então o caminho vale do começo até o fim da linha, ou até o fecho de quem o abriu
-# (aspas, colchete, parêntese ou chave logo antes dele). Sem quem o abra, vale só até um `: ` (dois pontos e um
-# branco): é onde as mensagens de sistema põem o motivo (`/x/a.mp4: Invalid data found`), e o motivo fica. Um
-# `C:\` não é isso, nem um `:` colado ao nome. Perder a frase depois do caminho é aceito; deixar sobrar um
-# pedaço do nome, não. Quem sabe o nome (o `filename` de um `OSError`) o troca pelo texto exato antes disto.
+# (aspas, colchete, parêntese ou chave logo antes dele). Sem quem o abra, vale só até um `: ` ou um `; ` (dois
+# pontos ou ponto e vírgula e um branco): é onde as mensagens põem o motivo (`/x/a.mp4: Invalid data found`) ou
+# o resto da frase (`em /x/proj; nenhum arquivo foi criado`), e o que vem depois fica, desde que não haja barra
+# depois dele, na mesma linha: com barra (`Cliente; Parte 1; Final/a.mp4`) o nome da pasta continua e o caminho
+# também. Um `C:\` não é isso, nem um `:` ou `;` colado ao nome. Perder a frase depois do caminho é aceito;
+# deixar sobrar um pedaço do nome, não. Quem sabe o nome (o `filename` de um `OSError`) o troca pelo texto exato
+# antes disto.
 _LINE_END = re.compile(r"[\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
-_REASON = re.compile(r":\s")
+_REASON = re.compile(r"[:;]\s")
+_SEPARATOR = re.compile(r"[/\\]")
 _CLOSERS = {
     "'": "'",
     '"': '"',
@@ -326,7 +349,7 @@ def _marked(path) -> str | None:
 
 
 class _Ends:  # pylint: disable=too-few-public-methods
-    """Onde acaba cada caminho de texto livre de um mesmo texto (`end`). O fim da linha e o próximo `: ` são
+    """Onde acaba cada caminho de texto livre de um mesmo texto (`end`). O fim da linha e o próximo `: ` ou `; ` são
     guardados: os começos chegam em ordem, então cada um é procurado uma vez só por texto (linear, mesmo com
     milhares de caminhos na mesma linha)."""
 
@@ -334,6 +357,8 @@ class _Ends:  # pylint: disable=too-few-public-methods
         self.text = text_
         self._line = -1
         self._reason = -1
+        self._separators_line = -1
+        self._separator = -1
 
     def _next(self, pattern, start, known):
         if known >= start:
@@ -341,16 +366,39 @@ class _Ends:  # pylint: disable=too-few-public-methods
         found = pattern.search(self.text, start)
         return found.start() if found else len(self.text)
 
+    def _last_separator(self, start):
+        """Onde está a última barra (`/` ou `\\`) da linha atual, procurada a partir de `start` (-1 sem barra).
+        Guardada por linha: os começos chegam em ordem, então cada linha é varrida uma vez só."""
+        if self._separators_line != self._line:
+            self._separators_line = self._line
+            self._separator = max(self.text.rfind("/", start, self._line), self.text.rfind("\\", start, self._line))
+        return self._separator
+
+    def _reason_end(self, start):
+        """O primeiro `: ` ou `; ` depois de `start` sem nenhuma barra depois dele, até o fim da linha: é a frase do
+        motivo. Com barra em qualquer ponto depois, na mesma linha, o nome da pasta ainda pode não ter acabado
+        (`Cliente; Parte 1; Final/a.mp4`) e o caminho segue; sem terminador assim, vai até o fim da linha.
+        Fica de fora o que nenhuma regra separa: um nome de arquivo com `; ` e sem barra depois
+        (`Clip; take 2.mp4: erro`) é igual a uma frase."""
+        position = start
+        while True:
+            self._reason = self._next(_REASON, position, self._reason)
+            if self._reason >= self._line:
+                return self._line
+            after = self._reason + 2
+            if self._last_separator(after) < after:
+                return self._reason
+            position = after
+
     def end(self, start):
         """Onde acaba o caminho que começa em `start`: no fecho de quem o abriu (a aspa, com a barra invertida que
         escapa; o colchete, o parêntese ou a chave, contando os que abrem dentro) ou, sem fecho, no fim da linha;
-        sem quem abra, no primeiro `: ` ou no fim da linha."""
+        sem quem abra, no primeiro `: ` ou `; ` sem barra depois dele na linha (`_reason_end`) ou no fim da linha."""
         self._line = self._next(_LINE_END, start, self._line)
         opener = self.text[start - 1] if start else ""
         closer = _CLOSERS.get(opener)
         if closer is None:
-            self._reason = self._next(_REASON, start, self._reason)
-            return min(self._line, self._reason)
+            return self._reason_end(start)
         depth, position = 0, start
         while position < self._line:
             char = self.text[position]

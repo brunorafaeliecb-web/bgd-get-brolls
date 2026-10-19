@@ -33,6 +33,7 @@ from typing import cast
 
 from . import _paths, effects, labels, logs, runtime
 from .config import SECRET_ENV_SUFFIXES as _SECRET_ENV_SUFFIXES
+from .sdk.files import refuse_link
 
 DEFAULT_PORT = 8767
 
@@ -489,17 +490,21 @@ def _write_private_text(path, text):
     talvez com um umask mais frouxo — é apertado de novo pelo `chmod` explícito.
     `.serve.pid`/`.serve.log` guardam o id de sessão do servidor; nenhum dos dois
     precisa ficar legível por outra conta na máquina.
+
+    Um link no nome é recusado antes de abrir (`refuse_link`); onde não há `O_NOFOLLOW` (Windows) resta a
+    janela entre essa conferência e a abertura, a mesma que `save_review` aceita.
     """
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
     with effects.op("fs.write", path):
+        refuse_link(path)
         handle = os.open(path, flags, 0o600)
         try:
             Path(path).chmod(0o600)
         except BaseException:
             os.close(handle)
             raise
-        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(text)
+        with effects.owned_stream(handle) as stream:
+            stream.write(text.encode("utf-8"))
 
 
 def save_review(directory, data):
@@ -553,11 +558,13 @@ def save_review(directory, data):
                     "Confira se não há um link simbólico no lugar do arquivo."
                 ) from exc
             try:
-                with os.fdopen(handle, "wb") as stream:
+                with effects.owned_stream(handle) as stream:
                     stream.write(body)
             except BaseException:
-                # Disk full or interrupted mid-write: no truncated decisions file is left behind.
-                effects.unlink(path, missing_ok=True)
+                # Disk full or interrupted mid-write: no truncated decisions file is left behind, and a
+                # cleanup that fails (an antivirus holding the file on Windows) must not hide the error.
+                with contextlib.suppress(OSError):
+                    effects.unlink(path, missing_ok=True)
                 raise
             saving.target = path
             return path
@@ -753,8 +760,9 @@ def _rotate_log(log):
         # writing through it.
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
         with effects.op("fs.write", rotated):
+            refuse_link(rotated)
             handle = os.open(rotated, flags, 0o600)
-            with os.fdopen(handle, "wb") as stream:
+            with effects.owned_stream(handle) as stream:
                 stream.write(kept)
     # lenient: log rotation is optional: a failure keeps the current log as it is
     except OSError:

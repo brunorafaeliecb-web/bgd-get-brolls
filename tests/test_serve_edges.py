@@ -453,6 +453,61 @@ class SaveReviewEdgeTests(unittest.TestCase):
             self.assertEqual(errno.ENOSPC, ctx.exception.errno)
             self.assertEqual([], list((brolls / "reviews").iterdir()))
 
+    def test_a_failed_fdopen_closes_the_descriptor_once_and_leaves_no_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brolls = self._brolls(tmp)
+            with (
+                patch.object(serve.os, "fdopen", side_effect=OSError(errno.ENOSPC, "No space left on device")),
+                patch.object(serve.os, "close", wraps=os.close) as closed,
+                self.assertRaises(OSError) as ctx,
+            ):
+                serve.save_review(brolls, {"n": 1})
+            self.assertEqual(errno.ENOSPC, ctx.exception.errno)
+            self.assertEqual(1, closed.call_count)
+            with self.assertRaises(OSError):  # o descritor devolvido ao SO não é mais válido
+                os.fstat(closed.call_args.args[0])
+            self.assertEqual([], list((brolls / "reviews").iterdir()))
+
+    def test_a_cleanup_that_fails_does_not_replace_the_disk_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brolls = self._brolls(tmp)
+            with (
+                patch.object(serve.os, "fdopen", side_effect=OSError(errno.ENOSPC, "No space left on device")),
+                patch.object(serve.effects, "unlink", side_effect=PermissionError(errno.EACCES, "em uso")),
+                self.assertRaises(OSError) as ctx,
+            ):
+                serve.save_review(brolls, {"n": 1})
+            self.assertEqual(errno.ENOSPC, ctx.exception.errno)
+
+    def test_an_already_closed_descriptor_after_a_failed_fdopen_keeps_the_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brolls = self._brolls(tmp)
+
+            def closes_then_fails(handle, _mode):
+                os.close(handle)  # `io.open` fails after the raw file exists and may have closed it already
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+            with (
+                patch.object(serve.os, "fdopen", side_effect=closes_then_fails),
+                self.assertRaises(OSError) as ctx,
+            ):
+                serve.save_review(brolls, {"n": 1})
+            self.assertEqual(errno.ENOSPC, ctx.exception.errno)
+
+    def test_a_failed_fdopen_closes_the_descriptor_of_a_private_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / ".serve.pid"
+            with (
+                patch.object(serve.os, "fdopen", side_effect=OSError(errno.ENOSPC, "No space left on device")),
+                patch.object(serve.os, "close", wraps=os.close) as closed,
+                self.assertRaises(OSError) as ctx,
+            ):
+                serve._write_private_text(target, "texto")
+            self.assertEqual(errno.ENOSPC, ctx.exception.errno)
+            self.assertEqual(1, closed.call_count)
+            with self.assertRaises(OSError):
+                os.fstat(closed.call_args.args[0])
+
     def test_a_chmod_failure_closes_the_descriptor_and_propagates(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / ".serve.pid"

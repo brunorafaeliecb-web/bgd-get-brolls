@@ -1,5 +1,6 @@
 """Pastas de export numeradas: nunca apaga nem mistura, `LATEST`, staging, varredura e corrida."""
 
+import errno
 import json
 import os
 import shutil
@@ -11,6 +12,8 @@ from unittest import mock
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _posix import open_follows_links
+from _symlink import needs_symlink
 
 from getbrolls import export_folder, export_place
 from getbrolls.runtime import force_rmtree
@@ -562,6 +565,48 @@ class LatestAndMarkerTests(FolderTestCase):
             self.export()
         # 3 textos + marcador staging + regravação antes do hardlink + marcador complete + LATEST
         self.assertGreaterEqual(fsync.call_count, len(FILES) + 3)
+
+
+class WriteNewLinkTests(FolderTestCase):
+    """`_write_new` creates the file or fails: a link at the name is never written through."""
+
+    @needs_symlink
+    def test_a_dangling_link_is_refused_where_the_open_would_follow_it(self):
+        planted = self.project / "plantado.txt"
+        target = self.project / "marcador.txt"
+        target.symlink_to(planted)
+        with open_follows_links(), self.assertRaises(FileExistsError):
+            export_folder._write_new(target, b"dados")
+        self.assertFalse(planted.exists())
+        self.assertTrue(target.is_symlink())
+
+    @needs_symlink
+    def test_a_link_to_a_file_leaves_the_file_alone(self):
+        victim = self.project / "da-pessoa.txt"
+        victim.write_bytes(b"da pessoa")
+        target = self.project / "marcador.txt"
+        target.symlink_to(victim)
+        with open_follows_links(), self.assertRaises(FileExistsError):
+            export_folder._write_new(target, b"dados")
+        self.assertEqual(b"da pessoa", victim.read_bytes())
+
+    def test_a_new_name_is_written(self):
+        target = self.project / "novo.txt"
+        export_folder._write_new(target, b"dados")
+        self.assertEqual(b"dados", target.read_bytes())
+
+    def test_a_failed_fdopen_closes_the_descriptor_once_and_keeps_the_error(self):
+        target = self.project / "novo.txt"
+        with (
+            mock.patch.object(export_folder.os, "fdopen", side_effect=OSError(errno.ENOSPC, "cheio")),
+            mock.patch.object(export_folder.os, "close", wraps=os.close) as closed,
+            self.assertRaises(OSError) as caught,
+        ):
+            export_folder._write_new(target, b"dados")
+        self.assertEqual(errno.ENOSPC, caught.exception.errno)
+        self.assertEqual(1, closed.call_count)
+        with self.assertRaises(OSError):  # the descriptor was given back
+            os.fstat(closed.call_args.args[0])
 
 
 if __name__ == "__main__":

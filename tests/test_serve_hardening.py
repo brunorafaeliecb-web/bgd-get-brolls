@@ -26,6 +26,7 @@ import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: d
 from _cli import run_cli
 from _media import skip_unless_ffmpeg, synth_video
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _posix import without_nofollow
 from _symlink import needs_symlink
 
 from getbrolls import serve
@@ -471,6 +472,59 @@ class LogRotationTests(unittest.TestCase):
             rotated.symlink_to(victim)
             serve._rotate_log(log)
             self.assertEqual("nao mexer", victim.read_text(encoding="utf-8"))
+
+    @needs_symlink
+    def test_a_link_at_the_rotated_name_is_refused_where_there_is_no_nofollow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _project_with_review(Path(tmp))
+            brolls = root / "brolls"
+            log = brolls / serve.LOG_FILE
+            log.write_text("conteudo novo\n", encoding="utf-8")
+            victim = brolls / "victim.txt"
+            victim.write_text("nao mexer", encoding="utf-8")
+            rotated = brolls / serve.LOG_ROTATE_FILE
+            rotated.symlink_to(victim)
+            with without_nofollow():
+                serve._rotate_log(log)
+            self.assertEqual("nao mexer", victim.read_text(encoding="utf-8"))
+            self.assertTrue(rotated.is_symlink())
+
+
+class PrivateTextLinkTests(unittest.TestCase):
+    """`.serve.pid` and `.serve.log` are never written through a link planted at their name."""
+
+    @needs_symlink
+    def test_a_link_at_the_target_is_refused_where_there_is_no_nofollow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            victim = directory / "victim.txt"
+            victim.write_text("nao mexer", encoding="utf-8")
+            target = directory / serve.PID_FILE
+            target.symlink_to(victim)
+            with without_nofollow(), self.assertRaises(OSError) as caught:
+                serve._write_private_text(target, "texto")
+            self.assertEqual(errno.ELOOP, caught.exception.errno)
+            self.assertEqual("nao mexer", victim.read_text(encoding="utf-8"))
+            self.assertTrue(target.is_symlink())
+
+    @needs_symlink
+    def test_a_dangling_link_is_refused_and_creates_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            planted = directory / "plantado.txt"
+            target = directory / serve.LOG_FILE
+            target.symlink_to(planted)
+            with without_nofollow(), self.assertRaises(OSError):
+                serve._write_private_text(target, "")
+            self.assertFalse(planted.exists())
+
+    def test_a_plain_file_is_still_replaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / serve.PID_FILE
+            target.write_text("antigo", encoding="utf-8")
+            with without_nofollow():
+                serve._write_private_text(target, "novo")
+            self.assertEqual("novo", target.read_text(encoding="utf-8"))
 
 
 class BackgroundEnvironmentTests(unittest.TestCase):

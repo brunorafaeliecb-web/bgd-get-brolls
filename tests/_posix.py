@@ -50,3 +50,21 @@ def without_nofollow():
     finally:
         if saved is not None:
             os.O_NOFOLLOW = saved
+
+
+@contextlib.contextmanager
+def open_follows_links():
+    """`os.open` follows a link at the last name for the block, as `CreateFile` does on Windows.
+
+    There `O_NOFOLLOW` is missing and `O_EXCL` does not stop a dangling link, so a link planted at the
+    target of a write is written through. A POSIX `O_EXCL` refuses any link on its own; this keeps the
+    path a precheck has to cover."""
+    real_open = os.open
+
+    def follow(path, flags, mode=0o777, **kwargs):
+        if "dir_fd" in kwargs:
+            return real_open(path, flags, mode, **kwargs)
+        return real_open(os.path.realpath(path), flags, mode)
+
+    with mock.patch.object(os, "open", follow):
+        yield

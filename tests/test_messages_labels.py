@@ -179,10 +179,10 @@ class DeliveryTests(LabelCase):
 
     def test_a_comparison_that_fails_to_read_keeps_only_the_system_reason(self):
         missing = self.project / "entrega" / "sumiu.mp4"
-        with self.assertRaises(
-            OSError
-        ) as system:  # a frase é a do sistema: "No such file..." no POSIX, outra no Windows
-            missing.read_bytes()
+        # A frase é a do sistema, da mesma chamada que o código sob teste faz (`stat`): "No such file..." no POSIX;
+        # no Windows `open` e `stat` dão frases diferentes para uma pasta que falta.
+        with self.assertRaises(OSError) as system:
+            missing.stat()
         with self.assertRaises(delivery._CompareError) as ctx:
             delivery._same_bytes(missing, missing)
         self.assertEqual(system.exception.strerror, str(ctx.exception))

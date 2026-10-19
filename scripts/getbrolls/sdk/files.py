@@ -6,6 +6,7 @@ criar ciclo entre eles. Nada aqui é contrato público: `getbrolls.sdk` não
 exporta estes nomes.
 """
 
+import errno
 import os
 import re
 import stat
@@ -100,6 +101,12 @@ def is_link(path, windows=None):
     except OSError:
         return False
     return tag in _NAME_SURROGATE_TAGS
+
+
+def refuse_link(path):
+    """`OSError(ELOOP)`, como o `O_NOFOLLOW` do POSIX, se `path` é um link: o Windows não tem essa flag."""
+    if is_link(Path(path)):
+        raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(path))
 
 
 # Nome de arquivo que a rota pode pedir dentro da pasta de trabalho: sem barra,

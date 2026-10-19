@@ -1638,18 +1638,42 @@ def _expand_project(args):
             ) from None
 
 
+def _is_link_loop(exc):
+    """Windows has no `ELOOP`: a loop is `ERROR_CANT_RESOLVE_FILENAME`, with `errno` 22."""
+    return exc.errno == errno.ELOOP or getattr(exc, "winerror", None) == _paths.WINERROR_CANT_RESOLVE_FILENAME
+
+
 def _refuse_link_loop(typed, path):
     """`--project` cujo caminho passa por um laço de links: erro de uso, igual no 3.11 (`RuntimeError` do
-    `resolve`) e no 3.14 (`ELOOP`). Qualquer outro erro do `stat` fica para o comando."""
+    `resolve`) e no 3.14 (`ELOOP`). Qualquer outro erro do `stat` fica para o comando.
+
+    O Windows só diz "laço" quando o laço é o último nome; com o laço num componente do meio o
+    erro do caminho inteiro é outro (caminho não encontrado). Aí os pais são perguntados do mais
+    próximo ao mais longe, até o primeiro que responde sem erro: um laço em qualquer um deles
+    é o laço do caminho."""
+    path = Path(path)
     try:
-        Path(path).stat()
+        path.stat()
     except OSError as exc:
-        # Windows has no `ELOOP`: a loop is `ERROR_CANT_RESOLVE_FILENAME`, with `errno` 22.
-        if exc.errno == errno.ELOOP or getattr(exc, "winerror", None) == _paths.WINERROR_CANT_RESOLVE_FILENAME:
+        if _is_link_loop(exc) or _parent_loops(path):
             raise UsageError(
                 f"--project {typed}: o caminho tem um laço de links simbólicos ou um link que não resolve. "
                 "Aponte para a pasta de verdade do projeto."
             ) from None
+
+
+def _parent_loops(path):
+    """Algum pai de `path`, antes do primeiro que responde ao `stat` sem erro, é um laço de links?"""
+    for parent in path.parents:
+        try:
+            parent.stat()
+        # Any other error on a parent (EACCES, ENOENT, ENOTDIR) is walked past: the command refuses the project.
+        except OSError as exc:
+            if _is_link_loop(exc):
+                return True
+        else:
+            return False
+    return False
 
 
 def _unknown_tilde_user(project):

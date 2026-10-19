@@ -57,13 +57,13 @@ class PortablePathTests(unittest.TestCase):
         (source / "getbrolls-plugin.json").write_text(json.dumps(MANIFEST), encoding="utf-8")
         (source / "plugin.py").write_text(PLUGIN_CODE, encoding="utf-8")
         preview = self.cli("plugins", "--action", "install", "--source", source)
-        self.assertEqual(str(Path("~") / "src" / "demo"), preview["plugin"]["source"])
+        self.assertEqual("~/src/demo", preview["plugin"]["source"])
         self.assert_no_home(preview["plugin"])
         sha = preview["plugin"]["sha256"]
         done = self.cli("plugins", "--action", "install", "--source", source, "--yes", "--expect", sha)
         self.assert_no_home(done["plugin"])
         listed = self.cli("plugins", "--action", "list")
-        self.assertEqual("$GB_HOME" + os.sep + "plugins", listed["plugins_dir"])
+        self.assertEqual("$GB_HOME/plugins", listed["plugins_dir"])
         self.assert_no_home(listed["plugins"])
         # O plugins.json guarda o caminho de verdade: o update relê a origem dele.
         state = json.loads((self.home / "plugins.json").read_text(encoding="utf-8"))
@@ -126,14 +126,14 @@ class PluginsErrorTests(unittest.TestCase):
         inventory, _entries = self.broken()
         with inventory:
             manifest = capabilities.describe(cli.build_parser())
-        self.assertEqual("$GB_HOME" + os.sep + "plugins.json quebrado", manifest["plugins_error"])
+        self.assertEqual("$GB_HOME/plugins.json quebrado", manifest["plugins_error"])
 
     def test_doctor_plugins_error_is_portable(self):
         _inventory, entries = self.broken()
         result = {}
         with entries:
             commands._doctor_plugin_inventory(result, {"missing": [], "optional": []})  # pylint: disable=protected-access
-        self.assertEqual("$GB_HOME" + os.sep + "plugins.json quebrado", result["plugins_error"])
+        self.assertEqual("$GB_HOME/plugins.json quebrado", result["plugins_error"])
 
 
 if __name__ == "__main__":

@@ -138,6 +138,105 @@ class SaltFileStateTests(SaltCase):
         self.assertEqual([effects.SALT_FILE], sorted(p.name for p in self.home.iterdir()))
 
 
+class SaltSharingViolationTests(SaltCase):
+    """Windows refuses to open or rename a file another process is renaming or reading (`PermissionError`,
+    `WinError` 32 or 5): the read and the set-aside try again a few times before giving up."""
+
+    @staticmethod
+    def sharing_violation():
+        error = PermissionError(errno.EACCES, "O arquivo está em uso por outro processo")
+        error.winerror = 32  # pyright: ignore[reportAttributeAccessIssue]  # set by hand: POSIX has no such attribute
+        return error
+
+    def failing_open(self, times):
+        """`os.open` that raises a sharing violation `times` times for the salt, then opens it."""
+        real_open, left = os.open, [times]
+
+        def flaky(path, flags, *args, **kwargs):
+            if Path(path) == self.salt_file() and left[0] > 0:
+                left[0] -= 1
+                raise self.sharing_violation()
+            return real_open(path, flags, *args, **kwargs)
+
+        return mock.patch.object(effects.os, "open", side_effect=flaky)
+
+    def test_an_open_that_is_busy_a_few_times_is_read_in_the_end(self):
+        self.write_salt("ab" * 32 + "\n")
+        with self.failing_open(effects._SHARING_TRIES - 1), mock.patch.object(effects.time, "sleep") as slept:
+            self.assertEqual(("ok", bytes.fromhex("ab" * 32)), effects._inspect_salt(self.salt_file()))
+        self.assertEqual(effects._SHARING_TRIES - 1, slept.call_count)
+        self.assertEqual([], self.warnings())
+
+    def test_an_open_that_stays_busy_is_unreadable_after_exactly_the_tries(self):
+        self.write_salt("ab" * 32 + "\n")
+        with self.failing_open(effects._SHARING_TRIES + 3) as opened, mock.patch.object(effects.time, "sleep") as slept:
+            self.assertEqual(("unreadable", None), effects._inspect_salt(self.salt_file()))
+        self.assertEqual(effects._SHARING_TRIES, opened.call_count)
+        self.assertEqual(effects._SHARING_TRIES - 1, slept.call_count)
+
+    def test_a_permission_error_that_is_no_sharing_violation_is_not_tried_again(self):
+        self.write_salt("ab" * 32 + "\n")
+        denied = PermissionError(errno.EACCES, "Permission denied")  # no `winerror`: a real EACCES
+        with (
+            mock.patch.object(effects.os, "open", side_effect=denied) as opened,
+            mock.patch.object(effects.time, "sleep") as slept,
+        ):
+            self.assertEqual(("unreadable", None), effects._inspect_salt(self.salt_file()))
+        self.assertEqual((1, 0), (opened.call_count, slept.call_count))
+
+    def test_a_busy_open_does_not_make_a_process_use_a_salt_of_its_own(self):
+        self.write_salt("cd" * 32 + "\n")
+        with self.failing_open(2), mock.patch.object(effects.time, "sleep"):
+            shown = target_of("texto livre do cliente")
+        self.assertEqual([], self.warnings())
+        self.fresh_salts()
+        self.assertEqual(shown, target_of("texto livre do cliente"))  # the one on disk was used
+
+    def fresh_salts(self):
+        effects._salts.clear()
+        effects._salt_warned.clear()
+
+    def busy_replace(self, times):
+        """`Path.replace` that raises a sharing violation `times` times, then moves the file."""
+        real_replace, left = Path.replace, [times]
+
+        def flaky(path, target):
+            if left[0] > 0:
+                left[0] -= 1
+                raise self.sharing_violation()
+            return real_replace(path, target)
+
+        return mock.patch.object(Path, "replace", flaky)
+
+    def test_a_set_aside_that_is_busy_a_few_times_still_moves_the_file(self):
+        self.write_salt("nao-e-sal\n")
+        with self.busy_replace(effects._SHARING_TRIES - 1), mock.patch.object(effects.time, "sleep") as slept:
+            effects._set_aside(self.salt_file())
+        self.assertEqual(effects._SHARING_TRIES - 1, slept.call_count)
+        self.assertFalse(self.salt_file().exists())
+
+    def test_a_set_aside_that_stays_busy_raises_after_exactly_the_tries(self):
+        self.write_salt("nao-e-sal\n")
+        with (
+            self.busy_replace(effects._SHARING_TRIES + 3),
+            mock.patch.object(effects.time, "sleep") as slept,
+            self.assertRaises(PermissionError),
+        ):
+            effects._set_aside(self.salt_file())
+        self.assertEqual(effects._SHARING_TRIES - 1, slept.call_count)
+        self.assertEqual("nao-e-sal\n", self.salt_file().read_text(encoding="ascii"))
+
+    def test_a_repair_that_is_busy_a_few_times_ends_with_the_salt_that_persisted(self):
+        self.write_salt("nao-e-sal\n")
+        with self.busy_replace(2), mock.patch.object(effects.time, "sleep"):
+            shown = target_of("texto livre do cliente")
+        self.assertEqual(["malformed"], self.warnings())  # the malformed file is warned about once, nothing more
+        on_disk = self.salt_file().read_text(encoding="ascii").strip()
+        self.assertRegex(on_disk, r"^[0-9a-f]{64}$")
+        self.fresh_salts()
+        self.assertEqual(shown, target_of("texto livre do cliente"))  # the persisted salt, not one of the process
+
+
 class SaltReadRetryTests(unittest.TestCase):
     """A salt still being written (short hex) is read again: exactly `tries` reads, then malformed."""
 

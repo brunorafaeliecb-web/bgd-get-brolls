@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 
 from getbrolls import labels, runtime
 
@@ -225,6 +226,126 @@ class LinkedSpellingTests(unittest.TestCase):
                 self.assertNotIn(
                     "gb-linked-", labels.message_of(FileNotFoundError(2, "x", str(named / "a.mp4")), project=held)
                 )
+
+
+class TypedSpellingTests(unittest.TestCase):
+    """The folder the person typed for `--project` can be another spelling of the same folder (a link, or on
+    Windows the 8.3 short name of a long folder): it is still `<projeto>`, and the rest of the sentence survives."""
+
+    SENTENCE = "Projeto não encontrado em {}; nenhum arquivo foi criado."
+    EXPECTED = "Projeto não encontrado em <projeto>; nenhum arquivo foi criado."
+
+    def setUp(self):
+        self.addCleanup(labels.forget_typed_project)
+        self.tmp = Path(tempfile.mkdtemp(prefix="gb-typed-")).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        env = {"GB_HOME": str(self.tmp / "gbhome"), "GB_CACHE_DIR": str(self.tmp / "gbhome" / "cache")}
+        patched = patch.dict(os.environ, env)
+        patched.start()
+        self.addCleanup(patched.stop)
+        (self.tmp / "temp").mkdir()
+        temp = patch.object(tempfile, "tempdir", str(self.tmp / "temp"))  # the folder under test is not `$TMPDIR`
+        temp.start()
+        self.addCleanup(temp.stop)
+
+    @needs_symlink
+    def test_a_link_to_the_folder_that_was_typed_is_the_project(self):
+        real = self.tmp / "real"
+        (real / "proj").mkdir(parents=True)
+        alias = self.tmp / "alias"
+        alias.symlink_to(real, target_is_directory=True)
+        typed = alias / "proj"
+        labels.note_typed_project(str(typed), typed)
+        self.assertEqual(self.EXPECTED, labels.text(self.SENTENCE.format(typed), project=real / "proj"))
+
+    def test_a_short_name_of_a_long_folder_is_the_project(self):
+        # Windows hands out `RUNNER~1` for `runneradmin`; the resolver of the disk answers with the long name,
+        # which is all this checks (the folder does not exist, like the project of a `status` that is refused).
+        short, long_ = self.tmp / "RUNNER~1" / "proj", self.tmp / "runneradmin" / "proj"
+        real_realpath = os.path.realpath
+
+        def expand(path, *args, **kwargs):
+            return real_realpath(str(path).replace("RUNNER~1", "runneradmin"), *args, **kwargs)
+
+        with patch.object(os.path, "realpath", expand):
+            labels.note_typed_project(str(short), short)
+            self.assertEqual(self.EXPECTED, labels.text(self.SENTENCE.format(short), project=long_))
+            self.assertEqual("<projeto>/a.mp4", labels.text(f"{short}/a.mp4", project=long_))
+            self.assertEqual(self.EXPECTED, labels.for_log(self.SENTENCE.format(short), project=long_))
+
+    def test_a_typed_folder_that_is_another_folder_is_not_the_project(self):
+        other = self.tmp / "outra" / "proj"
+        project = self.tmp / "video"
+        project.mkdir()
+        labels.note_typed_project(str(other), other)
+        shown = labels.text(self.SENTENCE.format(other), project=project)
+        self.assertNotIn("<projeto>", shown)
+        self.assertNotIn("outra", shown)
+
+    def test_without_a_typed_project_nothing_changes(self):
+        project = self.tmp / "video"
+        project.mkdir()
+        self.assertEqual("<projeto>/a.mp4", labels.text(f"{project}/a.mp4", project=project))
+
+
+class OutsideStopsAtASemicolonTests(unittest.TestCase):
+    """A path in free text ends where the sentence goes on after `; `, as it ends before `: `."""
+
+    def test_the_text_after_a_semicolon_is_not_swallowed_into_the_hash(self):
+        folder = "/Volumes/Externo/x/proj"
+        hidden = labels.outside(folder)
+        self.assertEqual(
+            f"Projeto não encontrado em {hidden}; nenhum arquivo foi criado.",
+            labels.outside(f"Projeto não encontrado em {folder}; nenhum arquivo foi criado."),
+        )
+
+    def test_a_folder_name_with_a_semicolon_and_a_blank_never_leaves_a_fragment(self):
+        # `Cliente; Final` is one folder: the words after `; ` still hold a separator, so the path goes on.
+        for text in (
+            "Erro em /Volumes/Externo/Cliente; Final/a.mp4 nao achado",
+            "Erro em /Volumes/Externo/Cliente: Final/a.mp4 nao achado",
+            "Erro em /Volumes/Externo/Cliente; Final\\a.mp4 nao achado",
+        ):
+            with self.subTest(text=text):
+                shown = labels.outside(text)
+                self.assertNotIn("Final", shown)
+                self.assertNotIn("a.mp4", shown)
+                self.assertRegex(shown, "^Erro em " + re.escape(labels.OUTSIDE) + "/#[0-9a-f]{8}")
+
+    def test_a_reason_without_a_separator_after_the_terminator_still_survives(self):
+        folder = "/Volumes/Externo/x/proj"
+        hidden = labels.outside(folder)
+        for terminator in ("; ", ": "):
+            with self.subTest(terminator=terminator):
+                self.assertEqual(
+                    f"falhou em {hidden}{terminator}arquivo nao criado; tente de novo.",
+                    labels.outside(f"falhou em {folder}{terminator}arquivo nao criado; tente de novo."),
+                )
+
+    def test_a_separator_anywhere_later_on_the_line_keeps_the_path_going(self):
+        # `Parte 1` alone is no path, but `Final/a.mp4` comes later on the same line: the folder name has several `; `.
+        for text in (
+            "Erro em /Volumes/Externo/Cliente; Parte 1; Final/a.mp4 nao achado",
+            "Erro em /Volumes/Externo/Cliente: Parte 1; Final\\a.mp4 nao achado",
+            "Erro em /Volumes/Externo/a; b; c; d/e.mp4 nao achado",
+        ):
+            with self.subTest(text=text):
+                shown = labels.outside(text)
+                for fragment in ("Parte", "Final", "a.mp4", "e.mp4", "b;", "d/"):
+                    self.assertNotIn(fragment, shown)
+                self.assertRegex(shown, "^Erro em " + re.escape(labels.OUTSIDE) + "/#[0-9a-f]{8}$")
+
+    def test_the_reason_ends_the_path_when_no_separator_follows_on_that_line(self):
+        folder = "/Volumes/Externo/x/proj"
+        hidden = labels.outside(folder)
+        self.assertEqual(
+            f"falhou em {hidden}; tente de novo\n{hidden}: ok",
+            labels.outside(f"falhou em {folder}; tente de novo\n{folder}: ok"),
+        )
+
+    def test_a_semicolon_inside_a_name_still_belongs_to_it(self):
+        shown = labels.outside("em /Volumes/Externo/a;b/c e mais")
+        self.assertRegex(shown, "^em " + re.escape(labels.OUTSIDE) + "/#[0-9a-f]{8}$")
 
 
 class OutsideTests(unittest.TestCase):

@@ -552,8 +552,10 @@ class PluginApi:  # pylint: disable=too-many-instance-attributes  # a origem ofi
         conferência de raiz feitas antes, e um link ou junction no último nome do
         caminho resolvido é recusado antes de abrir; a conferência depois de abrir ainda
         deixa uma janela para quem troca pastas durante a abertura (junction não exige
-        privilégio de administrador). `O_BINARY` garante cópia byte a byte. A abertura e
-        a cópia são as de `sdk.safe_copy`.
+        privilégio de administrador). Um link plantado no destino da cópia também é
+        recusado antes de criar (o `O_EXCL` do Windows não barra um link pendente); entre
+        essa conferência e a criação resta a mesma janela. `O_BINARY` garante cópia byte a
+        byte. A abertura e a cópia são as de `sdk.safe_copy`.
 
         Args:
             path: caminho do arquivo, dentro de uma raiz de `permissions.paths`.

@@ -332,6 +332,12 @@ def copy_from_fd(fd, target, cap, *, mode=0o600, hasher=None):
     `hasher` (um `hashlib`), cada pedaço gravado também entra nele, no mesmo passe."""
     target = Path(target)
     with effects.op("fs.copy", target) as copying:
+        # Where `O_NOFOLLOW` is missing (Windows) `O_EXCL` does not stop a dangling link: the
+        # open would create the file at its end. The link is refused as an existing name, on
+        # every system, so the answer is the one `O_EXCL` already gives a link on POSIX. A link planted between
+        # this check and the open is the window `open_regular` also accepts on Windows.
+        if is_link(target):
+            raise UnsafeFileError(TARGET_EXISTS)
         try:
             target_fd = os.open(target, _WRITE_FLAGS, mode)
         except FileExistsError:

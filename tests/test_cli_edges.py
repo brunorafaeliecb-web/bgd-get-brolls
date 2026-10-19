@@ -132,7 +132,12 @@ class SymlinkLoopProjectTests(HomeCase):
         loop_a, loop_b = self.home / "loop-a", self.home / "loop-b"
         loop_a.symlink_to(loop_b)
         loop_b.symlink_to(loop_a)
-        for command, project in (("status", loop_a), ("init", loop_a), ("status", loop_a / "child")):
+        for command, project in (
+            ("status", loop_a),
+            ("init", loop_a),
+            ("status", loop_a / "child"),
+            ("status", loop_a / "sub" / "child"),
+        ):
             with self.subTest(command=command, project=project.name):
                 code, out, err = entry([command, "--project", project])
                 self.assertEqual(cli.EXIT_USAGE_ERROR, code)
@@ -160,6 +165,51 @@ class WindowsLinkLoopTests(HomeCase):
         loop = OSError(errno.ELOOP, "Too many levels of symbolic links")
         with self.stat_fails(loop), self.assertRaisesRegex(UsageError, "laço de links"):
             cli._refuse_link_loop("proj", self.home / "proj")
+
+    def stat_by_name(self, answers):
+        """`Path.stat` that raises what `answers` says for the last name (and answers a real stat otherwise)."""
+        real_stat = Path.stat
+
+        def stat(path, **kwargs):
+            if path.name in answers:
+                raise answers[path.name]
+            return real_stat(path, **kwargs)
+
+        return mock.patch.object(Path, "stat", stat)
+
+    @staticmethod
+    def windows_error(code, text, errno_value=errno.ENOENT):
+        error = OSError(errno_value, text)
+        error.winerror = code  # pyright: ignore[reportAttributeAccessIssue]  # set by hand: POSIX has no such attribute
+        return error
+
+    def test_a_loop_in_a_middle_component_is_a_usage_error(self):
+        # Python 3.14 on Windows answers "path not found" for the whole path, so only the parent shows the loop.
+        missing = self.windows_error(3, "The system cannot find the path specified")
+        loop = self.windows_error(1921, "The name of the file cannot be resolved by the system", errno.EINVAL)
+        for depth in (1, 2, 3):
+            with self.subTest(depth=depth):
+                names = ["loop-a", *[f"sub{n}" for n in range(depth - 1)], "child"]
+                answers = dict.fromkeys(names[1:], missing)
+                answers["loop-a"] = loop
+                with self.stat_by_name(answers), self.assertRaisesRegex(UsageError, "laço de links"):
+                    cli._refuse_link_loop("proj", self.home.joinpath(*names))
+
+    def test_a_parent_that_stats_cleanly_ends_the_search(self):
+        missing = self.windows_error(3, "The system cannot find the path specified")
+        loop = self.windows_error(1921, "The name of the file cannot be resolved by the system", errno.EINVAL)
+        # `quieto` is a real folder: whatever is above it is not asked, and a plain missing project is the command's.
+        (self.home / "quieto").mkdir()
+        with self.stat_by_name({"child": missing, self.home.name: loop}):
+            cli._refuse_link_loop("proj", self.home / "quieto" / "child")
+        with self.stat_by_name({"child": missing}):
+            cli._refuse_link_loop("proj", self.home / "nao-existe" / "child")
+
+    def test_a_parent_with_another_error_is_walked_past_without_a_refusal(self):
+        missing = self.windows_error(3, "The system cannot find the path specified")
+        invalid = self.windows_error(123, "The filename, directory name, or volume label syntax is incorrect")
+        with self.stat_by_name({"child": missing, "mid": invalid, "top": missing}):
+            cli._refuse_link_loop("proj", self.home / "top" / "mid" / "child")
 
     def test_any_other_stat_error_is_left_to_the_command(self):
         other = OSError(errno.EINVAL, "x")

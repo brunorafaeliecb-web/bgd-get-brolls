@@ -259,8 +259,13 @@ def sweep_abandoned(root):
 def _write_new(path, data):
     """Cria o arquivo (nunca sobrescreve, nunca segue link, nunca cria pasta) e grava tudo até o disco."""
     with effects.op("fs.write", path):
+        # Sem `O_NOFOLLOW` (Windows) o `O_EXCL` não barra um link pendente: o link é recusado
+        # como um nome que já existe, em todo sistema, como o `O_EXCL` do POSIX já faz. Entre esta
+        # conferência e a criação resta a janela que `open_regular` também aceita.
+        if loader._is_link(Path(path)):  # pylint: disable=protected-access  # cross: helper privado do sdk
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(path))
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_BINARY, 0o644)
-        with os.fdopen(fd, "wb") as stream:
+        with effects.owned_stream(fd) as stream:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
