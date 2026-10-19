@@ -17,6 +17,7 @@ from unittest import mock
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 import _paths as _test_paths  # noqa: F401  (efeito de import: põe scripts/ no sys.path)  # pylint: disable=unused-import
+from _listing import visible_entries, visible_names
 from test_effects import target_of
 from test_effects_salt_edges import HASH, NOT_ROOT, SaltCase
 
@@ -114,7 +115,7 @@ class PassingFailureTests(SaltFailureCase):
         self.assertEqual(0, in_place.call_count)
         self.assertEqual([], self.warnings())
         self.same_hash_after_a_fresh_start(shown)
-        self.assertEqual([effects.SALT_FILE], sorted(p.name for p in self.home.iterdir()))
+        self.assertEqual([effects.SALT_FILE], visible_names(self.home))
 
     def test_a_hardlink_refused_with_access_denied_falls_back_to_creating_in_place(self):
         with (
@@ -125,7 +126,7 @@ class PassingFailureTests(SaltFailureCase):
         self.assertEqual(1, in_place.call_count)
         self.assertEqual([], self.warnings())
         self.same_hash_after_a_fresh_start(shown)
-        self.assertEqual([effects.SALT_FILE], sorted(p.name for p in self.home.iterdir()))
+        self.assertEqual([effects.SALT_FILE], visible_names(self.home))
 
     def test_a_first_read_that_is_unreadable_once_is_read_again(self):
         self.write_salt("ef" * 32 + "\n")
@@ -194,7 +195,7 @@ class PassingFailureTests(SaltFailureCase):
         self.assertEqual(1, len(attempts))  # the second attempt never came: the file was well formed by then
         self.assertEqual(winner + "\n", self.salt_file().read_text(encoding="ascii"))
         self.assertEqual(["malformed"], self.warnings())  # an adopted salt is not a private one: no other line
-        self.assertEqual([effects.SALT_FILE], sorted(p.name for p in self.home.iterdir()))
+        self.assertEqual([effects.SALT_FILE], visible_names(self.home))
 
     def test_a_set_aside_whose_file_was_moved_by_another_repairer_is_done(self):
         self.write_salt("zz-not-hex\n")
@@ -247,7 +248,7 @@ class PassingFailureTests(SaltFailureCase):
 
         with mock.patch.object(Path, "unlink", flaky), mock.patch.object(effects.time, "sleep"):
             target_of("Cliente Acme")
-        self.assertEqual([effects.SALT_FILE], sorted(p.name for p in self.home.iterdir()))
+        self.assertEqual([effects.SALT_FILE], visible_names(self.home))
 
     def test_a_repair_sweeps_the_stale_temporary_files_and_only_those(self):
         self.write_salt("zz-not-hex\n")
@@ -257,9 +258,7 @@ class PassingFailureTests(SaltFailureCase):
         os.utime(stale, (1, 1))
         os.utime(other, (1, 1))
         target_of("Cliente Acme")
-        self.assertEqual(
-            [".log-salt", ".log-salt.2.b.tmp", ".log-salt.bak"], sorted(p.name for p in self.home.iterdir())
-        )
+        self.assertEqual([".log-salt", ".log-salt.2.b.tmp", ".log-salt.bak"], visible_names(self.home))
 
 
 class GivingUpTests(SaltFailureCase):
@@ -411,7 +410,7 @@ class DoctorProbeTests(SaltFailureCase):
     def test_a_folder_that_refuses_the_probe_is_readonly_and_a_good_one_is_left_clean(self):
         self.home.mkdir()
         self.assertEqual("missing", effects.salt_state())
-        self.assertEqual([], sorted(self.home.iterdir()))
+        self.assertEqual([], visible_entries(self.home))
         real_open = os.open
 
         def refusing(path, flags, *args):
@@ -421,7 +420,7 @@ class DoctorProbeTests(SaltFailureCase):
 
         with mock.patch.object(effects.os, "open", side_effect=refusing):
             self.assertEqual("readonly", effects.salt_state())
-        self.assertEqual([], sorted(self.home.iterdir()))
+        self.assertEqual([], visible_entries(self.home))
 
     def test_the_probe_file_is_removed_even_when_something_goes_wrong_after_it_was_created(self):
         self.home.mkdir()
