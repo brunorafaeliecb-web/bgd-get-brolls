@@ -239,7 +239,16 @@ class TypedSpellingTests(unittest.TestCase):
         self.addCleanup(labels.forget_typed_project)
         self.tmp = Path(tempfile.mkdtemp(prefix="gb-typed-")).resolve()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        env = {"GB_HOME": str(self.tmp / "gbhome"), "GB_CACHE_DIR": str(self.tmp / "gbhome" / "cache")}
+        # The person's home is a folder inside `tmp`, never above it: on Windows the temp folder lives under the real
+        # home, so `~` would otherwise hold every folder this class makes and show it as `~/…`.
+        self.person = self.tmp / "pessoa"
+        self.person.mkdir()
+        env = {
+            "GB_HOME": str(self.tmp / "gbhome"),
+            "GB_CACHE_DIR": str(self.tmp / "gbhome" / "cache"),
+            "HOME": str(self.person),
+            "USERPROFILE": str(self.person),
+        }
         patched = patch.dict(os.environ, env)
         patched.start()
         self.addCleanup(patched.stop)
@@ -281,6 +290,16 @@ class TypedSpellingTests(unittest.TestCase):
         shown = labels.text(self.SENTENCE.format(other), project=project)
         self.assertNotIn("<projeto>", shown)
         self.assertNotIn("outra", shown)
+
+    def test_a_typed_folder_under_the_home_that_is_not_the_project_is_shown_with_the_tilde(self):
+        # The mirror of the test above: under the home the typed folder is a path the labels contract lets through
+        # as `~/…` (the deepest known folder that holds it), the way Windows shows a temp folder under the home.
+        other = self.person / "outra" / "proj"
+        project = self.tmp / "video"
+        project.mkdir()
+        labels.note_typed_project(str(other), other)
+        shown = labels.text(self.SENTENCE.format(other), project=project)
+        self.assertEqual("Projeto não encontrado em ~/outra/proj; nenhum arquivo foi criado.", shown)
 
     def test_without_a_typed_project_nothing_changes(self):
         project = self.tmp / "video"
