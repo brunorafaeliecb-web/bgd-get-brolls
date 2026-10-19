@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 from test_sdk_loader import MANIFEST, LoaderTestCase
 
 from getbrolls.http import ProviderError
@@ -87,7 +88,7 @@ class OpenRegularTests(SafeCopyTestCase):
         error = self.refused(safe_copy.OPEN_FAILED, safe_copy.open_regular, self.base / "nada.wav")
         self.assertEqual("FileNotFoundError", error.type_name)
 
-    @unittest.skipUnless(POSIX, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_symlink_is_not_followed(self):
         link = self.base / "atalho.wav"
         link.symlink_to(self.source)
@@ -132,7 +133,7 @@ class CopyFromFdTests(SafeCopyTestCase):
         self.refused(safe_copy.TARGET_EXISTS, safe_copy.copy_from_fd, self.open(), target, 1024)
         self.assertEqual(b"da pessoa", target.read_bytes())
 
-    @unittest.skipUnless(POSIX, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_planted_link_at_the_target_is_not_followed(self):
         planted = self.base / "plantado.wav"
         target = self.base / "copia.wav"
@@ -189,7 +190,7 @@ class RootTests(SafeCopyTestCase):
         self.assertEqual(self.inner.stat().st_ino, info.st_ino)
         self.refused(safe_copy.OUTSIDE, safe_copy.open_under, self.source, [self.root])
 
-    @unittest.skipUnless(POSIX, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_folder_swapped_after_the_open_is_caught(self):
         fd, _ = safe_copy.open_regular(self.inner)
         self.addCleanup(os.close, fd)
@@ -292,6 +293,7 @@ class DescentTests(DescentTestCase):
         with patch.object(safe_copy, "open_root", lambda root: real_open_root(self.outside)):
             self.refused(safe_copy.CHANGED, safe_copy.open_under, self.inner, [self.root])
 
+    @needs_symlink
     def test_the_legacy_check_still_refuses_a_single_swap(self):
         real_open = safe_copy.open_regular
 
@@ -299,8 +301,6 @@ class DescentTests(DescentTestCase):
             self.swap_to_link()
             return real_open(path, **kwargs)
 
-        if not POSIX:
-            self.skipTest("symlink exige privilégio no Windows")
         with (
             patch.object(safe_copy, "_BY_COMPONENT", False),
             patch.object(safe_copy, "open_regular", swapping_open),
@@ -428,7 +428,7 @@ class LocalFileSwapTests(LoaderTestCase):
         self.assertIn("praia.mp4 está fora de permissions.paths", str(caught.exception))
         self.assertEqual([], list(self.work.iterdir()))
 
-    @unittest.skipUnless(POSIX, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_folder_swapped_before_the_open_is_refused(self):
         with swap_before_open(self.swap_to_link):
             self.assert_refused_outside()
@@ -564,7 +564,7 @@ class LocalFileRootTests(LoaderTestCase):
             self.copy()
         self.assertIn("f.wav está fora de permissions.paths", str(caught.exception))
 
-    @unittest.skipUnless(POSIX, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_a_root_swapped_for_a_link_between_calls_is_refused(self):
         self.assertEqual(b"INSIDE", self.copy())
         self.root.rename(self.anc / "root-orig")

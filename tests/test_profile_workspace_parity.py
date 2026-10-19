@@ -18,6 +18,7 @@ from pathlib import Path
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _paths import ROOT, WHEEL_MODE, cli
+from _symlink import needs_symlink
 
 from getbrolls import __version__, profile
 
@@ -222,7 +223,7 @@ class ProfileGuardTests(WorkspaceParityCase):
         self.assertEqual(4, done.returncode, done.stderr)
         self.assertEqual("PREREQUISITE_MISSING", json.loads(done.stderr)["error_code"])
 
-    @unittest.skipIf(NT, "link simbólico exige privilégio no Windows")
+    @needs_symlink
     def test_symlink_into_the_home_never_applies(self):
         env = self.base_env()
         home = self.ws / ".getbrolls"

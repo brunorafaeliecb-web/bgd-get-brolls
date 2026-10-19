@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 from test_sdk_safe_copy import swap_before_open
 
 from getbrolls import http
@@ -121,14 +122,14 @@ class RefusedHitTests(ResolverTestCase):
         self.returns(ResolverHit(self.root / ".." / "fora" / "segredo.wav"))
         self.refused("fora de permissions.paths")
 
-    @unittest.skipUnless(POSIX, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_symlink_even_inside_the_root(self):
         link = self.root / "atalho.wav"
         link.symlink_to(self.sound)
         self.returns(ResolverHit(link))
         self.refused("é um link")
 
-    @unittest.skipUnless(POSIX, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_folder_link_pointing_outside(self):
         (self.root / "sub").symlink_to(self.outside)
         self.returns(ResolverHit(self.root / "sub" / "segredo.wav"))
@@ -227,13 +228,13 @@ class SwapTests(ResolverTestCase):
         (self.root / "sub").rename(self.base / "sub-original")
         (self.root / "sub").symlink_to(self.outside / "sub")
 
-    @unittest.skipUnless(POSIX, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_folder_swapped_before_the_open_is_refused(self):
         self.returns(ResolverHit(self.root / "sub" / "eco.wav"))
         with swap_before_open(self.swap_sub_for_a_link):
             self.refused("fora de permissions.paths")
 
-    @unittest.skipUnless(POSIX, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_copy_step_rechecks_the_root(self):
         self.returns(ResolverHit(self.root / "sub" / "eco.wav"))
         hit, _ = self.resolve()

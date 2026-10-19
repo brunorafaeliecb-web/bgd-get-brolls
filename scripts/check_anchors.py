@@ -97,10 +97,10 @@ def check_relative_links(path: Path, markdown: str) -> list[str]:
             continue
         resolved = (path.parent / target).resolve()
         if not resolved.exists():
-            problems.append(f"{path.relative_to(ROOT)}: link quebrado {link}")
+            problems.append(f"{path.relative_to(ROOT).as_posix()}: link quebrado {link}")
             continue
         if anchor and anchor not in extract_headings(resolved.read_text(encoding="utf-8")):
-            problems.append(f"{path.relative_to(ROOT)}: âncora quebrada {link}")
+            problems.append(f"{path.relative_to(ROOT).as_posix()}: âncora quebrada {link}")
     return problems
 
 
@@ -114,7 +114,7 @@ def check() -> list[str]:
             continue
         text = path.read_text(encoding="utf-8")
         problems.extend(
-            f"{path.relative_to(ROOT)}: âncora quebrada GUIDE.md#{anchor}"
+            f"{path.relative_to(ROOT).as_posix()}: âncora quebrada GUIDE.md#{anchor}"
             for anchor in find_anchor_refs(text)
             if anchor not in guide_slugs
         )

@@ -22,6 +22,7 @@ from unittest.mock import patch
 # A pasta pessoal da skill vai para um temporário: nenhum teste toca ~/.getbrolls.
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _paths import ROOT
+from _symlink import needs_symlink
 
 from getbrolls import delivery
 
@@ -295,7 +296,7 @@ class Build(unittest.TestCase):
             media.write_bytes(b"editei a copia")
             self.assertEqual(original, source.read_bytes())
 
-    @unittest.skipIf(os.name == "nt", "Symlinks exigem privilégio extra no Windows nativo.")
+    @needs_symlink
     def test_forced_copy_replaces_a_symlink_with_a_writable_copy(self):
         """O symlink para o clipe também é o original; com cópia forçada ele sai."""
         with tempfile.TemporaryDirectory() as tmp:

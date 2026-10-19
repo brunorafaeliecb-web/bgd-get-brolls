@@ -8,6 +8,7 @@ import uuid
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _cli import run_cli
+from _symlink import needs_symlink
 from test_sdk_install import InstallTestCase, write_plugin
 
 from getbrolls.sdk import install as install_mod
@@ -46,7 +47,7 @@ class RemoveTests(InstallTestCase):
         self.assertTrue((data / "cache.json").exists())
         self.assertEqual([], [p.name for p in (self.home / "plugins").iterdir()])
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_remove_of_symlinked_folder_unlinks_without_touching_target(self):
         target = write_plugin(self.work / "fora" / "demo")
         root = self.home / "plugins"

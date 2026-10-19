@@ -36,3 +36,17 @@ def without_posix_names():
     finally:
         for module, name, value in saved:
             setattr(module, name, value)
+
+
+@contextlib.contextmanager
+def without_nofollow():
+    """`os.O_NOFOLLOW` is gone for the block (it never existed on Windows); where it is missing already, nothing
+    changes."""
+    saved = getattr(os, "O_NOFOLLOW", None)
+    if saved is not None:
+        delattr(os, "O_NOFOLLOW")
+    try:
+        yield
+    finally:
+        if saved is not None:
+            os.O_NOFOLLOW = saved

@@ -74,7 +74,7 @@ def _read(path: Path) -> str:
 
 
 def _write(path: Path, text: str) -> None:
-    path.write_text(text, encoding="utf-8")
+    path.write_text(text, encoding="utf-8", newline="\n")
 
 
 # -- scripts/getbrolls/__init__.py -------------------------------------

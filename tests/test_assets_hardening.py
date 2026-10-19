@@ -12,6 +12,7 @@ from pathlib import Path
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _isolation import GB_HOME
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 
 from getbrolls import assets
 
@@ -40,7 +41,7 @@ class AssetHardeningTests(unittest.TestCase):
         (self.project / "assets/sfx/whoosh.wav").mkdir(parents=True)
         self.assertEqual(assets.resolve(self.project, "sfx", "whoosh")["status"], "pending")
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_symlinks_inside_are_allowed_broken_are_ignored(self):
         real = self._put("assets/sfx", "original.wav")
         (self.project / "assets/sfx/atalho.wav").symlink_to(real)
@@ -48,7 +49,7 @@ class AssetHardeningTests(unittest.TestCase):
         self.assertEqual(assets.resolve(self.project, "sfx", "atalho")["status"], "found")
         self.assertEqual(assets.resolve(self.project, "sfx", "quebrado")["status"], "pending")
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_symlink_outside_is_a_row_error_in_listing(self):
         outside = Path(tempfile.mkdtemp(prefix="gb-out-"))
         self.addCleanup(shutil.rmtree, outside, ignore_errors=True)

@@ -178,6 +178,9 @@ def bounded(value, limit=INPUT_MAX) -> str:
     return result if len(result) <= limit else f"<texto omitido: {len(result)} caracteres>"
 
 
+_DRIVE_LETTER = re.compile(r"[A-Za-z]:")
+
+
 def _hidden_name(path) -> str:
     """O nome de um arquivo ou pasta fora de toda pasta conhecida, sem dizê-lo: o nome de um arquivo de
     cliente já é dado do cliente. Fica o hash com a chave da instalação e a extensão conhecida, como no
@@ -185,6 +188,8 @@ def _hidden_name(path) -> str:
     from . import effects  # local: effects imports logs, which imports this module
 
     name = re.split(r"[/\\]", str(path).rstrip("/\\"))[-1]
+    if _DRIVE_LETTER.fullmatch(name):
+        return ""  # `C:\` is the root of a disk, as `/` is: no name
     # A chave que já existe; nunca a cria (um comando que só lê não grava nada): `effects.message_key`.
     return effects._hashed(name, key=effects.message_key()) if name else ""  # pylint: disable=protected-access
 
@@ -251,13 +256,14 @@ _KNOWN_ROOTS = frozenset(
 
 @functools.lru_cache(maxsize=1)
 def _roots() -> frozenset[str]:
-    """`_KNOWN_ROOTS` e os nomes da raiz deste disco, sem diferença de maiúsculas onde o disco não faz."""
+    """`_KNOWN_ROOTS` e os nomes da raiz deste disco, sempre sem diferença de maiúsculas."""
+    # O texto vem de qualquer sistema (URL codificada, Windows, log de outra máquina), não só deste disco.
     try:
         here = {child.name for child in Path(os.sep).iterdir()}
     except OSError:
         here = set()  # a root it cannot list: only the usual names
     names = _KNOWN_ROOTS | here
-    return frozenset(name.casefold() for name in names) if _paths._CASELESS else frozenset(names)  # pylint: disable=protected-access
+    return frozenset(name.casefold() for name in names)
 
 
 def _climbs_out(rest) -> bool:
@@ -293,8 +299,7 @@ def _a_path(core) -> bool:
         return True
     if core.startswith("//"):
         return True  # `//servidor/pasta`: a network share, whatever the server is called
-    first = names[0].casefold() if _paths._CASELESS else names[0]  # pylint: disable=protected-access
-    return first in _roots()
+    return names[0].casefold() in _roots()
 
 
 def _decoded_path(run):

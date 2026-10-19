@@ -214,9 +214,9 @@ class TargetRedactionEdgeTests(SaltCase):
         self.assertNotIn("cliente", shown)
 
     def test_a_shell_text_with_an_unclosed_quote_keeps_only_its_first_word(self):
-        shown = target_of(['ffmpeg -i "/srv/cliente/segredo.mov'])
+        shown = target_of([effects.ShellText('ffmpeg -i "/srv/cliente/segredo.mov')])
         self.assertEqual("ffmpeg", shown)
-        self.assertEqual("ffmpeg", target_of(("C:/tools/ffmpeg.EXE 'sem fim",)))
+        self.assertEqual("ffmpeg", target_of((effects.ShellText("C:/tools/ffmpeg.EXE 'sem fim"),)))
 
     def test_a_command_given_as_bytes_is_never_spelled_out(self):
         self.assertEqual("-", effects.redact_target((b"/srv/cliente/bin/segredo",)))
@@ -226,8 +226,8 @@ class TargetRedactionEdgeTests(SaltCase):
         self.assertEqual(("proc.run", "-", "ok"), (row["operation"], row["target"], row["outcome"]))
         self.assertNotIn("cliente", repr(self.recorder.calls))
 
-    def test_an_empty_command_logs_an_empty_name(self):
-        self.assertEqual("", effects.redact_target([""]))
+    def test_an_empty_command_logs_the_dash(self):
+        self.assertEqual("-", effects.redact_target([""]))
         self.assertEqual("-", effects.redact_target([]))
 
 

@@ -9,18 +9,21 @@ import io
 import json
 import os
 import socket
+import struct
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 from contextlib import contextmanager
 from http.server import SimpleHTTPRequestHandler
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import MagicMock, patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 import _posix
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 
 from getbrolls import layout, serve
 
@@ -174,7 +177,7 @@ class PostRefusalTests(unittest.TestCase):
             saved = Path(json.loads(answer[1])["path"])
             self.assertEqual({"items": []}, json.loads(saved.read_text(encoding="utf-8")))
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_save_answers_409_for_a_planted_link_and_500_for_a_disk_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _project(tmp)
@@ -225,6 +228,84 @@ class AllowlistEdgeTests(unittest.TestCase):
             with _serving(root) as (_server, port):
                 self.assertEqual((200, b"poster"), _request(port, "GET", "/previews/p.jpg"))
                 self.assertEqual(404, _request(port, "GET", "/previews/nope.jpg")[0])
+
+
+class ClientGoneTests(unittest.TestCase):
+    """Cliente que some no meio da resposta (aba fechada, `urlopen` sem ler o corpo) não é falha do servidor."""
+
+    LOGGER = "getbrolls.serve"
+    CLIENTS = 3
+
+    @staticmethod
+    def wait_for(condition, seconds=10.0):
+        """Espera `condition()` valer por até `seconds` segundos; devolve o último valor."""
+        deadline = time.monotonic() + seconds
+        while not condition() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return condition()
+
+    def test_a_client_that_resets_the_connection_mid_download_leaves_no_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _project(tmp)
+            (root / "brolls" / "previews").mkdir()
+            (root / "brolls" / "previews" / "big.gif").write_bytes(b"x" * (16 << 20))
+            (root / "brolls" / "previews" / "small.gif").write_bytes(b"small")
+            err = io.StringIO()
+            with (
+                _serving(root) as (_server, port),
+                contextlib.redirect_stderr(err),
+                self.assertLogs(self.LOGGER, "DEBUG") as seen,
+            ):
+                for _ in range(self.CLIENTS):
+                    with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                        request = f"GET /previews/big.gif HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+                        sock.sendall(request.encode())
+                        sock.recv(64)
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))  # RST ao fechar
+                # Cada cliente que sumiu deixa uma linha DEBUG: é a condição de espera (e a prova de que o
+                # servidor passou por `handle_error`), sem um tempo fixo.
+                self.wait_for(lambda: len(seen.records) >= self.CLIENTS)
+                self.assertEqual((200, b"small"), _request(port, "GET", "/previews/small.gif"))
+            self.assertEqual("", err.getvalue())
+            self.assertEqual(self.CLIENTS, len(seen.records))
+            for record in seen.records:
+                self.assertRegex(record.getMessage(), r"^event=client_gone error=(BrokenPipe|ConnectionReset)Error$")
+
+    def test_only_a_client_that_went_away_is_swallowed(self):
+        with tempfile.TemporaryDirectory() as tmp, _serving(_project(tmp)) as (server, _port):
+            for gone in (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                err = io.StringIO()
+                with (
+                    self.subTest(error=gone.__name__),
+                    contextlib.redirect_stderr(err),
+                    self.assertLogs(self.LOGGER, "DEBUG") as seen,
+                ):
+                    try:
+                        raise gone("mensagem que não pode ir para o log")
+                    except gone:
+                        server.handle_error(MagicMock(), ("127.0.0.1", 1))
+                self.assertEqual("", err.getvalue())
+                # Uma linha, só com a classe do erro (nunca o texto dele).
+                self.assertEqual([f"event=client_gone error={gone.__name__}"], [r.getMessage() for r in seen.records])
+                self.assertEqual(["DEBUG"], [r.levelname for r in seen.records])
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertNoLogs(self.LOGGER, "DEBUG"):
+                try:
+                    raise ValueError("a real failure")
+                except ValueError:
+                    server.handle_error(MagicMock(), ("127.0.0.1", 1))
+            self.assertIn("ValueError: a real failure", err.getvalue())
+
+    def test_the_line_is_debug_only(self):
+        # Sem DEBUG (o padrão do log é INFO) a linha não existe: nada em INFO ou acima, e nenhum traceback.
+        with tempfile.TemporaryDirectory() as tmp, _serving(_project(tmp)) as (server, _port):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertNoLogs(self.LOGGER, "INFO"):
+                try:
+                    raise ConnectionResetError("client closed")
+                except ConnectionResetError:
+                    server.handle_error(MagicMock(), ("127.0.0.1", 1))
+            self.assertEqual("", err.getvalue())
 
 
 class TargetResolutionTests(unittest.TestCase):
@@ -310,7 +391,7 @@ class SaveReviewEdgeTests(unittest.TestCase):
             self.assertEqual(51, opened.call_count)
             self.assertEqual([], list((brolls / "reviews").iterdir()))
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_a_link_planted_between_the_check_and_the_open_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             brolls = self._brolls(tmp)
@@ -673,8 +754,12 @@ class StartBackgroundFailureTests(unittest.TestCase):
             self.assertEqual(4242, result["pid"])
             self.assertFalse(result["already_running"])
             self.assertEqual(result["pid"], json.loads((root / "brolls" / serve.PID_FILE).read_text())["pid"])
-            self.assertNotIn("creationflags", self.seen["kwargs"])
-            self.assertIs(True, self.seen["kwargs"]["start_new_session"])
+            if os.name == "nt":  # o Windows destaca o filho com `creationflags` e não conhece `start_new_session`
+                self.assertEqual(0x00000008 | 0x00000200, self.seen["kwargs"]["creationflags"])
+                self.assertNotIn("start_new_session", self.seen["kwargs"])
+            else:
+                self.assertNotIn("creationflags", self.seen["kwargs"])
+                self.assertIs(True, self.seen["kwargs"]["start_new_session"])
             self.assertEqual(str((root / "brolls").resolve()), self.seen["kwargs"]["cwd"])
 
     def test_a_child_that_already_exited_but_printed_its_payload_still_counts(self):
@@ -713,9 +798,10 @@ class ChildEnvironmentTests(unittest.TestCase):
         self.assertIn("PEXELS_API_KEY", source)  # a cópia não toca o original
 
     def test_a_checkout_prepends_its_scripts_and_an_installed_package_drops_pythonpath(self):
-        with_scripts = serve._child_environment({"PYTHONPATH": "/outro"}, Path("/repo/scripts"))
+        scripts = PurePosixPath("/repo/scripts")  # o texto é o que importa: `Path` viraria `\\repo\\scripts` no Windows
+        with_scripts = serve._child_environment({"PYTHONPATH": "/outro"}, scripts)
         self.assertEqual("/repo/scripts" + os.pathsep + "/outro", with_scripts["PYTHONPATH"])
-        self.assertEqual("/repo/scripts", serve._child_environment({}, Path("/repo/scripts"))["PYTHONPATH"])
+        self.assertEqual("/repo/scripts", serve._child_environment({}, scripts)["PYTHONPATH"])
         self.assertNotIn("PYTHONPATH", serve._child_environment({"PYTHONPATH": "/outro"}, None))
 
 

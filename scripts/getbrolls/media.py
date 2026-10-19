@@ -172,7 +172,9 @@ def drawtext_available():
         effects.mkdir(cache_path.parent, parents=True, exist_ok=True, mode=0o700)
         temp = cache_path.with_suffix(".tmp")
         with effects.op("fs.write", cache_path):
-            temp.write_text(json.dumps({"available": available, "checked_at": time.time()}), encoding="utf-8")
+            temp.write_text(
+                json.dumps({"available": available, "checked_at": time.time()}), encoding="utf-8", newline="\n"
+            )
             temp.replace(cache_path)
     except OSError:
         pass

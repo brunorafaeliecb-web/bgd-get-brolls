@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _paths import CLI_ARGV, ROOT
+from _symlink import needs_symlink
 
 from getbrolls import _paths, bootstrap, cli, runtime
 from getbrolls.errors import LockedError, UsageError
@@ -402,9 +403,8 @@ class FailureTests(_Setup):
         marker = _paths.read_marker("venv", self.root())
         self.assertNotEqual("ready", (marker or {}).get("status"))
 
+    @needs_symlink
     def test_a_symlinked_part_is_never_removed(self):
-        if WINDOWS:
-            self.skipTest("symlink exige privilégio no Windows")
         target = self.base / "elsewhere"
         _touch(target / "keep")
         root = self.root()
@@ -551,9 +551,8 @@ class ToolsTests(_Setup):
         self.assertTrue((explicit / ".tools" / "something").exists())
         self.assertEqual([], self.runner.labels())
 
+    @needs_symlink
     def test_a_symlinked_tools_part_is_never_removed(self):
-        if WINDOWS:
-            self.skipTest("symlink exige privilégio no Windows")
         target = self.base / "elsewhere"
         _touch(target / "keep")
         root = self.tools_root()

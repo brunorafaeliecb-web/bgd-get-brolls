@@ -12,6 +12,7 @@ from unittest.mock import patch
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _cli import run_cli
 from _paths import ROOT
+from _symlink import needs_symlink
 
 from getbrolls import _paths, capabilities, clients, renamed, runtime
 from getbrolls.cli import build_parser
@@ -180,7 +181,7 @@ class AddTests(ClientsTestCase):
         self.assertIn("Mova cada pasta de `components/<tipo>/` para `assets/<tipo>/`", messages[0])
         self.assertNotIn("migrate", messages[0])
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_a_linked_components_folder_counts_as_the_old_shape(self):
         clients.add("acme", str(self.base))
         elsewhere = self.tmp / "fora"

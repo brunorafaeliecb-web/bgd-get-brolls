@@ -1,7 +1,7 @@
 """capabilities._json_safe: valores de default do argparse viram JSON sem perder o tipo."""
 
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import _isolation  # noqa: F401  # pylint: disable=unused-import  # isola GB_HOME antes dos imports do getbrolls
 from _paths import ROOT  # noqa: F401  # pylint: disable=unused-import  # insere scripts/ em sys.path
@@ -23,6 +23,10 @@ class JsonSafeTests(unittest.TestCase):
     def test_any_other_object_becomes_its_string(self):
         self.assertEqual("a/b", capabilities._json_safe(Path("a/b")))
         self.assertEqual(["a/b"], capabilities._json_safe((Path("a/b"),)))
+
+    def test_a_windows_path_is_written_with_slashes(self):
+        self.assertEqual("a/b", capabilities._json_safe(PureWindowsPath("a\\b")))
+        self.assertEqual(["C:/x/y.json"], capabilities._json_safe([PureWindowsPath("C:\\x\\y.json")]))
 
 
 if __name__ == "__main__":

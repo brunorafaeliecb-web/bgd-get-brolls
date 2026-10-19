@@ -1,13 +1,13 @@
 """O que roda é o que o pin cobre — sem lixo de SO materializado,
 sem link simbólico e sem bytecode ao lado da fonte revisada."""
 
-import os
 import shutil
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 from test_sdk_install import HAS_GIT, InstallTestCase, git, write_plugin
 from test_sdk_loader import LoaderTestCase
 
@@ -123,7 +123,7 @@ class LoadTimeContentTests(LoaderTestCase):
                 else:
                     top.unlink()
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_symlink_makes_the_plugin_invalid(self):
         folder = self.enabled()
         outside = self.home / "ext"
@@ -132,7 +132,7 @@ class LoadTimeContentTests(LoaderTestCase):
         (folder / "lib").symlink_to(outside, target_is_directory=True)
         self.assert_invalid("link simbólico")
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_symlinked_file_makes_the_plugin_invalid(self):
         folder = self.enabled()
         (folder / "atalho.py").symlink_to(folder / "plugin.py")

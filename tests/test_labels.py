@@ -1,6 +1,7 @@
 """`labels`: a pasta da máquina vira a marca dela em toda mensagem, e nunca sobra o caminho inteiro."""
 
 import errno
+import json
 import os
 import re
 import shutil
@@ -267,6 +268,115 @@ class OutsideTests(unittest.TestCase):
         dense = (" /Users/a" * (labels.INPUT_MAX // 9))[: labels.INPUT_MAX]
         self.assertLessEqual(len(labels.outside(dense)), labels.INPUT_MAX)
         self.assertLessEqual(len(labels.for_log(dense)), labels.INPUT_MAX)
+
+
+class WindowsSpellingTests(unittest.TestCase):
+    """Text from a Windows machine, fed to the pure functions: a `\\` tail is written with `/` like every
+    label, and the drive alone (`C:\\`) is not a folder name."""
+
+    PROJECT = r"C:\Dados\ana\proj"
+
+    def swapped(self, text, **options):
+        return labels._paths.replace_spellings(text, {self.PROJECT}, "<projeto>", slashes=True, **options)
+
+    def test_the_names_after_a_windows_folder_follow_the_label_with_a_slash(self):
+        self.assertEqual("em <projeto>/brolls", self.swapped(r"em C:\Dados\ana\proj\brolls"))
+        self.assertEqual(
+            "em <projeto>/brolls e <projeto>/a/b.mp4.",
+            self.swapped(r"em C:\Dados\ana\proj\brolls e C:\Dados\ana\proj\a\b.mp4."),
+        )
+        self.assertEqual("(<projeto>/a/b)", self.swapped(r"(C:\Dados\ana\proj\a/b)"))
+        self.assertEqual("<projeto>", self.swapped(self.PROJECT))
+        self.assertEqual("<projeto>\\", self.swapped(self.PROJECT + "\\"))  # no name after it: nothing to follow
+
+    def test_the_tail_is_found_in_the_json_and_slash_spellings_too(self):
+        self.assertEqual('{"p": "<projeto>/brolls"}', self.swapped('{"p": "C:\\\\Dados\\\\ana\\\\proj\\\\brolls"}'))
+        self.assertEqual("<projeto>/brolls", self.swapped(r"C:/Dados/ana/proj\brolls"))
+
+    def test_a_tail_stops_at_a_blank_a_quote_or_a_separator_that_is_not_a_backslash(self):
+        self.assertEqual("<projeto>/pasta com espaço", self.swapped(r"C:\Dados\ana\proj\pasta com espaço"))
+        self.assertEqual("'<projeto>/a'", self.swapped(r"'C:\Dados\ana\proj\a'"))
+        self.assertEqual("<projeto>/a: falhou", self.swapped(r"C:\Dados\ana\proj\a: falhou"))
+        self.assertEqual("<projeto>/a/b", self.swapped(r"C:\Dados\ana\proj\a/b"))
+
+    def test_another_folder_with_the_same_start_is_left_alone(self):
+        for other in (r"C:\Dados\ana\proj2\brolls", r"C:\Dados\ana\proj-copia\a", r"xC:\Dados\ana\proj\a"):
+            with self.subTest(other=other):
+                self.assertEqual(other, self.swapped(other))
+
+    def test_a_windows_folder_in_another_case_is_found_when_asked(self):
+        self.assertEqual("<projeto>/Brolls", self.swapped(r"c:\dados\ANA\Proj\Brolls", ignore_case=True))
+
+    def test_a_posix_folder_followed_by_a_backslash_is_not_a_windows_tail(self):
+        out = labels._paths.replace_spellings(r"/x/proj\a", {"/x/proj"}, "<projeto>")
+        self.assertEqual(r"<projeto>\a", out)
+
+    def test_a_json_escape_after_the_folder_is_not_a_path_name(self):
+        """In JSON text a `\\n`, `\\t`, `\\"` or `\\u00e9` after the path is an escape, not a folder."""
+        for after in ("\nsecond line", "\tcol", ' "q"', "\u00e9x", "fim\n"):
+            with self.subTest(after=after):
+                line = json.dumps({"e": self.PROJECT + "\\brolls\\a.mp4" + after})
+                expected = json.dumps({"e": "<projeto>/brolls/a.mp4" + after})
+                self.assertEqual(expected, self.swapped(line))
+
+    def test_a_plain_windows_folder_named_like_an_escape_is_still_a_folder(self):
+        self.assertEqual("em <projeto>/new/tmp/a", self.swapped(r"em C:\Dados\ana\proj\new\tmp\a"))
+        self.assertEqual("<projeto>/nome/uni", self.swapped(r"C:\Dados\ana\proj\nome\uni"))
+
+    def test_a_folder_whose_name_starts_with_u_is_a_folder_not_a_unicode_escape(self):
+        project = r"C:\Dados\usuarios\ana"
+        out = labels._paths.replace_spellings(project + r"\x.mp4", {project}, "<projeto>", slashes=True)
+        self.assertEqual("<projeto>/x.mp4", out)
+        out = labels._paths.replace_spellings(
+            r"C:\Dados\ana\proj\usuarios\x.mp4", {self.PROJECT}, "<projeto>", slashes=True
+        )
+        self.assertEqual("<projeto>/usuarios/x.mp4", out)
+        escaped = json.dumps(project + r"\x.mp4")
+        out = labels._paths.replace_spellings(escaped, {project}, "<projeto>", slashes=True)
+        self.assertEqual('"<projeto>/x.mp4"', out)
+
+    def test_the_escaped_forms_of_a_posix_folder_take_no_tail(self):
+        spelling = "/srv/ana/proj"
+        for text, kept in (
+            (r"\u002fsrv\u002fana\u002fproj\u002fbrolls", r"\u002fbrolls"),
+            (r"\/srv\/ana\/proj\/brolls", r"\/brolls"),
+            (r"\\/srv\\/ana\\/proj\\/brolls", r"\\/brolls"),
+        ):
+            with self.subTest(text=text):
+                out = labels._paths.replace_spellings(text, {spelling}, "<projeto>", slashes=True)
+                self.assertEqual("<projeto>" + kept, out)
+
+    def test_a_unc_folder_takes_its_tail_raw_and_escaped(self):
+        unc = r"\\servidor\pasta\proj"
+        out = labels._paths.replace_spellings(unc + r"\brolls\a", {unc}, "<projeto>", slashes=True)
+        self.assertEqual("<projeto>/brolls/a", out)
+        escaped = json.dumps(unc + r"\brolls") + json.dumps("\n")
+        out = labels._paths.replace_spellings(escaped, {unc}, "<projeto>", slashes=True)
+        self.assertEqual('"<projeto>/brolls"' + json.dumps("\n"), out)
+
+    def test_without_slashes_the_tail_is_left_as_it_came(self):
+        # `runtime.scrub_home` (a diagnostics line nobody acts on) keeps the system's own separators.
+        out = labels._paths.replace_spellings(r"em C:\Dados\ana\proj\brolls", {self.PROJECT}, "~")
+        self.assertEqual(r"em ~\brolls", out)
+
+    def test_a_folder_label_takes_the_tail_of_a_windows_folder(self):
+        with patch.object(labels._paths, "_lexical", return_value=self.PROJECT):
+            out = labels._paths.replace_folder(r"em C:\Dados\ana\proj\brolls\a.mp4", self.PROJECT, "<projeto>")
+        self.assertEqual("em <projeto>/brolls/a.mp4", out)
+
+    def test_a_long_run_of_backslashes_is_linear(self):
+        text = "C:\\Dados\\ana\\proj" + "\\a" * 20_000 + "\\\\" * 20_000
+        self.assertEqual("<projeto>" + "/a" * 20_000 + "\\\\" * 20_000, self.swapped(text))
+
+    def test_a_drive_alone_names_no_folder(self):
+        for drive in ("C:\\", "c:/", "D:", "Z:\\\\"):
+            with self.subTest(drive=drive):
+                self.assertEqual("", labels._hidden_name(drive))
+                with patch.object(labels._paths, "label", return_value=None):  # on a Windows machine it is no folder
+                    self.assertEqual(labels.OUTSIDE, labels.shown(drive))
+
+    def test_a_name_on_a_drive_is_still_hidden_by_hash(self):
+        self.assertRegex(labels._hidden_name(r"Z:\gb-externo\clip.mp4"), r"^#[0-9a-f]{8}\.mp4$")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 from test_sdk_loader import LoaderTestCase
 
 from getbrolls.sdk import loader
@@ -33,33 +34,35 @@ class PluginDataTests(LoaderTestCase):
         (self.api().data_dir / "cursor.json").write_text("{}", encoding="utf-8")
         self.assertEqual("enabled", loader.inventory()[0]["status"])
 
-    @unittest.skipIf(os.name == "nt", "link simbólico pede privilégio extra no Windows")
+    @needs_symlink
     def test_data_dir_refuses_a_symlink_planted_at_plugin_folder(self):
         api = self.api()
         target = Path(tempfile.mkdtemp(prefix="gb-plugin-data-target-"))
         self.addCleanup(shutil.rmtree, target, ignore_errors=True)
         target.chmod(0o755)
+        mode_before = target.stat().st_mode & 0o777  # o Windows não guarda 0o755: o que importa é não mudar
         (self.home / "plugin-data").mkdir(parents=True, exist_ok=True)
         (self.home / "plugin-data" / "demo").symlink_to(target)
         with self.assertRaises(ValueError) as caught:
             _ = api.data_dir
         self.assertIn("plugin-data/demo", str(caught.exception))
         self.assertNotIn(str(self.home), str(caught.exception))
-        self.assertEqual(0o755, target.stat().st_mode & 0o777)
+        self.assertEqual(mode_before, target.stat().st_mode & 0o777)
 
-    @unittest.skipIf(os.name == "nt", "link simbólico pede privilégio extra no Windows")
+    @needs_symlink
     def test_data_dir_refuses_when_plugin_data_root_is_a_symlink(self):
         api = self.api()
         target = Path(tempfile.mkdtemp(prefix="gb-plugin-data-root-"))
         self.addCleanup(shutil.rmtree, target, ignore_errors=True)
         target.chmod(0o755)
+        mode_before = target.stat().st_mode & 0o777  # o Windows não guarda 0o755: o que importa é não mudar
         self.home.mkdir(parents=True, exist_ok=True)
         (self.home / "plugin-data").symlink_to(target)
         with self.assertRaises(ValueError) as caught:
             _ = api.data_dir
         self.assertIn("plugin-data/demo", str(caught.exception))
         self.assertNotIn(str(self.home), str(caught.exception))
-        self.assertEqual(0o755, target.stat().st_mode & 0o777)
+        self.assertEqual(mode_before, target.stat().st_mode & 0o777)
 
     def test_config_reads_settings_json(self):
         api = self.api()

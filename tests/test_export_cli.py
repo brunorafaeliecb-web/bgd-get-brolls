@@ -22,6 +22,7 @@ from unittest import mock
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _cli import run_cli
+from _listing import is_platform_lock
 from _media import skip_unless_ffmpeg, synth_video
 from _plugin_pins import pin_plugins
 from _schemas import strict
@@ -148,7 +149,7 @@ def tree(root):
     return {
         p.relative_to(root).as_posix(): (p.read_bytes() if p.is_file() else None)
         for p in sorted(Path(root).rglob("*"))
-        if p.relative_to(root).as_posix() not in RUNTIME_FILES
+        if p.relative_to(root).as_posix() not in RUNTIME_FILES and not is_platform_lock(p.name)
     }
 
 

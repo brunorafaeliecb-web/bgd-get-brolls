@@ -393,7 +393,7 @@ def _open_lock_file(path):
             raise refusal from None
         raise
     # effect-exempt: lock file of exclusive_lock/try_lock; the log takes try_lock per line, logging here recurses
-    return os.fdopen(fd, "a+", encoding="utf-8")
+    return os.fdopen(fd, "a+", encoding="utf-8", newline="\n")
 
 
 def lock_busy(name, started, error):
@@ -932,7 +932,7 @@ def _write_audit_log(event, log, failure, result):
         log.parent.mkdir(parents=True, exist_ok=True)
         _ensure_private_file(log)
         # effect-exempt: audit log writes diagnostics.jsonl itself; an op line per audit line would log the logger
-        with log.open("a", encoding="utf-8") as stream:
+        with log.open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(diagnostic_line(event) + "\n")
     except OSError:
         warning = {
@@ -1028,7 +1028,7 @@ def write_diagnostics_log(project, event):
         log.parent.mkdir(parents=True, exist_ok=True)
         _ensure_private_file(log)
         # effect-exempt: audit log writes diagnostics.jsonl itself; an op line per audit line would log the logger
-        with log.open("a", encoding="utf-8") as stream:
+        with log.open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(diagnostic_line(event) + "\n")
         return log
     except OSError:

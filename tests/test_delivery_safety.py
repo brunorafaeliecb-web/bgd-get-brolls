@@ -17,12 +17,15 @@ import shutil
 import stat as stat_module
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
 from unittest.mock import patch
 
 # A pasta pessoal da skill vai para um temporário: nenhum teste toca ~/.getbrolls.
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _paths import ROOT  # também insere scripts/ em sys.path
+from _portable import unlink_frozen
+from _symlink import needs_symlink
 
 from getbrolls import delivery, runtime
 from getbrolls.commands import mark_rejected
@@ -96,7 +99,7 @@ def _symlinks_available(tmp):
     return True
 
 
-@unittest.skipIf(os.name == "nt", "Symlinks exigem privilégio extra no Windows nativo.")
+@needs_symlink
 class SymlinkedDeliveryRoot(unittest.TestCase):
     """Finding: `entrega/` como symlink deixava a varredura apagar arquivos de outra pasta."""
 
@@ -213,7 +216,7 @@ class SymlinkedDeliveryRoot(unittest.TestCase):
                 beat_link.unlink()
 
 
-@unittest.skipIf(os.name == "nt", "Symlinks exigem privilégio extra no Windows nativo.")
+@needs_symlink
 class ForeignSymlinksSurviveSweep(unittest.TestCase):
     """Finding: qualquer symlink em `entrega/` era tratado como órfão do gerador."""
 
@@ -333,7 +336,7 @@ class MissingClip(unittest.TestCase):
                 if delivered_before:
                     delivery.build_delivery(tmp)
                 before = {c["id"]: c.get("delivery") for c in Ledger(tmp, recover=False).data["items"]}
-                (ledger.root / "clips" / "a.mp4").unlink()
+                unlink_frozen(ledger.root / "clips" / "a.mp4")
                 with self.assertRaises(ValueError) as caught:
                     delivery.build_delivery(tmp)
                 message = str(caught.exception)
@@ -444,6 +447,24 @@ def _change_item(tmp, clip, change):
     return c
 
 
+class OrphanMessageUsesSlashes(unittest.TestCase):
+    """The text of a conflict names the file with `/` on every system (a Windows root is fed in by hand)."""
+
+    ctx = SimpleNamespace(root=PureWindowsPath(r"C:\p\entrega"))
+
+    def test_an_edited_orphan_with_no_clip_is_named_with_slashes(self):
+        with patch.object(delivery, "_vanished_clip", return_value=None):
+            message, _note = delivery._edited_orphan(self.ctx, "a/b.mp4", None)
+        self.assertTrue(message.startswith("C:/p/entrega/a/b.mp4 saiu do plano"), message)
+        self.assertNotIn("\\", message)
+
+    def test_an_edited_orphan_whose_clip_vanished_is_named_with_slashes(self):
+        with patch.object(delivery, "_vanished_clip", return_value="brolls/x.mp4"):
+            message, _note = delivery._edited_orphan(self.ctx, "a/b.mp4", {})
+        self.assertTrue(message.startswith("C:/p/entrega/a/b.mp4 saiu do plano"), message)
+        self.assertNotIn("\\", message)
+
+
 class SweepKnowsEveryRevision(unittest.TestCase):
     """O link (ou a cópia) intocado de um clipe que saiu do manifesto continua sendo nosso.
 
@@ -516,7 +537,7 @@ class SweepKnowsEveryRevision(unittest.TestCase):
             delivered = _two_delivered(tmp)
             c = _change_item(tmp, "clips/a.mp4", lambda c: c["output"].update(verified=False))
             media = delivered[c["id"]]
-            (Path(tmp) / "brolls" / "clips" / "a.mp4").unlink()
+            unlink_frozen(Path(tmp) / "brolls" / "clips" / "a.mp4")
             with self.assertRaises(ValueError) as caught:
                 delivery.build_delivery(tmp)
             message = str(caught.exception)

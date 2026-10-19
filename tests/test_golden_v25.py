@@ -9,11 +9,13 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 import unittest.mock
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import _golden
 import _golden_diff
@@ -33,13 +35,32 @@ def _expected(scenario, case):
     return (_golden.EXPECTED / scenario / f"{case}.json").read_text(encoding="utf-8")
 
 
+def assert_matches_golden(test, scenario, record):
+    """O registro é igual ao arquivo do ouro, salvo tamanho e sha do clipe cortado pelo ffmpeg (variam com o build)."""
+    # A máscara não esconde campo que sumiu: as linhas `fetch` gravadas ainda têm os dois, com um clipe de verdade.
+    actual = _golden.serialize(record)
+    test.assertEqual([], _golden.fetch_lines_without_clip_fields(actual))
+    test.assertEqual(_golden.comparable(_expected(scenario, record["case"])), _golden.comparable(actual))
+
+
+def skip_unless_pinned(test, tmp=None):
+    """Pula quando a rodada não consegue fixar um ffmpeg sem `drawtext`: com o `drawtext` do host o ouro não vale."""
+    reason = _golden.pin_skipped_reason(tmp)
+    if reason:
+        test.skipTest(f"ffmpeg not pinned: {reason}")
+
+
 @unittest.skipIf(WHEEL_MODE, "o ouro grava o checkout: no pacote instalado os caminhos sugeridos são outros")
 @unittest.skipUnless(HAS_FFMPEG, "FFmpeg required")
 class GoldenMatrixTests(unittest.TestCase):
     maxDiff = None
 
+    def setUp(self):
+        skip_unless_pinned(self)
+
     def run_scenario(self, scenario):
         with tempfile.TemporaryDirectory(prefix="gb-ouro-") as raw:
+            skip_unless_pinned(self, Path(raw))
             records = _golden.record_scenario(list(CLI_ARGV), ROOT, scenario, Path(raw))
         if UPDATE:
             reason = _golden.update_reason(os.environ)
@@ -50,7 +71,7 @@ class GoldenMatrixTests(unittest.TestCase):
         self.assertEqual(recorded, sorted(record["case"] for record in records))
         for record in records:
             with self.subTest(case=record["case"]):
-                self.assertEqual(_expected(scenario, record["case"]), _golden.serialize(record))
+                assert_matches_golden(self, scenario, record)
 
     def test_fluxo_matches_the_golden_byte_for_byte(self):
         self.run_scenario("fluxo")
@@ -66,6 +87,9 @@ class GoldenOnAnotherDayTests(unittest.TestCase):
     """O ouro vale em qualquer dia: a CLI grava num fuso em que hoje é outra data e repete os mesmos bytes."""
 
     maxDiff = None
+
+    def setUp(self):
+        skip_unless_pinned(self)
 
     def _other_day(self, raw):
         today = datetime.now(UTC).date().isoformat()
@@ -89,7 +113,265 @@ class GoldenOnAnotherDayTests(unittest.TestCase):
                 records = _golden.record_scenario(list(CLI_ARGV), ROOT, scenario, Path(raw), stop_after=stop)
             for record in records:
                 with self.subTest(zone=zone, case=record["case"]):
-                    self.assertEqual(_expected(scenario, record["case"]), _golden.serialize(record))
+                    assert_matches_golden(self, scenario, record)
+
+
+class ClipFieldsMaskTests(unittest.TestCase):
+    """Tamanho e sha do clipe do ffmpeg dependem do build, não do sistema: os dois lados da comparação os escondem."""
+
+    LINE = (
+        '"level=INFO logger=getbrolls.commands event=fetch candidate=local:f6c96bb15a4f7e25:shot:abertura '
+        'kind=local bytes={size} sha256_prefix={sha} ms=<MS> duration_ms=<MS>",\n'
+    )
+
+    def line(self, size="4727", sha="83b140333582"):
+        return self.LINE.format(size=size, sha=sha)
+
+    def test_two_builds_of_the_same_clip_compare_equal(self):
+        one, other = self.line(), self.line("4718", "06f5a12cc56d")
+        self.assertNotEqual(one, other)
+        self.assertEqual(_golden.comparable(one), _golden.comparable(other))
+        self.assertIn("bytes=<N> sha256_prefix=<SHA> ms=<MS>", _golden.comparable(one))
+
+    def test_the_mask_touches_only_the_fetch_line_fields(self):
+        other_line = '"level=INFO logger=getbrolls.x event=other bytes=12 sha256_prefix=83b140333582",\n'
+        self.assertEqual(other_line, _golden.comparable(other_line))
+        self.assertNotEqual(
+            _golden.comparable(self.line()),
+            _golden.comparable(self.line().replace("candidate=local", "candidate=remote")),
+        )
+        self.assertNotEqual(
+            _golden.comparable(self.line()), _golden.comparable(self.line().replace("kind=local", "kind=remote"))
+        )
+
+    def test_an_empty_clip_is_not_hidden_by_the_mask(self):
+        # O que não tem forma de clipe fica como está na comparação: o ouro exato (`bytes=4727`) o recusa.
+        for empty in (
+            self.line("0", "e3b0c44298fc"),
+            self.line("0", "83b140333582"),
+            self.line("4727", "e3b0c44298fc"),
+        ):
+            with self.subTest(line=empty):
+                self.assertNotIn("<N>", _golden.comparable(empty))
+                self.assertNotEqual(_golden.comparable(self.line()), _golden.comparable(empty))
+
+    def test_a_fetch_line_without_the_fields_is_reported(self):
+        self.assertEqual([], _golden.fetch_lines_without_clip_fields(self.line()))
+        for broken in (
+            self.line("None", "83b140333582"),
+            self.line("4727", "-"),
+            self.line("4727", "83b14033358"),
+            self.line("4727", "83B140333582"),
+            self.line("0", "83b140333582"),  # clipe vazio
+            self.line("00", "83b140333582"),
+            self.line("4727", "e3b0c44298fc"),  # sha do arquivo vazio
+        ):
+            with self.subTest(line=broken):
+                self.assertEqual(1, len(_golden.fetch_lines_without_clip_fields(broken)))
+        self.assertEqual(
+            1, len(_golden.fetch_lines_without_clip_fields('"x event=fetch candidate=a kind=local ms=1",'))
+        )
+
+
+FAKE_FFMPEG = """#!{python}
+import sys
+if "-filters" in sys.argv[1:]:
+    out = sys.stdout.buffer
+    out.write(b" ... blend             VV->V      Blend two video frames.\\n")
+    out.write(b" T.C drawtext          V->V       Draw text on top of video frames.\\n")
+    out.write(b" ... odd               V->V       Not utf-8: \\xff\\xfe caf\\xe9\\n")
+    out.write(b" ... drawbox           V->V       Draw a colored box on the input video.\\n")
+    sys.stderr.write("filters listed\\n")
+    sys.exit(3)
+sys.stdout.write("fake ffmpeg " + " ".join(sys.argv[1:]) + "\\n")
+sys.exit(7 if "-fail" in sys.argv[1:] else 0)
+"""
+
+
+@unittest.skipIf(os.name == "nt", "o shim é POSIX")
+class FfmpegPinTests(unittest.TestCase):
+    """O ouro foi gravado com um ffmpeg sem o filtro `drawtext`: a rodada fixa um ffmpeg sem ele."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory(prefix="gb-pin-")  # pylint: disable=consider-using-with
+        self.addCleanup(folder.cleanup)
+        self.tmp = Path(folder.name).resolve()
+        (self.tmp / "host").mkdir()
+        fake = self.tmp / "host" / "ffmpeg"
+        fake.write_text(FAKE_FFMPEG.format(python=sys.executable), encoding="utf-8")
+        fake.chmod(0o755)
+        self.fake = fake
+        self.enterContext(unittest.mock.patch.dict(os.environ, {"PATH": str(self.tmp / "host")}))
+
+    def call(self, path, *args):
+        return subprocess.run([path, *args], capture_output=True, check=False)
+
+    def needs_runnable_shebang(self):
+        # O ffmpeg falso e o shim usam o Python como shebang: com espaço no caminho dele não rodam.
+        if _golden.pin_skipped_reason():
+            self.skipTest(f"ffmpeg not pinned: {_golden.pin_skipped_reason()}")
+
+    def test_the_pin_hides_drawtext_and_passes_everything_else_through(self):
+        self.needs_runnable_shebang()
+        pin = _golden.ffmpeg_pin(self.tmp)
+        self.assertEqual(self.tmp / "pin" / "ffmpeg", Path(pin))
+        listed = self.call(str(self.fake), "-hide_banner", "-filters")
+        self.assertIn(b" drawtext ", listed.stdout)
+        pinned = self.call(pin, "-hide_banner", "-filters")
+        self.assertNotIn(b"drawtext", pinned.stdout)
+        self.assertIn(b" blend ", pinned.stdout)
+        self.assertIn(b" drawbox ", pinned.stdout)
+        # A listagem passa em bytes: o que não é UTF-8 sai como entrou, e o código de saída é o do ffmpeg real.
+        self.assertIn(b"Not utf-8: \xff\xfe caf\xe9\n", pinned.stdout)
+        self.assertEqual(
+            [row for row in listed.stdout.split(b"\n") if b" drawtext " not in row], pinned.stdout.split(b"\n")
+        )
+        self.assertEqual((b"filters listed\n", 3), (pinned.stderr, pinned.returncode))
+        self.assertEqual((listed.stderr, listed.returncode), (pinned.stderr, pinned.returncode))
+        version = self.call(pin, "-version", "-x")
+        direct = self.call(str(self.fake), "-version", "-x")
+        self.assertEqual((direct.stdout, direct.stderr, direct.returncode), (version.stdout, version.stderr, 0))
+        self.assertEqual(b"fake ffmpeg -version -x\n", version.stdout)
+
+    def test_the_pin_stays_out_of_the_run_path(self):
+        self.needs_runnable_shebang()
+        # `tmp/bin` é o PATH da rodada: o caso `doctor` (bare) segue sem achar ffmpeg ali.
+        _golden.ffmpeg_pin(self.tmp)
+        self.assertFalse((self.tmp / "bin" / "ffmpeg").exists())
+        self.assertEqual("", _golden.hermetic_env(self.tmp, bare=True).get("GB_FFMPEG_PATH", ""))
+        self.assertEqual(str(self.tmp / "pin" / "ffmpeg"), _golden.hermetic_env(self.tmp)["GB_FFMPEG_PATH"])
+
+    def test_a_python_path_with_a_space_keeps_the_real_ffmpeg_and_says_why(self):
+        with unittest.mock.patch.object(_golden.sys, "executable", "/some where/python"):
+            self.assertEqual("espaço no caminho do Python", _golden.pin_skipped_reason())
+            self.assertEqual(str(self.fake), _golden.ffmpeg_pin(self.tmp))
+        self.assertFalse((self.tmp / "pin").exists())
+
+    def test_without_ffmpeg_there_is_no_pin(self):
+        with unittest.mock.patch.dict(os.environ, {"PATH": str(self.tmp / "none")}):
+            self.assertEqual("", _golden.ffmpeg_pin(self.tmp))
+
+    def test_the_golden_classes_skip_when_the_pin_cannot_apply(self):
+        with (
+            unittest.mock.patch.object(_golden.sys, "executable", "/a b/python"),
+            self.assertRaises(unittest.SkipTest) as caught,
+        ):
+            skip_unless_pinned(self)
+        self.assertEqual("ffmpeg not pinned: espaço no caminho do Python", str(caught.exception))
+
+    def test_the_exec_shim_and_the_spawn_shim_say_the_same_thing(self):
+        # O shim do Windows (espera o filho) é o mesmo texto, salvo a última linha: roda aqui contra o falso.
+        for spawn in (False, True):
+            with self.subTest(spawn=spawn):
+                script = self.tmp / f"shim-{spawn}.py"
+                script.write_text(_golden.shim_source(sys.executable, str(self.fake), spawn=spawn), encoding="utf-8")
+                self.assertEqual(not spawn, script.read_text(encoding="utf-8").startswith("#!"))
+                listed = self.call(sys.executable, str(script), "-hide_banner", "-filters")
+                self.assertNotIn(b"drawtext", listed.stdout)
+                self.assertIn(b" blend ", listed.stdout)
+                self.assertIn(b"Not utf-8: \xff\xfe caf\xe9\n", listed.stdout)
+                self.assertEqual((b"filters listed\n", 3), (listed.stderr, listed.returncode))
+                version = self.call(sys.executable, str(script), "-version", "-x")
+                self.assertEqual((b"fake ffmpeg -version -x\n", 0), (version.stdout, version.returncode))
+                # O código de saída do ffmpeg real chega a quem chamou, e o que ele escreveu também.
+                failed = self.call(sys.executable, str(script), "-fail", "a b")
+                self.assertEqual((b"fake ffmpeg -fail a b\n", 7), (failed.stdout, failed.returncode))
+
+
+@unittest.skipIf(os.name == "nt", "o ffmpeg falso é um script com shebang")
+class WindowsPinTests(unittest.TestCase):
+    """No Windows o pino é `ffmpeg.cmd` + `ffmpeg.py`. Aqui o ramo é simulado (`_windows`); o `.cmd` de verdade só
+    roda no Windows (`RealCmdPinTests`)."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory(prefix="gb-pin-nt-")  # pylint: disable=consider-using-with
+        self.addCleanup(folder.cleanup)
+        self.tmp = Path(folder.name).resolve()
+        (self.tmp / "host").mkdir()
+        self.fake = self.tmp / "host" / "ffmpeg"
+        self.fake.write_text(FAKE_FFMPEG.format(python=sys.executable), encoding="utf-8")
+        self.fake.chmod(0o755)
+        self.enterContext(unittest.mock.patch.dict(os.environ, {"PATH": str(self.tmp / "host")}))
+        self.enterContext(unittest.mock.patch.object(_golden, "_windows", return_value=True))
+
+    def test_a_windows_run_pins_a_cmd_that_starts_the_python_shim(self):
+        self.assertIsNone(_golden.pin_skipped_reason(self.tmp))
+        pin = _golden.ffmpeg_pin(self.tmp)
+        self.assertEqual(self.tmp / "pin" / "ffmpeg.cmd", Path(pin))
+        self.assertEqual(
+            f'@"{sys.executable}" "{self.tmp / "pin" / "ffmpeg.py"}" %*\r\n'.encode(),
+            (self.tmp / "pin" / "ffmpeg.cmd").read_bytes(),
+        )
+        self.assertEqual(
+            _golden.shim_source(sys.executable, str(self.fake), spawn=True),
+            (self.tmp / "pin" / "ffmpeg.py").read_text(encoding="utf-8"),
+        )
+        self.assertFalse((self.tmp / "pin" / "ffmpeg").exists())
+        self.assertEqual(pin, _golden.hermetic_env(self.tmp)["GB_FFMPEG_PATH"])
+        self.assertEqual("", _golden.hermetic_env(self.tmp, bare=True).get("GB_FFMPEG_PATH", ""))
+
+    def test_the_pin_files_are_written_once_per_run(self):
+        _golden.ffmpeg_pin(self.tmp)
+        before = {name: (self.tmp / "pin" / name).stat().st_mtime_ns for name in ("ffmpeg.cmd", "ffmpeg.py")}
+        _golden.ffmpeg_pin(self.tmp)
+        self.assertEqual(before, {name: (self.tmp / "pin" / name).stat().st_mtime_ns for name in before})
+
+    def test_a_python_path_with_a_space_is_quoted_in_the_cmd(self):
+        with unittest.mock.patch.object(_golden.sys, "executable", "C:\\Program Files\\Python\\python.exe"):
+            self.assertIsNone(_golden.pin_skipped_reason(self.tmp))
+            _golden.ffmpeg_pin(self.tmp)
+        cmd = (self.tmp / "pin" / "ffmpeg.cmd").read_text(encoding="utf-8")
+        self.assertTrue(cmd.startswith('@"C:\\Program Files\\Python\\python.exe" "'), cmd)
+
+    def test_a_percent_in_a_path_keeps_the_real_ffmpeg_and_says_why(self):
+        with unittest.mock.patch.object(_golden.sys, "executable", "C:\\100%\\python.exe"):
+            self.assertIn("%", _golden.pin_skipped_reason(self.tmp) or "")
+            self.assertEqual(str(self.fake), _golden.ffmpeg_pin(self.tmp))
+            with self.assertRaises(unittest.SkipTest):
+                skip_unless_pinned(self)
+        self.assertIn("%", _golden.pin_skipped_reason(Path("C:/100%/run")) or "")
+        self.assertFalse((self.tmp / "pin").exists())
+
+    def test_the_log_target_of_the_cmd_pin_reads_as_ffmpeg(self):
+        roots = _golden.Roots(Path("/t"), Path("/r"), {})
+        norm = _golden.Normalizer(roots, "2.6.0", windows=True)
+        self.assertEqual("event=op target=ffmpeg ms=<MS>", norm.text("event=op target=ffmpeg.cmd ms=7"))
+        self.assertEqual(
+            "target=ffmpeg.cmd", _golden.Normalizer(roots, "2.6.0", windows=False).text("target=ffmpeg.cmd")
+        )
+        self.assertEqual("target=ffmpeg ms=<MS>", norm.text("target=ffmpeg ms=7"))
+        self.assertEqual("target=ffmpeg.cmdx", norm.text("target=ffmpeg.cmdx"))
+
+
+@unittest.skipUnless(os.name == "nt", "o .cmd só roda no Windows")
+class RealCmdPinTests(unittest.TestCase):
+    """O pino de verdade no Windows: o `.cmd` é aberto pelo CreateProcess, passa os argumentos ao shim e devolve o
+    código de saída. Só o CI do Windows exercita isto."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory(prefix="gb-pin-cmd-")  # pylint: disable=consider-using-with
+        self.addCleanup(folder.cleanup)
+        self.tmp = Path(folder.name).resolve()
+        host = self.tmp / "host"
+        host.mkdir()
+        body = FAKE_FFMPEG.split("\n", 1)[1]  # sem o shebang
+        (host / "fake_ffmpeg.py").write_text(body, encoding="utf-8", newline="\n")
+        (host / "ffmpeg.cmd").write_bytes(f'@"{sys.executable}" "{host / "fake_ffmpeg.py"}" %*\r\n'.encode())
+        self.enterContext(unittest.mock.patch.dict(os.environ, {"PATH": str(host)}))
+
+    def call(self, *args):
+        return subprocess.run([_golden.ffmpeg_pin(self.tmp), *args], capture_output=True, check=False)
+
+    def test_the_cmd_hides_drawtext_and_keeps_the_exit_code(self):
+        listed = self.call("-hide_banner", "-filters")
+        self.assertNotIn(b"drawtext", listed.stdout)
+        self.assertIn(b" blend ", listed.stdout)
+        self.assertEqual(3, listed.returncode)
+
+    def test_the_cmd_passes_arguments_with_spaces_and_the_exit_code_through(self):
+        failed = self.call("-fail", "dois nomes", "scale=1:1,pad=a:b")
+        self.assertEqual(7, failed.returncode)
+        self.assertEqual("fake ffmpeg -fail dois nomes scale=1:1,pad=a:b", failed.stdout.decode().strip())
 
 
 class GoldenAgainstV250Tests(unittest.TestCase):
@@ -328,7 +610,7 @@ class NormalizerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="gb-ouro-norm-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        roots = _golden.Roots(self.tmp, Path("/repo/getbrolls"), {"<PY>": "/opt/py/bin/python3"})
+        roots = _golden.Roots(self.tmp, PurePosixPath("/repo/getbrolls"), {"<PY>": "/opt/py/bin/python3"})
         self.norm = _golden.Normalizer(roots, "2.6.0")
 
     def test_masks_what_varies_between_runs(self):
@@ -378,7 +660,7 @@ class NormalizerTests(unittest.TestCase):
         )
 
     def test_accented_root_in_any_json_form(self):
-        roots = _golden.Roots(Path("/t/João"), Path("/r"), {})
+        roots = _golden.Roots(PurePosixPath("/t/João"), PurePosixPath("/r"), {})
         for raw in ('"/t/João/proj"', '"/t/Jo\\u00e3o/proj"'):
             with self.subTest(raw=raw):
                 self.assertEqual('"<T>/proj"', roots.apply(raw))
@@ -403,6 +685,73 @@ class NormalizerTests(unittest.TestCase):
             env = _golden.hermetic_env(self.tmp)
         self.assertEqual("/x/coveragerc", env["COVERAGE_PROCESS_START"])
         self.assertNotIn("COVERAGE_RCFILE", env)
+
+    def test_windows_quoting_of_an_option_value_reads_as_the_posix_one(self):
+        roots = _golden.Roots(Path("C:\\t"), Path("C:\\r"), {})
+        norm = _golden.Normalizer(roots, "2.6.0", windows=True)
+        for raw, expected in (
+            # Texto corrido, como no stderr e nos arquivos: o caminho perde as aspas, o texto ganha as simples.
+            ('run --project "C:\\t\\work\\proj" --shot x', "run --project <T>/work/proj --shot x"),
+            ('q --query "Cole aqui a fala" --by Ana', "q --query 'Cole aqui a fala' --by Ana"),
+            # Dentro de uma string JSON: aspas escapadas e barras dobradas.
+            (
+                'run --project \\"C:\\\\t\\\\work\\\\proj\\" --query \\"Cole aqui\\"',
+                "run --project <T>/work/proj --query 'Cole aqui'",
+            ),
+            # O que o POSIX já escreve, as aspas de um valor que não segue uma opção e um apóstrofo ficam como estão.
+            ("run --project <T>/work/proj --query 'Cole aqui'", "run --project <T>/work/proj --query 'Cole aqui'"),
+            ('{"project": "C:\\t\\work\\proj"}', '{"project": "<T>/work/proj"}'),
+            ('python "C:\\r\\scripts\\gb.py" status', '<PYNAME> "<CODE>/scripts/gb.py" status'),
+            # Texto fixo da mensagem, igual nos dois sistemas, mesmo com espaço.
+            ('--statement \\"FRASE EXATA DITA\\"', '--statement \\"FRASE EXATA DITA\\"'),
+            ('q --query "it\'s here"', 'q --query "it\'s here"'),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(expected, norm.text(raw))
+
+    def test_the_one_byte_windows_project_lock_is_the_empty_posix_one(self):
+        for name, data, expected in (
+            (".command.lock", b"\0", b""),
+            (".command.lock", b"", b""),
+            (".command.lock", b"\0\0", b"\0\0"),
+            ("index.lock", b"\0", b"\0"),
+        ):
+            with self.subTest(name=name, data=data):
+                path = self.tmp / name
+                path.write_bytes(data)
+                self.assertEqual(expected, _golden.file_bytes(path, windows=True))
+
+    def test_on_posix_a_changed_quoting_is_not_normalised_away(self):
+        # A normalização do Windows não vale aqui: o POSIX compara a grafia exata do comando sugerido.
+        norm = _golden.Normalizer(_golden.Roots(PurePosixPath("/t"), PurePosixPath("/r"), {}), "2.6.0", windows=False)
+        golden = "run --project <T>/work/proj --query 'Cole aqui' --by Ana"
+        self.assertEqual(golden, norm.text("run --project /t/work/proj --query 'Cole aqui' --by Ana"))
+        for regression in (
+            "run --project \"/t/work/proj\" --query 'Cole aqui' --by Ana",
+            'run --project /t/work/proj --query "Cole aqui" --by Ana',
+            "run --project \\\"/t/work/proj\\\" --query 'Cole aqui' --by Ana",
+        ):
+            with self.subTest(raw=regression):
+                self.assertNotEqual(golden, norm.text(regression))
+                self.assertNotEqual(_golden.comparable(golden), _golden.comparable(norm.text(regression)))
+        # Sem o argumento o padrão é o sistema que roda: no POSIX, igual a `windows=False`.
+        if os.name != "nt":
+            self.assertNotEqual(golden, _golden.Normalizer(norm.roots, "2.6.0").text(regression))
+
+    def test_on_posix_a_changed_lock_byte_is_a_difference(self):
+        path = self.tmp / ".command.lock"
+        path.write_bytes(b"\0")
+        self.assertEqual(b"\0", _golden.file_bytes(path, windows=False))
+        if os.name != "nt":
+            self.assertEqual(b"\0", _golden.file_bytes(path))
+        # E no snapshot da rodada: a trava de 1 byte não vira a vazia do ouro.
+        lock = self.tmp / "work" / "proj" / "brolls" / ".command.lock"
+        lock.parent.mkdir(parents=True)
+        lock.write_bytes(b"\0")
+        with unittest.mock.patch.object(_golden, "_windows", return_value=False):
+            self.assertEqual(b"\0", _golden.snapshot(self.tmp)["work/proj/brolls/.command.lock"])
+        with unittest.mock.patch.object(_golden, "_windows", return_value=True):
+            self.assertEqual(b"", _golden.snapshot(self.tmp)["work/proj/brolls/.command.lock"])
 
     def test_windows_separators_after_a_root_become_slashes(self):
         self.assertEqual(

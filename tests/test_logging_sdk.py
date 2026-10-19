@@ -19,6 +19,7 @@ import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: d
 from _cli import run_cli
 from _logs import LogCase, events, home_log_lines
 from _paths import CLI_ARGV
+from _symlink import needs_symlink
 from test_sdk_install import HAS_GIT, InstallTestCase, git, head, write_plugin
 from test_sdk_loader import MANIFEST, PLUGIN_CODE, LoaderTestCase
 from test_sdk_marketplace_client import MarketplaceTestCase
@@ -687,7 +688,7 @@ class PluginInstallLogTests(InstallTestCase, LogCase):
         self.assertEqual("INVALID_DATA", row["error_code"])
         self.assert_clean(rows, "modelo-secreto", repo, self.work)
 
-    @unittest.skipIf(os.name == "nt", "link simbólico precisa de privilégio no Windows")
+    @needs_symlink
     def test_a_symlink_in_the_history_is_refused_by_reason(self):
         repo = self.repo()
         (repo / "atalho-secreto.py").symlink_to(repo / "plugin.py")

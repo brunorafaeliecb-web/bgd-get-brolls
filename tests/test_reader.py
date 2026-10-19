@@ -13,6 +13,7 @@ from unittest import mock
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _fake_secrets import joined
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 
 from getbrolls import reader, runtime
 from getbrolls.errors import Refusal, UsageError
@@ -81,8 +82,10 @@ class OpenUnderTests(ReaderCase):
             self.refused("too_big", reader.open_under, self.root, "cresce.txt", max_bytes=4)
 
     def test_a_name_it_cannot_even_look_at_is_unreadable(self):
+        # O POSIX olha cada nome com `os.stat(dir_fd=...)`, o Windows com `os.lstat`: nenhum dos dois deixa olhar.
         with (
             mock.patch.object(reader.os, "stat", side_effect=PermissionError),
+            mock.patch.object(reader.os, "lstat", side_effect=PermissionError),
             self.assertRaises(reader.UnreadableError),
         ):
             reader.open_under(self.root, "nada.txt", max_bytes=10)
@@ -93,7 +96,7 @@ class OpenUnderTests(ReaderCase):
         self.assertEqual("INVALID_DATA", runtime.error_code_for(caught.exception))
         self.assertNotIsInstance(caught.exception, Refusal)
 
-    @unittest.skipUnless(POSIX, "link simbólico sem privilégio")
+    @needs_symlink
     def test_a_link_in_any_piece_is_refused(self):
         (self.root / "project").mkdir()
         (self.root / "project" / "fora.txt").symlink_to(self.outside / "segredo.txt")
@@ -172,7 +175,7 @@ class TextAndJsonTests(ReaderCase):
 
 
 class ListUnderTests(ReaderCase):
-    @unittest.skipUnless(POSIX, "link simbólico sem privilégio")
+    @needs_symlink
     def test_lists_in_name_order_and_never_follows_a_link(self):
         self.write("project/index.html", b"<html>")
         self.write("project/renders/final.mp4", b"1234")
@@ -248,7 +251,7 @@ class ProjectDirTests(ReaderCase):
                 reader.project_dir(self.root, value)
             self.assertNotIn(str(self.root), str(caught.exception))
 
-    @unittest.skipUnless(POSIX, "link simbólico sem privilégio")
+    @needs_symlink
     def test_a_link_in_the_way_is_a_usage_error(self):
         (self.root / "videos").symlink_to(self.outside)
         with self.assertRaises(UsageError):
@@ -276,7 +279,7 @@ class WithoutDirFdTests(ReaderCase):
         with self.assertRaises(reader.MissingError):
             reader.open_under(self.root, "project/nada.txt", max_bytes=10)
 
-    @unittest.skipUnless(POSIX, "link simbólico sem privilégio")
+    @needs_symlink
     def test_a_link_or_a_file_in_the_way_is_refused(self):
         self.write("project/index.html")
         (self.root / "project" / "fora.txt").symlink_to(self.outside / "segredo.txt")
@@ -360,7 +363,7 @@ class CopyUnderTests(ReaderCase):
             reader.copy_under(self.root, "a.txt", self.outside / "nao-existe" / "a.txt", max_bytes=100)
         self.assertEqual("IO_ERROR", runtime.error_code_for(caught.exception))
 
-    @unittest.skipUnless(POSIX, "link simbólico sem privilégio")
+    @needs_symlink
     def test_a_link_is_never_copied(self):
         (self.root / "fora.txt").symlink_to(self.outside / "segredo.txt")
         dest = self.outside / "copia.txt"

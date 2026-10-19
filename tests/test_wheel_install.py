@@ -119,7 +119,9 @@ class WheelInstallTests(unittest.TestCase):
     def setUpClass(cls):
         uv = shutil.which("uv")
         if not uv:
-            _unavailable("uv ausente no PATH")
+            _unavailable(
+                "uv ausente no PATH (só o job do pacote o instala; lá a falta vira erro com GB_REQUIRE_WHEEL_TESTS=1)"
+            )
         cls.tmp = Path(tempfile.mkdtemp(prefix="gb-wheel-"))
         try:
             cls._build_and_install(uv)

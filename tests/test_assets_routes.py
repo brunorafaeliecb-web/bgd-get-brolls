@@ -12,6 +12,7 @@ import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: d
 from _cli import run_cli
 from _isolation import GB_HOME
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 
 from getbrolls import assets, clients, export, export_plan, layout, renamed, runtime
 
@@ -116,7 +117,7 @@ class AssetRouteTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 assets.resolve(self.project, "sfx", name)
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_symlink_outside_is_refused(self):
         outside = Path(tempfile.mkdtemp(prefix="gb-out-"))
         self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
@@ -265,7 +266,7 @@ class ClientRouteTests(unittest.TestCase):
         self.assertEqual("CLIENT_UNREGISTERED", warn.call_args.args[0])
         self.assertIn("ghost", warn.call_args.args[1])
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_linked_client_component_folder_is_skipped(self):
         root = self._register()
         self._project_json()

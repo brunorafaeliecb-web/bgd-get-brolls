@@ -19,6 +19,7 @@ import atexit
 import contextlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -30,7 +31,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
 
-from . import _paths, effects, labels, runtime
+from . import _paths, effects, labels, logs, runtime
 from .config import SECRET_ENV_SUFFIXES as _SECRET_ENV_SUFFIXES
 
 DEFAULT_PORT = 8767
@@ -75,6 +76,9 @@ ALLOWED_GET_FOLDERS = ("previews", "clips")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 
 
+_logger = logs.get("serve")
+
+
 class _ExclusiveServer(ThreadingHTTPServer):
     """Sem SO_REUSEADDR: no Windows ele deixaria dois servidores na mesma porta, e a
     queda para porta livre nunca aconteceria."""
@@ -86,6 +90,16 @@ class _ExclusiveServer(ThreadingHTTPServer):
     # correto, e um servidor ainda não inicializado aceitaria gravação sem segredo.
     save_token: str | None = None
     session_id: str = ""
+
+    def handle_error(self, request, client_address):
+        """Cliente que sumiu no meio da resposta não é falha do servidor: só uma linha DEBUG, sem traceback."""
+        # Aba fechada, `urlopen` que não leu o corpo. Só a classe do erro vai para o log; qualquer outro erro
+        # segue o relatório padrão.
+        error = sys.exception()
+        if isinstance(error, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            logs.event(_logger, logging.DEBUG, "client_gone", error=type(error).__name__)
+            return
+        super().handle_error(request, client_address)
 
 
 def _resolve_allowed_target(folder, served_parent, candidate):
@@ -121,7 +135,7 @@ def _clip_roots(project, directory):
     de `brolls/`, confiável sob o projeto) e a antiga `brolls/clips/` quando existe;
     `broll/` como link não serve clipe nenhum, mas a página abre.
     """
-    from . import layout, logs
+    from . import layout
 
     try:
         with logs.handled():  # `broll/` como link: a página abre sem clipe nenhum
@@ -484,7 +498,7 @@ def _write_private_text(path, text):
         except BaseException:
             os.close(handle)
             raise
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
 
 

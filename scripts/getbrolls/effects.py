@@ -75,7 +75,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Iterator
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from . import _paths, _tokens, logs, runtime
 
@@ -292,7 +292,7 @@ def _new_salt_file(path):
     """A temporary file next to `path` with a fresh salt, 0600; returns its path."""
     temp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    with os.fdopen(fd, "w", encoding="ascii") as stream:
+    with os.fdopen(fd, "w", encoding="ascii", newline="\n") as stream:
         stream.write(secrets.token_hex(32) + "\n")
     return temp
 
@@ -302,7 +302,7 @@ def _create_in_place(path):
     so only one process creates it; a reader that comes in the middle reads again."""
     with contextlib.suppress(FileExistsError):
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        with os.fdopen(fd, "w", encoding="ascii") as stream:
+        with os.fdopen(fd, "w", encoding="ascii", newline="\n") as stream:
             stream.write(secrets.token_hex(32) + "\n")
 
 
@@ -489,18 +489,48 @@ def _url_target(value):
     return (urllib.parse.urlsplit(value).hostname or "-").lower()
 
 
-def _executable(argv0):
-    """The name of the executable alone, without `.exe` (`ffmpeg` on every system).
+class ShellText(str):
+    """A command given as ONE text (`shell=True`, `"echo --api-key=…"`): the only `argv[0]` that
+    `_executable` splits into words. Anything else is an exact path, blanks and backslashes included."""
 
-    A command given as one text (`shell=True`, `"echo --api-key=…"`) keeps only its first word."""
+    __slots__ = ()
+
+
+# A command that starts with a drive (`C:\\` or `C:/`, maybe quoted) or a UNC share (`\\\\host`): a
+# Windows path, where a backslash separates folders and is no escape.
+_WINDOWS_COMMAND = re.compile(r"""^\s*(?:["']?[A-Za-z]:[\\/]|\\\\)""")
+_DRIVE = re.compile(r"[A-Za-z]:")
+
+
+def _first_word(text):
+    """The first word of a shell text; the quotes are removed. The shape (Windows or POSIX) is decided on
+    the original text, before `shlex` can eat a backslash."""
+    words = text.split()
+    windows = _WINDOWS_COMMAND.match(text) is not None or "\\" in words[0]
+    try:
+        return shlex.split(text, posix=not windows)[0].strip("\"'")
+    except ValueError:
+        return words[0].strip("\"'")
+
+
+def _executable(argv0, shell_text=False):
+    """The name of the executable alone, without `.exe` (`ffmpeg` on every system); `-` when there is none
+    (`C:\\`, `\\\\server\\share`, an empty text).
+
+    Only a `shell_text` (a command given as one text) keeps its first word. An `argv[0]` of a list is one path:
+    `C:\\Program Files\\ff\\ffmpeg.exe` and `/Users/Ana Silva/bin/yt-dlp` are not cut at the blank. A path with a
+    drive or a backslash (`bin\\ffmpeg.exe`, `.\\ffmpeg.exe`) is read as a Windows one on every system."""
     text = os.fspath(argv0)
-    if isinstance(text, str) and text.split():
-        try:
-            text = shlex.split(text)[0] if text.strip() else text
-        except ValueError:
-            text = text.split()[0]
-    name = Path(text).name
-    return name[:-4] if name.lower().endswith(".exe") else name
+    if not isinstance(text, str):
+        return "-"  # bytes: never spelled out
+    if shell_text:
+        if not text.split():
+            return "-"
+        text = _first_word(text)
+    shape = PureWindowsPath if "\\" in text or _DRIVE.match(text) else PurePosixPath
+    name = shape(text).name
+    name = name[:-4] if name.lower().endswith(".exe") else name
+    return name or "-"
 
 
 def redact_target(value):
@@ -516,7 +546,7 @@ def redact_target(value):
     """
     try:
         if isinstance(value, (list, tuple)):
-            text = _executable(value[0]) if value else "-"
+            text = _executable(value[0], shell_text=isinstance(value[0], ShellText)) if value else "-"
         elif isinstance(value, os.PathLike):
             text = _path_target(value)
         else:
@@ -659,7 +689,12 @@ def run(argv, *, operation="proc.run", **kwargs):
 
     The target is the executable's name only; a command given as one text (`shell=True`)
     logs only its first word."""
-    with op(operation, (argv,) if isinstance(argv, (str, bytes, os.PathLike)) else list(argv)) as handle:
+    target = (
+        list(argv)
+        if not isinstance(argv, (str, bytes, os.PathLike))
+        else [ShellText(argv) if isinstance(argv, str) else argv]
+    )
+    with op(operation, target) as handle:
         # The caller chooses `check` (and every other option): this only adds the line.
         try:
             completed = subprocess.run(argv, **kwargs)  # noqa: S603, PLW1510  # pylint: disable=subprocess-run-check
@@ -756,10 +791,11 @@ def temp_dir(*, prefix=None, folder=None) -> Iterator[str]:
         runtime.force_rmtree(path, target=where)
 
 
-def write_text(path, text, *, encoding, newline=None, exclusive=False):
+def write_text(path, text, *, encoding, newline="\n", exclusive=False):
     """Write `text` to `path` (`x` mode with `exclusive`: never over an existing file).
 
-    `encoding` is required, as for every text I/O of the package (always `"utf-8"`)."""
+    `encoding` is required, as for every text I/O of the package (always `"utf-8"`). Lines end in `\\n` on
+    every system (the Windows default would write `\\r\\n`): the same bytes, hash and golden everywhere."""
     with (
         op("fs.write", path),
         Path(path).open("x" if exclusive else "w", encoding=encoding, newline=newline) as stream,

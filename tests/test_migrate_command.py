@@ -9,6 +9,7 @@ from pathlib import Path
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _cli import run_cli
+from _listing import is_platform_lock
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
 
 from getbrolls import layout
@@ -25,7 +26,7 @@ def snapshot(root):
     return {
         str(path.relative_to(root)): (path.read_bytes() if path.is_file() else None)
         for path in sorted(root.rglob("*"))
-        if path.name not in INFRA
+        if path.name not in INFRA and not is_platform_lock(path.name)
     }
 
 

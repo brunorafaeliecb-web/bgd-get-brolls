@@ -1,7 +1,6 @@
 """`--subdir`, recusa de ponteiro LFS e de nome fora de NFC, `content_digest` e `fetch_file`."""
 
 import json
-import os
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +11,7 @@ from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _cli import run_cli
+from _symlink import needs_symlink
 from test_sdk_install import HAS_GIT, InstallTestCase, _git_test_env, git, head, write_plugin
 from test_sdk_loader import MANIFEST
 
@@ -134,7 +134,7 @@ class SubdirInstallTests(InstallTestCase):
             self.assertIn(reason, str(ctx.exception))
         self.assertEqual([], self.leftover_staging())
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_subdir_that_is_a_symlink_is_refused(self):
         root = self.monorepo()
         (root / "atalho").symlink_to(root / "plugins" / "demo")

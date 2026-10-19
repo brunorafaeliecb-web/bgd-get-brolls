@@ -578,7 +578,7 @@ def get_json(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917
             effects.mkdir(cache_path.parent, parents=True, exist_ok=True, mode=0o700)
             temp = cache_path.with_suffix(".tmp")
             with effects.op("fs.write", cache_path):
-                temp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                temp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8", newline="\n")
                 temp.chmod(0o600)
                 temp.replace(cache_path)
         except OSError:

@@ -13,7 +13,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from test_setup_install import PYTHON_LAYOUT, WINDOWS, YTDLP_LAYOUT, _Setup, _touch
+from _symlink import needs_symlink
+from test_setup_install import PYTHON_LAYOUT, YTDLP_LAYOUT, _Setup, _touch
 
 from getbrolls import _paths, bootstrap, cli, runtime
 from getbrolls.errors import LockedError, UsageError
@@ -43,7 +44,7 @@ class _Gate(_Setup):
         python.symlink_to(target.name)
 
 
-@unittest.skipIf(WINDOWS, "links simbólicos exigem privilégio no Windows")
+@needs_symlink
 class BrokenVenvTests(_Gate):
     def test_part_ready_needs_the_venv_python(self):
         self.install()
@@ -238,7 +239,7 @@ class LockAndLinkTests(_Gate):
             pass
         self.assertEqual("LOCKED", runtime.error_code_for(caught.exception))
 
-    @unittest.skipIf(WINDOWS, "links simbólicos exigem privilégio no Windows")
+    @needs_symlink
     def test_a_symlinked_runtime_root_is_refused(self):
         elsewhere = self.base / "elsewhere"
         elsewhere.mkdir()

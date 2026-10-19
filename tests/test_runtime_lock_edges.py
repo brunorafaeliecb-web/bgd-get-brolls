@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 import _paths  # noqa: F401  (efeito de import: põe scripts/ no sys.path)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 
 from getbrolls import logs, runtime
 from getbrolls.errors import LockedError
@@ -78,12 +79,12 @@ class LockFileEdgeTests(unittest.TestCase):
         self.base = Path(tempfile.mkdtemp(prefix="gb-lock-edges-"))
         self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
 
-    @unittest.skipIf(os.name == "nt", "link simbólico exige privilégio no Windows")
+    @needs_symlink
     def test_a_linked_lock_is_refused_where_o_nofollow_is_missing(self):
         target = self.base / "fora.lock"
         link = self.base / ".command.lock"
         link.symlink_to(target)
-        with patch.object(runtime.os, "O_NOFOLLOW", 0):
+        with patch.object(runtime.os, "O_NOFOLLOW", 0, create=True):
             with (
                 self.assertRaisesRegex(ValueError, r"\.command\.lock .* é um link") as raised,
                 runtime.exclusive_lock(link, "ocupada"),

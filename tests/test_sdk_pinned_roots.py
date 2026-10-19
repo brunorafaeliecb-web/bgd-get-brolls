@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _cli import run_cli
+from _symlink import needs_symlink
 from test_sdk_loader import LoaderTestCase
 
 from getbrolls.http import ProviderError
@@ -26,8 +27,6 @@ from getbrolls.sdk.api import PluginApi, route_scope
 from getbrolls.sdk.files import resolved_roots
 from getbrolls.sdk.registry import Registry, get_registry, reset_registry
 from getbrolls.sdk.resolvers import resolve_with_plugins
-
-CAN_SYMLINK = os.name != "nt"
 
 RESOLVER_CODE = """
 def register(api):
@@ -104,7 +103,7 @@ class EnableRecordsTests(PinnedRootsTestCase):
         self.assertNotIn("roots_resolved", loader.enable("demo", confirm=True)["plugin"])
         self.assertEqual({}, self.pinned())
 
-    @unittest.skipUnless(CAN_SYMLINK, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_reenable_recomputes_the_field(self):
         self.install(PATHS_MANIFEST, RESOLVER_CODE)
         loader.enable("demo", confirm=True)
@@ -122,7 +121,7 @@ class EnableRecordsTests(PinnedRootsTestCase):
         self.assertEqual(loader.folder_digest(folder), self.state()["enabled"]["demo"]["sha256"])
 
 
-@unittest.skipUnless(CAN_SYMLINK, "symlink exige privilégio no Windows")
+@needs_symlink
 class InstallUpdateRecordsTests(PinnedRootsTestCase):
     def test_install_and_update_preview_and_record_the_resolved_roots(self):
         source = self.person / "fonte" / "demo"
@@ -142,7 +141,7 @@ class InstallUpdateRecordsTests(PinnedRootsTestCase):
 
 
 class LoadChecksTests(PinnedRootsTestCase):
-    @unittest.skipUnless(CAN_SYMLINK, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_a_root_that_resolves_elsewhere_is_ignored_with_a_warning_naming_the_entry(self):
         self.install(PATHS_MANIFEST, RESOLVER_CODE)
         loader.enable("demo", confirm=True)
@@ -256,7 +255,7 @@ class EdgeCaseTests(PinnedRootsTestCase):
         self.assertNotIn("vale neste sistema", warnings[0])
 
 
-@unittest.skipUnless(CAN_SYMLINK, "symlink exige privilégio no Windows")
+@needs_symlink
 class ResolvedPathStaysLocalTests(PinnedRootsTestCase):
     """O caminho resolvido não sai do plugins.json: nem log, nem list, nem doctor."""
 

@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _cli import run_cli
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _portable import unlink_frozen
 
 from getbrolls import cli, http, media, providers, queue, runtime, social
 from getbrolls import instagram_pairs as ig
@@ -798,7 +799,7 @@ class DeliverConflictHintTests(unittest.TestCase):
             _store(Ledger(tmp), _delivered_candidate("a", "Palco"))
             first = run_cli("deliver", project=tmp)
             media = Path(tmp) / first["items"][0]["path"]
-            media.unlink()
+            unlink_frozen(media)
             media.write_bytes(b"edicao da pessoa")
             _store(Ledger(tmp), _delivered_candidate("b", "Outro"))
             error = run_cli("deliver", project=tmp, expect=1)

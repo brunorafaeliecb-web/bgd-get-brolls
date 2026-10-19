@@ -1272,12 +1272,12 @@ def _edited_orphan(ctx, rel, c):
     )
     if vanished:
         return (
-            f"{ctx.root / rel} saiu do plano da entrega e o clipe dele sumiu de brolls/ ({vanished}): "
+            f"{(ctx.root / rel).as_posix()} saiu do plano da entrega e o clipe dele sumiu de brolls/ ({vanished}): "
             "este arquivo pode ser a única cópia, e eu não apago. Copie esse arquivo de volta para "
             f"{vanished} e rode `verify`, ou guarde-o fora de `entrega/`; depois rode `deliver` de novo."
         ), (f"o clipe `{vanished}` sumiu e este pode ser a única cópia dele; não apaguei")
     return (
-        f"{ctx.root / rel} saiu do plano da entrega e não bate com nenhum arquivo de brolls/ "
+        f"{(ctx.root / rel).as_posix()} saiu do plano da entrega e não bate com nenhum arquivo de brolls/ "
         "(pode ser edição sua): eu não apago. Guarde esse arquivo fora de `entrega/` e rode "
         "`deliver` de novo."
     ), "saiu do plano e não bate com nenhum arquivo de `brolls/` (pode ser edição sua); não apaguei"

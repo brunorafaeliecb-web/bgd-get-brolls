@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 # A pasta pessoal da skill vai para um temporário: nenhum teste toca ~/.getbrolls.
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 from test_delivery_safety import (
     _brief_with_target,
     _change_item,
@@ -338,7 +339,7 @@ class LockedPlannedFileIsAConflict(unittest.TestCase):
             self.assertEqual(b"conteudo de previews/a.jpg", sheet.read_bytes())
 
 
-@unittest.skipIf(os.name == "nt", "Symlinks exigem privilégio extra no Windows nativo.")
+@needs_symlink
 class SymlinkedBeatFolderKeepsWhatIsBehindIt(unittest.TestCase):
     """Uma pasta de beat trocada à mão por um link para fora de `entrega/`: nada de lá é apagado.
 

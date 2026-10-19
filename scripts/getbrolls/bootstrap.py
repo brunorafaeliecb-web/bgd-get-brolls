@@ -359,7 +359,7 @@ class _RootLock:
         else:
             effects.mkdir(self.root, parents=True, exist_ok=True)
         # effect-exempt: lock file of the runtime root; a busy lock already logs lock_busy, as in runtime
-        stream = (self.root / LOCK_NAME).open("a+", encoding="utf-8")  # pylint: disable=consider-using-with
+        stream = (self.root / LOCK_NAME).open("a+", encoding="utf-8", newline="\n")  # pylint: disable=consider-using-with
         try:
             runtime._acquire_lock(stream)  # pylint: disable=protected-access
         except BlockingIOError as exc:

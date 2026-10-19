@@ -4,7 +4,6 @@ import contextlib
 import errno
 import io
 import json
-import os
 import shutil
 import socket
 import subprocess
@@ -18,6 +17,7 @@ from unittest.mock import patch
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _logs import LogCase
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 
 from getbrolls import instagram_pairs as ig
 from getbrolls import queue
@@ -180,7 +180,7 @@ class StemAndPairTests(QuietCase):
         with self.assertRaisesRegex(ig.CollectError, "layout=student exige stem"):
             ig.infer_output_for_stem("solto", self.root / "out", "student")
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_a_user_folder_that_links_outside_the_output_dir_is_refused(self):
         out, fora = self.root / "out", self.root / "fora"
         out.mkdir()

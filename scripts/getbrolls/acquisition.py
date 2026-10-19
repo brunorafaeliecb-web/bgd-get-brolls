@@ -79,12 +79,23 @@ def _save_index(cache, index):
         fd, temp_name = tempfile.mkstemp(dir=str(cache), prefix=".index-", suffix=".tmp")
         temp = Path(temp_name)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            try:
+                stream = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+            except BaseException:
+                # No stream owns it yet; an open handle would stop the `unlink` below on Windows. `io.open` may have
+                # closed it already (it fails after the raw file exists): that `EBADF` must not replace the error.
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                raise
+            with stream:  # the only closer of the descriptor from here on
                 stream.write(json.dumps(index, ensure_ascii=False))
             temp.chmod(0o600)
             temp.replace(path)
-        except OSError:
-            temp.unlink(missing_ok=True)
+        except BaseException:
+            # Any failure (a `TypeError` from `json`, Ctrl-C) leaves no temp file; a cleanup that fails (an
+            # antivirus holding it on Windows) must not hide the error that got us here.
+            with contextlib.suppress(OSError):
+                temp.unlink(missing_ok=True)
             raise
 
 

@@ -14,6 +14,7 @@ import unittest
 # A pasta pessoal da skill vai para um temporário: nenhum teste toca ~/.getbrolls.
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _logs import LogCase
+from _symlink import needs_symlink
 from test_setup_install import WINDOWS, FakeRunner, _Setup, _touch
 
 from getbrolls import _paths, bootstrap, runtime
@@ -176,7 +177,7 @@ class SetupLogTests(_Setup, LogCase):
             {"lock": bootstrap.LOCK_NAME, "error_code": "LOCKED"}, {key: row[key] for key in ("lock", "error_code")}
         )
 
-    @unittest.skipIf(os.name == "nt", "link simbólico precisa de privilégio no Windows")
+    @needs_symlink
     def test_a_runtime_part_that_is_a_link_is_refused_by_reason(self):
         target = self.base / "elsewhere"
         _touch(target / "keep")

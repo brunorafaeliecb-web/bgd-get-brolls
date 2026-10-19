@@ -171,7 +171,7 @@ def save(path, data):
     with effects.op("fs.write", path):
         handle, temp = tempfile.mkstemp(prefix=".queue-", suffix=".tmp", dir=path.parent)
         try:
-            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
                 stream.write(json.dumps(versioning.stamp(data, SCHEMA_VERSION), ensure_ascii=False, indent=2) + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())

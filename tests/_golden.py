@@ -78,6 +78,8 @@ _DURATION_MS = re.compile(r'("duration_ms":\s*)\d+')
 # O interpretador que faz as vezes do yt-dlp no `event=op` (`python3.11`, `python3.14`, `python`) e a
 # chave de cache que sai do caminho e da data do ffmpeg de cada máquina.
 _TARGET_PYTHON = re.compile(r"(\btarget=)python(?:3(?:\.\d+)?)?(?=\s|$)")
+# No Windows o pino do ffmpeg é `ffmpeg.cmd` (`ffmpeg_pin`); o log guarda o nome do arquivo, e só `.exe` sai dele.
+_TARGET_PIN_CMD = re.compile(r"(\btarget=)ffmpeg\.cmd(?=\s|$)")
 _CACHE_KEY = re.compile(r"(\btarget=\$GB_CACHE_DIR/)#[0-9a-f]{8}")
 _PY_VERSION = re.compile(r"(Python |\"python\":\s*\")\d+\.\d+\.\d+")
 _STDERR_TAIL = re.compile(r"(; stderr: )(?:[^\"\\]|\\.)*")
@@ -88,8 +90,21 @@ _TRACEBACK = re.compile(r'("traceback":\s*)"(?:[^"\\]|\\.)*"')
 _TAIL = re.compile(r"(<(?:T|CODE)>)((?:(?:\\\\|\\|/)[^\"\s'\\/]+)+)")
 # O que o build do ffmpeg sabe fazer e o tamanho do que ele grava mudam entre máquinas.
 _MACHINE_KEYS = re.compile(r'("(?:gif_bytes|sheet_labels|drawtext|labels|font)":\s*)(?:"(?:[^"\\]|\\.)*"|[^,\s}\]]+)')
+# O tamanho e o sha do clipe que o ffmpeg cortou dependem do build do ffmpeg (metadados do contêiner), não do
+# sistema: só na linha `event=fetch`, e só na comparação (os arquivos do ouro seguem como foram gravados).
+# O formato exige um clipe de verdade: `bytes=0` e o sha do arquivo vazio (`e3b0c44298fc`) não contam como campo.
+_FETCH_LINE = re.compile(r'event=fetch [^"\n]*')
+_CLIP_FIELDS = re.compile(r"\bbytes=[1-9]\d* sha256_prefix=(?!e3b0c44298fc\b)[0-9a-f]{12}\b")
 # O nome do Python no comando sugerido: `python3` no POSIX, `python` no Windows (`_paths._interpreter`).
 _INTERPRETER = re.compile(r'\bpython3?(?=(?: |",\s*")\\?"?<CODE>/scripts/gb\.py)')
+# O comando sugerido cita o valor de uma opção: o Windows sempre com aspas duplas (`_paths._quote_nt`, um caminho
+# leva `\\` e `:`); o POSIX deixa o caminho sem aspas e cita o texto com aspas simples (`shlex.quote`). O ouro guarda
+# a grafia do POSIX. Só vale depois de os caminhos virarem marcadores e só logo depois de uma opção `--nome `: o
+# caminho perde as aspas; o texto das duas opções que o ouro mostra citadas (`QUOTED_TEXT_OPTIONS`) ganha as simples.
+# Outras aspas duplas ficam como estão: `--statement "frase"` é texto fixo das mensagens, igual nos dois sistemas.
+_NT_QUOTED_VALUE = re.compile(r'(--[\w-]+ )(\\?)"([^"\\\n]*)\2"')
+_ROOT_TAG = re.compile(r"<(?:T|CODE|PY|FFMPEG|FFPROBE)>")
+QUOTED_TEXT_OPTIONS = ("--query ", "--narration ")
 _VERSION_LINE = re.compile(r'^__version__ = "([^"]+)"$', re.MULTILINE)
 # A data do dia no frontmatter que a CLI grava (`created:`/`updated:` de credits, README e ORIGEM).
 TODAY = "<TODAY>"
@@ -114,6 +129,15 @@ def run_days(today):
         return ()
     first = datetime.date.fromisoformat(today)
     return (first.isoformat(), (first + datetime.timedelta(days=1)).isoformat())
+
+
+def _posix_quoting(match):
+    flag, value = match.group(1), match.group(3)
+    if _ROOT_TAG.match(value):
+        return flag + value
+    if flag in QUOTED_TEXT_OPTIONS and "'" not in value:
+        return f"{flag}'{value}'"
+    return match.group(0)
 
 
 def _posix_tail(match):
@@ -145,8 +169,11 @@ class Roots:
 class Normalizer:
     """Troca o que varia por rodada ou máquina; uuid, época e sha de mídia gerada viram marcadores numerados."""
 
-    def __init__(self, roots, version, today=None):
+    def __init__(self, roots, version, today=None, windows=None):
         self.roots = roots
+        # As normalizações que só o Windows pede (aspas do comando sugerido, nome do pino `.cmd`) valem só nele:
+        # no POSIX a comparação continua exata.
+        self.windows = _windows() if windows is None else windows
         self.today = re.compile("|".join(rf"(?<![\d-]){re.escape(day)}(?![\d-])" for day in run_days(today)) or r"(?!)")
         self.version = re.compile(
             r'(get-brolls |getbrolls |"get_brolls":\s*"|"version":\s*")' + re.escape(version) + r'(?=[\s"(]|$)',
@@ -171,6 +198,8 @@ class Normalizer:
     def text(self, value):
         value = _TRACEBACK.sub(r'\1"<TRACEBACK>"', value)
         value = self.roots.apply(value)
+        if self.windows:
+            value = _NT_QUOTED_VALUE.sub(_posix_quoting, value)
         value = _INTERPRETER.sub("<PYNAME>", value)
         for sha, tag in self.binary_shas.items():
             value = value.replace(sha, tag)
@@ -184,6 +213,8 @@ class Normalizer:
         value = _MS.sub(r"\1<MS>", value)
         value = _DURATION_MS.sub(r'\1"<MS>"', value)
         value = _TARGET_PYTHON.sub(r"\1<PYNAME>", value)
+        if self.windows:
+            value = _TARGET_PIN_CMD.sub(r"\1ffmpeg", value)
         value = _CACHE_KEY.sub(r"\1#<CACHE>", value)
         value = _PY_VERSION.sub(r"\1<PYV>", value)
         value = self.version.sub(r"\1<VERSION>", value)
@@ -201,6 +232,93 @@ class Normalizer:
         with contextlib.suppress(ValueError):
             return {"jsonl": [json.loads(line) for line in lines if line.strip()]}
         return {"text": lines}
+
+
+def comparable(text):
+    """O texto do ouro como a comparação o vê: `bytes=` e `sha256_prefix=` do `event=fetch` viram marcadores.
+    Vale para os dois lados (o arquivo do ouro e o registro serializado); nada mais é mascarado."""
+    return _FETCH_LINE.sub(lambda line: _CLIP_FIELDS.sub("bytes=<N> sha256_prefix=<SHA>", line.group(0)), text)
+
+
+def fetch_lines_without_clip_fields(text):
+    """As linhas `event=fetch` de `text` sem `bytes=<número>` e `sha256_prefix=<12 hex>`: a máscara de `comparable`
+    não pode esconder um campo que sumiu."""
+    return [line.group(0) for line in _FETCH_LINE.finditer(text) if not _CLIP_FIELDS.search(line.group(0))]
+
+
+# O ouro foi gravado com um ffmpeg sem o filtro `drawtext` (o do brew); o do apt e o do chocolatey têm. A rodada
+# fixa um ffmpeg sem `drawtext`: este script repassa tudo ao ffmpeg real, e de `-filters` tira só a linha do
+# `drawtext`, em bytes (a listagem não passa pela codificação do sistema) e com o código de saída do ffmpeg real.
+# No POSIX o script é o próprio `ffmpeg` (shebang) e repassa com `execv`. No Windows `execv` devolve o controle antes
+# de o filho acabar e perde o código de saída: o script `ffmpeg.py` espera o filho (`subprocess.run`) e sai com o
+# código dele, e o `ffmpeg.cmd` ao lado é o que o `GB_FFMPEG_PATH` aponta (`.cmd` roda por CreateProcess, que o
+# abre pelo cmd.exe).
+_SHIM_BODY = """import os, subprocess, sys
+real, args = {real!r}, sys.argv[1:]
+if "-filters" in args:
+    done = subprocess.run([real, *args], capture_output=True, check=False)
+    rows = done.stdout.split(b"\\n")
+    sys.stdout.buffer.write(b"\\n".join(row for row in rows if b" drawtext " not in row))
+    sys.stdout.buffer.flush()
+    sys.stderr.buffer.write(done.stderr)
+    sys.stderr.buffer.flush()
+    sys.exit(done.returncode)
+{passthrough}
+"""
+_EXEC_PASSTHROUGH = "os.execv(real, [real, *args])"
+_SPAWN_PASSTHROUGH = "sys.exit(subprocess.run([real, *args], check=False).returncode)"
+
+
+def shim_source(python, real, spawn=False):
+    """O texto do shim que esconde o `drawtext` de `real`; `spawn` espera o filho em vez de trocar o processo
+    (Windows). Sem `spawn` o texto leva o shebang do `python`."""
+    body = _SHIM_BODY.format(real=real, passthrough=_SPAWN_PASSTHROUGH if spawn else _EXEC_PASSTHROUGH)
+    return body if spawn else f"#!{python}\n{body}"
+
+
+def _windows():
+    return os.name == "nt"
+
+
+def pin_skipped_reason(tmp=None):
+    """O motivo de a rodada não poder fixar o ffmpeg, ou `None`.
+
+    POSIX: o shim usa o Python como shebang e não roda com espaço no caminho dele. Windows: o `.cmd` cita os
+    caminhos, mas o cmd.exe ainda expandiria um `%` dentro deles."""
+    if _windows():
+        if "%" in sys.executable or (tmp is not None and "%" in str(tmp)):
+            return "% no caminho do Python ou da pasta da rodada (o cmd.exe o expandiria)"
+        return None
+    if any(char.isspace() for char in sys.executable):
+        return "espaço no caminho do Python"
+    return None
+
+
+def _write_if_changed(path, text, newline):
+    # Escrito uma vez por rodada: o cache da sonda do `drawtext` tem o mtime do ffmpeg na chave.
+    data = text.replace("\n", newline).encode("utf-8")
+    if not path.is_file() or path.read_bytes() != data:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+
+def ffmpeg_pin(tmp):
+    """O ffmpeg da rodada: o do PATH com `drawtext` fora de `-filters`, ou o do PATH como está quando não há como
+    fixar (`pin_skipped_reason`)."""
+    real = shutil.which("ffmpeg") or ""
+    if not real or pin_skipped_reason(tmp):
+        return real
+    folder = tmp / "pin"  # fora de `tmp/bin`, o PATH da rodada: o caso `doctor` (bare) segue sem ffmpeg
+    if _windows():
+        script = folder / "ffmpeg.py"
+        _write_if_changed(script, shim_source(sys.executable, real, spawn=True), "\n")
+        launcher = folder / "ffmpeg.cmd"
+        _write_if_changed(launcher, f'@"{sys.executable}" "{script}" %*\n', "\r\n")
+        return str(launcher)
+    shim = folder / "ffmpeg"
+    _write_if_changed(shim, shim_source(sys.executable, real), "\n")
+    shim.chmod(0o755)
+    return str(shim)
 
 
 def hermetic_env(tmp, bare=False):
@@ -235,7 +353,7 @@ def hermetic_env(tmp, bare=False):
         "PYTHONUTF8": "1",
     }
     if not bare:
-        env["GB_FFMPEG_PATH"] = shutil.which("ffmpeg") or ""
+        env["GB_FFMPEG_PATH"] = ffmpeg_pin(tmp)
         env["GB_FFPROBE_PATH"] = shutil.which("ffprobe") or ""
     for key in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"):
         if key in os.environ:
@@ -261,6 +379,19 @@ def run_date(tmp):
     return done.stdout.strip()
 
 
+COMMAND_LOCK = ".command.lock"
+
+
+def file_bytes(path, windows=None):
+    """Os bytes de `path` como o ouro os guarda. A trava do projeto no Windows (`msvcrt`) tem 1 byte `\\0`
+    (`runtime._acquire_lock`); a do POSIX (`flock`) fica vazia. Só no Windows as duas valem o mesmo: no POSIX um
+    byte na trava é uma diferença."""
+    data = path.read_bytes()
+    if (_windows() if windows is None else windows) and path.name == COMMAND_LOCK and data == b"\0":
+        return b""
+    return data
+
+
 def snapshot(tmp):
     """{caminho relativo a `tmp`: bytes} das pastas que a CLI pode tocar."""
     files = {}
@@ -270,7 +401,7 @@ def snapshot(tmp):
             for path in sorted(base.rglob("*")):
                 rel = path.relative_to(tmp).as_posix()
                 if path.is_file() and not path.is_symlink() and not platform_only(rel):
-                    files[rel] = path.read_bytes()
+                    files[rel] = file_bytes(path)
     return files
 
 
@@ -552,7 +683,7 @@ def record_scenario(cli_argv, code_root, scenario, tmp, stop_after=None):
     today = run_date(tmp)
     if scenario == "layout0":
         materialize_layout0(tmp)
-    executables = {"<PY>": sys.executable, "<FFMPEG>": shutil.which("ffmpeg"), "<FFPROBE>": shutil.which("ffprobe")}
+    executables = {"<PY>": sys.executable, "<FFMPEG>": ffmpeg_pin(tmp), "<FFPROBE>": shutil.which("ffprobe")}
     run = Run(cli_argv, tmp, Normalizer(Roots(tmp, code_root, executables), version_of(code_root), today=today))
     state, records = {}, []
     for case, planned, options in SCENARIOS[scenario](tmp, state):

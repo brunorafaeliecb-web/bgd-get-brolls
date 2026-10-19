@@ -55,7 +55,7 @@ def remember(ledger, c, decision, reason, by):
     data["items"].append(entry)
     temp = path.with_suffix(".tmp")
     with effects.op("fs.write", path):
-        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
         temp.replace(path)
     ledger.save("remember", c)
     return entry

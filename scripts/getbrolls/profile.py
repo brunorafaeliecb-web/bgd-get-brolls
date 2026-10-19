@@ -569,7 +569,7 @@ def _write_store(home: Path, data: dict) -> None:
     with effects.op("fs.write", home / TRUST_FILE):
         fd, tmp = tempfile.mkstemp(prefix=f".{TRUST_FILE}.", dir=home)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
                 json.dump(data, stream, ensure_ascii=False, indent=2, sort_keys=True)
                 stream.write("\n")
             Path(tmp).chmod(0o600)
@@ -590,7 +590,7 @@ def _update_store(home: Path, change) -> bool:
     effects.mkdir(home, parents=True, exist_ok=True, mode=0o700)
     lock_path = home / f"{TRUST_FILE}.lock"
     # effect-exempt: lock file of trusted-profiles.json; a lock that stays busy already logs lock_busy
-    with lock_path.open("a+", encoding="utf-8") as lock:
+    with lock_path.open("a+", encoding="utf-8", newline="\n") as lock:
         started = time.monotonic()
         deadline = started + LOCK_TIMEOUT_S
         while True:

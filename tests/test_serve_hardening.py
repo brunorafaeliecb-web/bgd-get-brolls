@@ -26,6 +26,7 @@ import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: d
 from _cli import run_cli
 from _media import skip_unless_ffmpeg, synth_video
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 
 from getbrolls import serve
 
@@ -134,7 +135,7 @@ def _post_save(server, port):
 class SaveFailureTests(unittest.TestCase):
     """Quando a gravação das decisões falha, a página recebe um erro JSON, não uma conexão caída."""
 
-    @unittest.skipIf(os.name == "nt", "symlinks sem privilégio não são criáveis no Windows")
+    @needs_symlink
     def test_save_failure_answers_a_json_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _project_with_review(Path(tmp) / "proj")
@@ -361,7 +362,7 @@ class EncodedPathAllowlistTests(unittest.TestCase):
 class SymlinkEscapeTests(unittest.TestCase):
     """Um symlink plantado dentro de previews/ não pode servir arquivo de fora."""
 
-    @unittest.skipIf(os.name == "nt", "symlinks sem privilégio não são criáveis no Windows")
+    @needs_symlink
     def test_a_symlink_inside_previews_pointing_outside_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _project_with_review(Path(tmp))
@@ -381,7 +382,7 @@ class SymlinkEscapeTests(unittest.TestCase):
             finally:
                 outside.unlink(missing_ok=True)
 
-    @unittest.skipIf(os.name == "nt", "symlinks sem privilégio não são criáveis no Windows")
+    @needs_symlink
     def test_previews_itself_as_a_symlink_to_an_outside_folder_is_refused(self):
         """`brolls/previews` resolved THROUGH its own symlink used to serve the whole
         target tree: the allowlist check must refuse when the top-level folder is a
@@ -457,7 +458,7 @@ class LogRotationTests(unittest.TestCase):
             self.assertEqual(0, stat.S_IMODE(rotated.stat().st_mode) & 0o077)
             self.assertEqual("log da rodada anterior\n", rotated.read_text(encoding="utf-8"))
 
-    @unittest.skipIf(os.name == "nt", "symlinks sem privilégio não são criáveis no Windows")
+    @needs_symlink
     def test_a_symlink_planted_at_the_rotated_name_is_not_written_through(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _project_with_review(Path(tmp))

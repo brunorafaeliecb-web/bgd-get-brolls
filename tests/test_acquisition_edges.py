@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -91,6 +92,86 @@ class SourceIndexTests(AcquisitionCase):
         ):
             acquisition._save_index(self.cache, {"a": []})
         self.assertEqual([], list(self.cache.iterdir()))
+
+    def refused_fdopen(self, error):
+        """Run `_save_index` with an `fdopen` that refuses; returns the descriptors `mkstemp` opened and `close` saw."""
+        opened, closed = [], []
+        real_close = os.close
+
+        def failing_fdopen(fd, mode="r", **kwargs):
+            if mode == "w" and kwargs.get("encoding") == "utf-8":  # the index's temp file, not the salt's
+                opened.append(fd)
+            raise error
+
+        def recording_close(fd):
+            closed.append(fd)
+            real_close(fd)
+
+        with (
+            patch.object(acquisition.os, "fdopen", failing_fdopen),
+            patch.object(acquisition.os, "close", recording_close),
+            self.assertRaises(type(error)),
+        ):
+            acquisition._save_index(self.cache, {"a": []})
+        return opened, closed
+
+    def test_a_failed_fdopen_closes_the_descriptor_before_the_temp_file_goes(self):
+        # On Windows an open handle makes `unlink` fail with a sharing violation that hides "disco cheio".
+        opened, closed = self.refused_fdopen(OSError("disco cheio"))
+        self.assertEqual(1, len(opened))
+        self.assertIn(opened[0], closed)
+        self.assertEqual([], list(self.cache.iterdir()))
+
+    def test_a_descriptor_that_fdopen_refuses_with_another_error_is_closed_and_leaves_no_temp_file(self):
+        opened, closed = self.refused_fdopen(ValueError("modo invalido"))
+        self.assertEqual(1, len(opened))
+        self.assertIn(opened[0], closed)
+        self.assertEqual([], list(self.cache.iterdir()))
+
+    def test_an_index_that_json_cannot_write_leaves_no_temp_file_and_closes_once(self):
+        closed = []
+        real_close = os.close
+
+        def recording_close(fd):
+            closed.append(fd)
+            real_close(fd)
+
+        with (
+            patch.object(acquisition.os, "close", recording_close),
+            self.assertRaisesRegex(TypeError, "not JSON serializable"),
+        ):
+            acquisition._save_index(self.cache, {"a": [object()]})
+        self.assertEqual([], list(self.cache.iterdir()))
+        self.assertEqual([], closed)  # the stream owned the descriptor: no second close from our code
+
+    def test_a_descriptor_that_is_already_closed_does_not_replace_the_real_error(self):
+        # `io.open` closes the descriptor itself when it fails after the raw file exists (`LookupError`).
+        def failing_fdopen(fd, mode="r", **kwargs):
+            if mode == "w" and kwargs.get("encoding") == "utf-8":
+                os.close(fd)
+                raise LookupError("codificacao")
+            raise OSError("outro fdopen")
+
+        with (
+            patch.object(acquisition.os, "fdopen", failing_fdopen),
+            self.assertRaisesRegex(LookupError, "codificacao"),
+        ):
+            acquisition._save_index(self.cache, {"a": []})
+        self.assertEqual([], list(self.cache.iterdir()))
+
+    def test_a_cleanup_that_fails_does_not_replace_the_real_error(self):
+        # On Windows an antivirus can hold the temp file: `unlink` raises, "disco cheio" must still come out.
+        with (
+            patch.object(acquisition.os, "fdopen", side_effect=OSError("disco cheio")),
+            patch.object(Path, "unlink", side_effect=PermissionError("em uso")),
+            self.assertRaisesRegex(OSError, "disco cheio"),
+        ):
+            acquisition._save_index(self.cache, {"a": []})
+
+    def test_a_good_save_replaces_the_index_and_leaves_no_temp_file(self):
+        acquisition._save_index(self.cache, {"a": [{"sha": "x"}]})
+        self.assertEqual({"a": [{"sha": "x"}]}, json.loads((self.cache / acquisition.INDEX_NAME).read_text("utf-8")))
+        self.assertEqual([acquisition.INDEX_NAME], [path.name for path in self.cache.iterdir()])
 
 
 class ReuseFromIndexTests(AcquisitionCase):

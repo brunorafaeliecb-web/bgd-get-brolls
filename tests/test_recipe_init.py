@@ -10,8 +10,10 @@ from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _cli import run_cli
+from _listing import visible_names
 from _paths import ROOT
 from _schemas import close
+from _symlink import needs_symlink
 from test_recipe_store import OWNER, RecipeCase, _schema, reseal
 
 from getbrolls import assets, cli, export, layout, open_enums, recipe_init, recipes, renamed, roteiro, runtime
@@ -42,7 +44,7 @@ class InitBySlugRefusalTests(RecipeInitCase):
             "init", "--recipe", "reels-split@1", "--client", OWNER, "--slug", "s2", "--tema", "x", expect=expect
         )
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_a_linked_project_folder_is_refused_live_and_dangling(self):
         elsewhere = self.tmp / "fora"
         elsewhere.mkdir()
@@ -82,7 +84,7 @@ class InitBySlugRefusalTests(RecipeInitCase):
 
 
 class InitTests(RecipeInitCase):
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_a_dangling_project_json_link_counts_as_existing_and_the_typed_path_is_echoed(self):
         self.new.mkdir()
         (self.new / "project.json").symlink_to(self.tmp / "nao-existe")
@@ -173,9 +175,7 @@ class InitTests(RecipeInitCase):
         for name in ("manifest.json", "candidates", "clips", "previews", "events.jsonl", "roteiro-reviews.jsonl"):
             self.assertFalse((brolls / name).exists(), name)
         if brolls.exists():
-            self.assertLessEqual(
-                {p.name for p in brolls.iterdir()}, {".command.lock", "getbrolls.log", "diagnostics.jsonl"}
-            )
+            self.assertLessEqual(set(visible_names(brolls)), {".command.lock", "getbrolls.log", "diagnostics.jsonl"})
         self.assertNotIn("revisado", (self.new / "ROTEIRO.md").read_text(encoding="utf-8"))
 
     def test_flags_override_the_recipe_canvas_and_fps(self):

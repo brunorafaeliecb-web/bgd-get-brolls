@@ -23,6 +23,7 @@ from unittest import mock
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 import _paths as _test_paths  # noqa: F401  (efeito de import: põe scripts/ no sys.path)  # pylint: disable=unused-import
 from _fake_secrets import joined
+from _listing import visible_names
 
 from getbrolls import delivery, delivery_sweep, effects, logs, runtime
 from getbrolls.bootstrap import StepResult, _StepFailedError
@@ -468,11 +469,83 @@ class RedactionTests(EffectsCase):
         argv = ["/opt/tools/bin/yt-dlp", "--add-header", "Authorization: Bearer SEGREDO", "https://x.test/?sig=1"]
         self.assertEqual("yt-dlp", target_of(argv))
 
+    def test_a_list_command_is_an_exact_path_never_split_into_words(self):
+        """argv[0] of a list is one path: a blank in a folder name is part of it, a backslash is no escape."""
+        cases = {
+            r"C:\ProgramData\chocolatey\bin\ffmpeg.exe": "ffmpeg",
+            r"C:/ProgramData/chocolatey/bin/ffmpeg.EXE": "ffmpeg",
+            r"C:\Program Files\ffmpeg\bin\ffmpeg.exe": "ffmpeg",
+            r"C:\Program Files (x86)\ff\ffmpeg.exe": "ffmpeg",
+            r"\\server\my share\bin\ffmpeg.exe": "ffmpeg",
+            r"\\server\share\bin\ffprobe.exe": "ffprobe",
+            r".\ffmpeg.exe": "ffmpeg",
+            r"bin\ffmpeg.exe": "ffmpeg",
+            r"..\tools\yt-dlp.exe": "yt-dlp",
+            r"node_modules\.bin\playwright-cli.cmd": "playwright-cli.cmd",
+            "/Users/Ana Silva/bin/yt-dlp": "yt-dlp",
+            "/usr/local/bin/ffmpeg": "ffmpeg",
+            "/usr/bin/python3.14": "python3.14",
+            "ffmpeg": "ffmpeg",
+            "C:\\": "-",
+            "C:/": "-",
+            r"\\server\share": "-",
+            "": "-",
+        }
+        for command, tool in cases.items():
+            for kind in (list, tuple):
+                with self.subTest(command=command, kind=kind.__name__):
+                    shown = target_of(kind([command, "-version"]))
+                    self.assertEqual(tool, shown)
+                    self.assertEqual(tool, effects._executable(command))
+                    for fragment in ("Program", "Silva", "Ana", "server", "my share", "chocolatey"):
+                        self.assertNotIn(fragment, shown)
+
+    def test_only_a_shell_text_is_split_into_words(self):
+        cases = {
+            r"C:\ProgramData\chocolatey\bin\ffmpeg.exe -i x": "ffmpeg",
+            r'"C:\Program Files\ff\ffmpeg.exe" -i x': "ffmpeg",
+            r'"C:\Program Files (x86)\ff\ffmpeg.exe" -i x': "ffmpeg",
+            r"C:\Tools\yt-dlp.exe --cookies x": "yt-dlp",
+            r"bin\ffmpeg.exe -i x": "ffmpeg",
+            r".\ffmpeg.exe -i x": "ffmpeg",
+            r"\\server\share\bin\ffprobe.exe -v": "ffprobe",
+            "/opt/tools/bin/yt-dlp --cookies x": "yt-dlp",
+            "echo --api-key=SEGREDO": "echo",
+            'ffmpeg -i "/srv/cliente/segredo.mov': "ffmpeg",
+            "C:/tools/ffmpeg.EXE 'sem fim": "ffmpeg",
+            "   ": "-",
+            "": "-",
+            "C:\\ -x": "-",
+        }
+        for command, tool in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(tool, effects._executable(command, shell_text=True))
+                shown = target_of([effects.ShellText(command)])
+                self.assertEqual(tool, shown)
+                self.assertNotIn("SEGREDO", shown)
+                self.assertNotIn("cliente", shown)
+                self.assertNotIn("segredo", shown)
+
+    def test_run_marks_a_string_command_as_shell_text_and_a_path_as_a_path(self):
+        with (
+            mock.patch.object(effects.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)),
+            mock.patch.object(effects, "op", wraps=effects.op) as spy,
+        ):
+            effects.run("echo --api-key=SEGREDO", shell=True)  # noqa: S604
+            effects.run(Path("/Users/Ana Silva/bin/yt-dlp"))
+            effects.run(["/Users/Ana Silva/bin/yt-dlp", "-x"])
+            seen = [call.args[1] for call in spy.call_args_list]
+        self.assertIsInstance(seen[0][0], effects.ShellText)
+        self.assertNotIsInstance(seen[1][0], effects.ShellText)
+        self.assertNotIsInstance(seen[2][0], effects.ShellText)
+        self.assertEqual(["echo", "yt-dlp", "yt-dlp"], [row["target"] for row in self.recorder.ops()])
+        self.assertNotIn("Silva", repr(self.recorder.calls))
+
     def test_a_logged_operation_carries_only_the_redacted_target(self):
         argv = [sys.executable, "-c", "pass", "--password=SEGREDO"]
         effects.run(argv, check=True)
         row = self.recorder.one()
-        self.assertEqual(Path(sys.executable).name, row["target"])
+        self.assertEqual(Path(sys.executable).name.removesuffix(".exe"), row["target"])
         self.assertNotIn("SEGREDO", repr(self.recorder.calls))
 
     def test_a_shell_string_command_logs_only_its_first_word(self):
@@ -480,7 +553,7 @@ class RedactionTests(EffectsCase):
         row = self.recorder.one()
         self.assertEqual("echo", row["target"])
         self.assertNotIn("SEGREDO", repr(self.recorder.calls))
-        self.assertEqual("yt-dlp", target_of(("/opt/bin/yt-dlp --cookies x",)))
+        self.assertEqual("yt-dlp", target_of((effects.ShellText("/opt/bin/yt-dlp --cookies x"),)))
 
     def test_a_plain_text_target_that_is_not_an_id_is_hashed(self):
         for text in (
@@ -622,7 +695,7 @@ class SaltedHashTests(EffectsCase):
         self.salt_file().write_text("nao-e-sal\n", encoding="utf-8")
         (self.home / f"{effects.SALT_FILE}.bad-antigo").write_text("x", encoding="utf-8")
         target_of(self.project / "entrega" / "a")
-        self.assertEqual([effects.SALT_FILE], sorted(p.name for p in self.home.iterdir()))
+        self.assertEqual([effects.SALT_FILE], visible_names(self.home))
         self.assertEqual("ok", effects.salt_state())
 
     @unittest.skipUnless(POSIX and os.geteuid() != 0, "permissões POSIX, sem root")

@@ -11,7 +11,9 @@ from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _cli import run_cli
+from _listing import visible_names
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 
 from getbrolls import clients, layout
 from getbrolls.sdk import schemas
@@ -37,7 +39,7 @@ class InitCommandTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
         self.project = self.base / "video-01"
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_a_linked_project_path_is_refused_live_and_dangling_with_the_typed_path(self):
         elsewhere = self.base / "fora"
         elsewhere.mkdir()
@@ -75,7 +77,7 @@ class InitCommandTests(unittest.TestCase):
         # A trava e o log do comando são esperados; nada mais sob brolls/.
         if brolls.exists():
             allowed = {".command.lock", "getbrolls.log", "diagnostics.jsonl"}
-            self.assertLessEqual({p.name for p in brolls.iterdir()}, allowed)
+            self.assertLessEqual(set(visible_names(brolls)), allowed)
 
     def test_client_canvas_and_fps_are_recorded(self):
         (self.base / "Clientes").mkdir()
@@ -192,7 +194,7 @@ class InitBySlugTests(unittest.TestCase):
         refused = run_cli("init", "--client", "ghost", "--slug", "video-01", expect=1)
         self.assertIn("ghost", refused["error"])
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_a_linked_projetos_folder_is_refused(self):
         elsewhere = self.base / "fora"
         elsewhere.mkdir()
@@ -222,7 +224,7 @@ class InitBySlugTests(unittest.TestCase):
     def _init(self, *extra, expect=1):
         return run_cli("init", "--client", "cliente-exemplo", "--slug", "s2", *extra, expect=expect)
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_a_linked_project_folder_is_refused_live_and_dangling(self):
         elsewhere = self.base / "fora"
         elsewhere.mkdir()

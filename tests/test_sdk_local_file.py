@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 from test_sdk_loader import MANIFEST, LoaderTestCase
 
 from getbrolls import http
@@ -15,8 +16,6 @@ from getbrolls.http import ProviderError
 from getbrolls.sdk.api import PluginApi, route_scope
 from getbrolls.sdk.manifest import read_manifest
 from getbrolls.sdk.registry import Registry
-
-CAN_SYMLINK = os.name != "nt"
 
 
 class LocalFileTests(LoaderTestCase):
@@ -61,7 +60,7 @@ class LocalFileTests(LoaderTestCase):
         self.assertNotIn(str(self.outside), "\n".join(cm.output))
         self.assertEqual([], list(self.work.iterdir()))
 
-    @unittest.skipUnless(CAN_SYMLINK, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_symlink_inside_the_root_pointing_outside_is_refused(self):
         link = self.root / "atalho.mp4"
         link.symlink_to(self.outside / "segredo.mp4")

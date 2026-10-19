@@ -13,6 +13,7 @@ from unittest import mock
 # A pasta pessoal da skill vai para um temporário: nenhum teste toca ~/.getbrolls.
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _paths import ROOT
+from _symlink import needs_symlink
 
 from getbrolls import export_gates, models, roteiro, roteiro_commands, roteiro_ids, roteiro_review, roteiro_sync
 from getbrolls import ledger as ledger_module
@@ -435,7 +436,7 @@ class CarriedRequirementTests(SyncCase):
         self.assertIn("link para fora do projeto", str(ctx.exception))
         self.assertEqual(before, (other / "BRIEF.md").read_bytes())
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_brief_symlinked_inside_the_project_is_refused_as_a_link(self):
         (self.project / "sub").mkdir()
         shutil.move(self.project / "BRIEF.md", self.project / "sub" / "brief.md")
@@ -451,7 +452,7 @@ class CarriedRequirementTests(SyncCase):
         self.assertEqual(before, tree(self.project))
         self.assertTrue((self.project / "BRIEF.md").is_symlink())
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_roteiro_symlink_is_written_through_and_stays_a_link(self):
         vault = Path(tempfile.mkdtemp(prefix="gb-vault-"))
         self.addCleanup(shutil.rmtree, vault, ignore_errors=True)

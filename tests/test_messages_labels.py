@@ -179,9 +179,14 @@ class DeliveryTests(LabelCase):
 
     def test_a_comparison_that_fails_to_read_keeps_only_the_system_reason(self):
         missing = self.project / "entrega" / "sumiu.mp4"
+        with self.assertRaises(
+            OSError
+        ) as system:  # a frase é a do sistema: "No such file..." no POSIX, outra no Windows
+            missing.read_bytes()
         with self.assertRaises(delivery._CompareError) as ctx:
             delivery._same_bytes(missing, missing)
-        self.assertEqual("No such file or directory", str(ctx.exception))
+        self.assertEqual(system.exception.strerror, str(ctx.exception))
+        self.assert_no_machine_path(str(ctx.exception))
 
     def test_link_or_copy_that_fails_both_ways_is_named_under_the_project(self):
         src = self.file("brolls/clips/clip.mp4")

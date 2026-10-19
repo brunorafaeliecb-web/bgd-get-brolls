@@ -216,21 +216,14 @@ class CliTest(unittest.TestCase):
             self.assertEqual(1, state["counts"]["previews"])
             self.assertEqual([c["id"]], state["stages"]["previews"])
 
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg required")
     def test_a_video_without_an_interval_is_told_about_reference_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             src = root / "original.mp4"
-            src.write_bytes(b"not a real video")
-            resolved = subprocess.run(
-                [*CLI_ARGV, "resolve", "--file", str(src), "--project", str(root)],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                check=False,
-            )
-            if resolved.returncode != 0:
-                self.skipTest("resolve recusou o arquivo sintético")
-            candidate_id = json.loads(resolved.stdout)["id"]
+            # Um vídeo de verdade: o `resolve` confere o arquivo com o ffprobe e recusa bytes que não são mídia.
+            synth_video(src, size="160x90", duration=3, rate=10)
+            candidate_id = self.call("resolve", "--file", src, "--project", root)["id"]
             failed = self.call("preview", "--candidate", candidate_id, "--project", root, ok=False)
             self.assertIn("--reference-only", json.dumps(failed, ensure_ascii=False))
 

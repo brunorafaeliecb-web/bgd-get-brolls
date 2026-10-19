@@ -156,7 +156,8 @@ def encoded_roots(tmp):
     for spelling in (str(tmp), real, real.removeprefix("/private")):
         quoted = urllib.parse.quote(spelling, safe="")
         forms |= {urllib.parse.quote(spelling), quoted, urllib.parse.quote(quoted, safe="")}
-        forms |= {spelling.replace("/", sep) for sep in ("\\/", "\\\\/", "\\u002f")}
+        # A pasta do Windows não tem `/`: o JSON que escapa a barra parte da grafia com `/` (`as_posix`).
+        forms |= {Path(spelling).as_posix().replace("/", sep) for sep in ("\\/", "\\\\/", "\\u002f")}
     forms.discard(str(tmp))
     forms.discard(real)
     return {form.lower() for form in forms}
@@ -285,7 +286,7 @@ def after_case(tmp, case):
 def record_extra(tmp):
     prepare_extra(tmp)
     _golden.plant_log_salt(tmp / "gbhome")
-    executables = {"<PY>": sys.executable, "<FFMPEG>": shutil.which("ffmpeg"), "<FFPROBE>": shutil.which("ffprobe")}
+    executables = {"<PY>": sys.executable, "<FFMPEG>": _golden.ffmpeg_pin(tmp), "<FFPROBE>": shutil.which("ffprobe")}
     roots = _golden.Roots(tmp, ROOT, executables)
     run = _golden.Run(
         list(CLI_ARGV), tmp, _golden.Normalizer(roots, _golden.version_of(ROOT), today=_golden.run_date(tmp))
@@ -363,7 +364,7 @@ class NoMachinePathTests(unittest.TestCase):
         record = {
             "case": "sonda",
             "stdout": {"json": {"q": f"a={quoted}", "url": f"file://{MACHINE}/work/x"}},
-            "stderr": {"json": {"error": str(tmp).replace("/", "\\/") + "\\/x"}},
+            "stderr": {"json": {"error": tmp.as_posix().replace("/", "\\/") + "\\/x"}},
             "appends": {},
         }
         self.assertEqual(
@@ -503,6 +504,26 @@ class FreeTextPathTests(unittest.TestCase):
             self.assert_hidden(text, self.HASH + r"\.mp4" + tail, *gone)
         for kept in ("a%2Fb", "x=1%2F2", "https://h/a%2Fb/c", "100%25"):
             self.assertEqual(kept, labels.outside(kept))
+
+    def test_a_root_in_any_case_goes_on_every_system(self):
+        # O texto vem de qualquer lugar (URL codificada, Windows, log de outra máquina), não só deste disco:
+        # as raízes conhecidas valem em qualquer caixa, o disco distinguindo `Users` de `USERS` ou não.
+        for caseless in (False, True):
+            with self.subTest(caseless=caseless), unittest.mock.patch.object(labels._paths, "_CASELESS", caseless):  # pylint: disable=protected-access
+                labels._roots.cache_clear()  # pylint: disable=protected-access
+                self.addCleanup(labels._roots.cache_clear)  # pylint: disable=protected-access
+                for text in (
+                    "/volumes/Externo/x.mp4",
+                    "/VOLUMES/Externo/x.mp4",
+                    "/USERS/pessoa/a.mp4",
+                    "/uSeRs/pessoa/a.mp4",
+                    "%2fvolumes%2fExterno%2fx.mp4",
+                    "%2FUSERS%2Fpessoa%2Fa.mp4",
+                    "C%3A%5Cusers%5Cpessoa%5Ca.mp4",
+                ):
+                    self.assert_hidden(text, "^" + self.HASH + r"\.mp4$", "pessoa", "Externo", "USERS", "volumes")
+                for kept in ("a%2Fb", "x=1%2F2", "https://h/a%2Fb/c", "100%25", "/v1/search", "/review/save"):
+                    self.assertEqual(kept, labels.outside(kept))
 
     def test_a_path_glued_to_an_option_goes(self):
         for text, head in (

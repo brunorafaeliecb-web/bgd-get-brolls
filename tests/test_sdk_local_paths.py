@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 from test_sdk_loader import MANIFEST, PLUGIN_CODE, LoaderTestCase
 from test_sdk_manifest import BASE, write_plugin
 
@@ -67,7 +68,7 @@ class LocalFileHardeningTests(LoaderTestCase):
         manifest = {**MANIFEST, "permissions": {**MANIFEST["permissions"], "paths": [str(self.root)]}}
         return PluginApi(read_manifest(self.install(manifest)), Registry())
 
-    @unittest.skipUnless(POSIX, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_refusal_names_the_callers_file_never_the_resolved_target(self):
         link = self.root / "atalho.mp4"
         link.symlink_to(self.outside / "segredo-externo.mp4")
@@ -87,7 +88,7 @@ class LocalFileHardeningTests(LoaderTestCase):
         ):
             api.local_file(self.root / "praia.mp4")
 
-    @unittest.skipUnless(POSIX, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_dangling_symlink_at_the_destination_is_never_followed(self):
         planted = self.outside / "plantado.mp4"
         (self.work / "local.mp4").symlink_to(planted)

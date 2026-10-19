@@ -15,6 +15,7 @@ from unittest.mock import patch
 # A pasta pessoal da skill vai para um temporário: nenhum teste toca ~/.getbrolls.
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _logs import LogCase, events, home_log_lines
+from _symlink import needs_symlink
 from test_clients import ClientsTestCase, _can_symlink
 from test_profile_cli import ProfileCliCase, sha, write
 from test_recipe_init import RecipeInitCase
@@ -73,7 +74,7 @@ class ClientLogTests(ClientsTestCase, LogCase):
             self.assertEqual(logging.WARNING, rows.level_of("client_refused", reason=reason))
             self.assert_clean(rows, "acme-secreto", "fantasma-secreto", "ACME Segredo", self.tmp)
 
-    @unittest.skipUnless(os.name != "nt", "link simbólico precisa de privilégio no Windows")
+    @needs_symlink
     def test_a_root_that_is_a_link_is_refused(self):
         if not _can_symlink(self.base):
             self.skipTest("sem permissão para criar link")

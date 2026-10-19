@@ -321,6 +321,7 @@ def _write_private(path, text):
             os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
             "w",
             encoding="utf-8",
+            newline="\n",
         ) as stream,
     ):
         stream.write(text)

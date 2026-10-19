@@ -32,7 +32,9 @@ from .errors import DataRootError, UsageError
 # não é pasta, descritor inválido ou laço de links. E, no Windows, unidade não pronta, nome
 # inválido e nome que não resolve.
 _ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
-_ABSENT_WINERRORS = frozenset({21, 123, 1921})
+# `ERROR_CANT_RESOLVE_FILENAME`: what Windows answers to a link loop (it has no `ELOOP`), also used by `cli`.
+WINERROR_CANT_RESOLVE_FILENAME = 1921
+_ABSENT_WINERRORS = frozenset({21, 123, WINERROR_CANT_RESOLVE_FILENAME})
 
 
 def _stat_or_none(path, *, follow_symlinks=True):
@@ -401,10 +403,11 @@ def _lower_hex(text):
     return re.sub(r"%[0-9A-F]{2}", lambda found: found.group(0).lower(), text)
 
 
-def replace_spellings(text, spellings, tag, *, ignore_case=False) -> str:
+def replace_spellings(text, spellings, tag, *, ignore_case=False, slashes=False) -> str:
     """`text` with each of `spellings`, in every form of `_encoded`, replaced by `tag`, only as a whole
     path (`_BEFORE`/`_AFTER`): `/Users/ana` never inside `/Users/anax`. Without case where the
-    disk ignores it, or with `ignore_case` (a Windows folder seen from another system)."""
+    disk ignores it, or with `ignore_case` (a Windows folder seen from another system). With `slashes`, the
+    names that follow a Windows folder (`\\brolls\\a`) are written with `/` like a label (`<projeto>/brolls/a`)."""
     value = str(text)
     flags = re.IGNORECASE if ignore_case or _CASELESS else 0
     probed: dict[str, bool] = {}  # the sibling checks of this call (`_ends_here`): each name asked once
@@ -412,16 +415,51 @@ def replace_spellings(text, spellings, tag, *, ignore_case=False) -> str:
     for spelling in spellings:
         for form in _encoded(spelling):
             raw = form == spelling
-            pattern = _compiled(form, flags)
-            value = pattern.sub(lambda found, raw=raw: tag if _ends_here(found, raw, probed) else found.group(0), value)
+            pattern = _compiled(form, flags, slashes)
+            value = pattern.sub(lambda found, raw=raw: _swapped(found, raw, probed, tag), value)
     return value
 
 
+def _swapped(found, raw, probed, tag):
+    """What replaces one match of `_compiled`: the tag, and the rest of a Windows path (`\\brolls\\a`) written
+    with `/` as the label always does; the match itself when the folder goes on into a longer name."""
+    if not _ends_here(found, raw, probed):
+        return found.group(0)
+    return tag + _BACKSLASHES.sub("/", found.group("tail") or "")
+
+
+# What follows a Windows folder in a text: `\name` after `\name`, up to a blank, a `/`, a quote or any
+# character a name cannot hold. A name with a blank ends the run (the rest of the text is left as it came).
+# The separator depends on how the text writes a backslash. Plain text (`C:\\x\\a`, `\\\\host\\share`): any run
+# of them, so a folder called `new` or `uni` is a folder. JSON text (`C:\\\\x\\\\a`, the backslash doubled): exactly
+# two, because a single one there is an escape (`\n`, `\t`, `\"`, `\u00e9`) and ends the path.
+_PLAIN_TAIL = r"(?P<tail>(?:\\+[^\s\\/'\"`<>|:]+)*)"
+_JSON_TAIL = r"(?P<tail>(?:\\\\[^\s\\/'\"`<>|:]+)*)"
+_NO_TAIL = "(?P<tail>)"
+_BACKSLASHES = re.compile(r"\\+")
+# Starts like a Windows path in any of its spellings: a drive (`C:\`, `C:/`, `C:\\`) or a UNC share.
+_WINDOWS_START = re.compile(r"(?:[A-Za-z]:[\\/]|(?:\\\\){1,2}[^\\/])")
+
+
+# A `\uXXXX` escape: `\u` and exactly four hex digits. A folder called `usuarios` is no escape.
+_UNICODE_ESCAPE = re.compile(r"\\u[0-9A-Fa-f]{4}")
+
+
+def _tail_of(form):
+    """The pattern of the names that may follow `form` (see above); none unless `form` is a Windows
+    spelling. The `\\u005c` form and the escaped forms of a POSIX folder (`\\u002f`, `\\/`) take none."""
+    if _WINDOWS_START.match(form) is None or _UNICODE_ESCAPE.search(form):
+        return _NO_TAIL
+    return _JSON_TAIL if "\\\\" in form.lstrip("\\") else _PLAIN_TAIL
+
+
 @functools.lru_cache(maxsize=4096)
-def _compiled(form, flags):
+def _compiled(form, flags, slashes=False):
     """The pattern of one form, compiled once per process: a literal between two fixed-width
-    assertions, so a search is linear in the text (no nested quantifier, nothing to backtrack)."""
-    return re.compile(_BEFORE + re.escape(form) + _AFTER, flags)
+    assertions, so a search is linear in the text (no nested quantifier, nothing to backtrack). With
+    `slashes`, a Windows spelling also takes the names that follow it (`_tail_of`): they alternate with
+    the `\\` they start with, so there is still nothing to backtrack."""
+    return re.compile(_BEFORE + re.escape(form) + _AFTER + (_tail_of(form) if slashes else _NO_TAIL), flags)
 
 
 # After a space, `,`, `:`, `;`, `)` or `'` a folder name can still go on (`Projeto 2/x`, `gb,v2/x`): it does
@@ -441,7 +479,7 @@ def _ends_here(found, raw, probed):
     """The match is the whole folder: the text does not go on into a longer name (`_CONTINUES`) and, for a
     raw spelling, no existing sibling starts with it (`Projeto 2` next to `Projeto`). `probed` holds the
     answers of this text: each candidate name is asked once, at most `_SIBLING_PROBES` in all."""
-    string, end = found.string, found.end()
+    string, end = found.string, found.start("tail")
     if end >= len(string) or string[end] not in _NAME_DELIMITERS:
         return True
     if _CONTINUES.match(string, end):
@@ -454,7 +492,7 @@ def _ends_here(found, raw, probed):
             name = cut[:index]
             if any(char in name for char in "/\\\n\r\t\0"):
                 break  # past the end of a name: nothing longer can be a sibling either
-            candidate = found.group(0) + name
+            candidate = string[found.start() : end] + name
             if candidate not in probed:
                 if len(probed) >= _SIBLING_PROBES:
                     break
@@ -480,7 +518,7 @@ def replace_folder(text, folder, tag) -> str:
     spellings = {str(_lexical(folder))}
     with contextlib.suppress(OSError, RuntimeError, ValueError):
         spellings.add(str(Path(folder).resolve()))
-    value = replace_spellings(text, with_linked(spellings), tag)
+    value = replace_spellings(text, with_linked(spellings), tag, slashes=True)
     if not Path(folder).is_absolute() and str(folder) not in ("", "."):
         pattern = _BEFORE_RELATIVE + re.escape(os.path.normpath(folder)) + _AFTER_RELATIVE
         value = re.sub(pattern, lambda _found: tag, value)
@@ -605,7 +643,7 @@ def write_marker(part: str, root: Path, status: str, extra: Mapping[str, object]
     effects.mkdir(root, parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     with effects.op("fs.write", path):
-        temporary.write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
+        temporary.write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8", newline="\n")
         temporary.replace(path)
     return path
 

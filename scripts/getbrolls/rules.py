@@ -386,7 +386,7 @@ def seed_project_rules(project, video_format):
     text = template.replace(blocks[0], json.dumps(data, ensure_ascii=False, indent=2), 1)
     with effects.op("fs.write", dest) as writing:
         try:
-            with dest.open("x", encoding="utf-8") as handle:
+            with dest.open("x", encoding="utf-8", newline="\n") as handle:
                 handle.write(text)
         except FileExistsError:
             writing.skip()

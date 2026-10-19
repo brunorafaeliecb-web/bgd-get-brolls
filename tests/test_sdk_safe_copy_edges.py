@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _posix import without_nofollow
+from _symlink import needs_symlink
 from test_sdk_safe_copy import BY_COMPONENT, POSIX, DescentTestCase, SafeCopyTestCase
 
 from getbrolls.sdk import safe_copy
@@ -17,16 +19,17 @@ from getbrolls.sdk import safe_copy
 class WithoutNofollowTests(SafeCopyTestCase):
     """O Windows não tem `O_NOFOLLOW`: o link é recusado antes de qualquer abertura."""
 
-    @unittest.skipUnless(POSIX, "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_a_link_is_refused_before_anything_is_opened(self):
         link = self.base / "atalho.wav"
         link.symlink_to(self.source)
         opened = []
         real_open = os.open
-        with patch.object(os, "O_NOFOLLOW", 0):
-            delattr(os, "O_NOFOLLOW")
-            with patch.object(safe_copy.os, "open", lambda *a, **k: (opened.append(a), real_open(*a, **k))[1]):
-                error = self.refused(safe_copy.OPEN_FAILED, safe_copy.open_regular, link)
+        with (
+            without_nofollow(),
+            patch.object(safe_copy.os, "open", lambda *a, **k: (opened.append(a), real_open(*a, **k))[1]),
+        ):
+            error = self.refused(safe_copy.OPEN_FAILED, safe_copy.open_regular, link)
         self.assertEqual("OSError", error.type_name)
         self.assertEqual([], opened)
 
@@ -75,7 +78,9 @@ class StillUnderTests(SafeCopyTestCase):
         self.assertEqual(self.inner, safe_copy.still_under(self.inner, [self.root], fd))
 
     def test_a_path_that_no_longer_resolves_is_changed(self):
-        fd = os.open(self.inner, os.O_RDONLY)
+        # O descritor segura outro arquivo: o Windows não apaga um arquivo aberto, e a conferência do caminho vem
+        # antes de olhar o descritor.
+        fd = os.open(self.root / "outro.wav", os.O_RDONLY)
         self.addCleanup(os.close, fd)
         self.inner.unlink()
         self.refused(safe_copy.CHANGED, safe_copy.still_under, self.inner, [self.root], fd)
@@ -158,7 +163,8 @@ class DescentFailureTests(DescentTestCase):
             error = self.refused(safe_copy.OPEN_FAILED, safe_copy.open_under, self.inner, [self.root])
         self.assertEqual("FileNotFoundError", error.type_name)
 
-    @unittest.skipUnless(POSIX, "symlink exige privilégio no Windows")
+    @needs_symlink
+    @unittest.skipUnless(BY_COMPONENT, "open_root desce por dir_fd, que é do POSIX")
     def test_a_link_in_the_root_path_that_fails_to_open_is_outside(self):
         (self.base / "atalho").symlink_to(self.root)
         real_open_at = safe_copy._open_at  # pylint: disable=protected-access

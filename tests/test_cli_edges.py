@@ -144,6 +144,31 @@ class SymlinkLoopProjectTests(HomeCase):
                 self.assertNotIn("Traceback", err)
 
 
+class WindowsLinkLoopTests(HomeCase):
+    """Windows answers a link loop with `winerror` 1921 (and `errno` 22), never with `ELOOP`."""
+
+    def stat_fails(self, exc):
+        return mock.patch.object(Path, "stat", side_effect=exc)
+
+    def test_a_windows_link_loop_is_a_usage_error(self):
+        loop = OSError(errno.EINVAL, "The name of the file cannot be resolved by the system")
+        loop.winerror = 1921  # pyright: ignore[reportAttributeAccessIssue]  # set by hand: POSIX has no such attribute
+        with self.stat_fails(loop), self.assertRaisesRegex(UsageError, "laço de links"):
+            cli._refuse_link_loop("proj", self.home / "proj")
+
+    def test_the_posix_loop_is_still_a_usage_error(self):
+        loop = OSError(errno.ELOOP, "Too many levels of symbolic links")
+        with self.stat_fails(loop), self.assertRaisesRegex(UsageError, "laço de links"):
+            cli._refuse_link_loop("proj", self.home / "proj")
+
+    def test_any_other_stat_error_is_left_to_the_command(self):
+        other = OSError(errno.EINVAL, "x")
+        other.winerror = 123  # pyright: ignore[reportAttributeAccessIssue]
+        for exc in (other, OSError(errno.EACCES, "x"), OSError(errno.EINVAL, "x")):
+            with self.subTest(exc=repr(exc)), self.stat_fails(exc):
+                cli._refuse_link_loop("proj", self.home / "proj")  # no exception
+
+
 class WindowsTildeTests(HomeCase):
     """Windows' `ntpath.expanduser` never raises: `~nome` becomes `C:\\Users\\nome` without checking."""
 
@@ -185,7 +210,7 @@ class ExistingTildeTests(unittest.TestCase):
     def test_a_path_without_tilde_is_left_alone(self):
         args = argparse.Namespace(command="status", project="relativo/~gbnouser_zz")
         cli._expand_project(args)
-        self.assertEqual("relativo/~gbnouser_zz", args.project)
+        self.assertEqual(str(Path("relativo/~gbnouser_zz")), args.project)  # the system's own separator
 
 
 class InternalErrorEdgeTests(HomeCase):

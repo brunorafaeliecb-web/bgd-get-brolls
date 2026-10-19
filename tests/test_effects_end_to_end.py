@@ -22,7 +22,8 @@ from unittest import mock
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 import _logs
-from _paths import CLI_ARGV, ROOT, WHEEL_MODE
+from _listing import visible_names
+from _paths import CLI_ARGV, ROOT, WHEEL_MODE, WHEEL_PYTHON
 
 from getbrolls import logs, runtime
 
@@ -37,6 +38,9 @@ _SIGINT_CHILD = (
     "runpy.run_module('getbrolls', run_name='__main__', alter_sys=True)"
 )
 FIRST_LINE_TIMEOUT_S = 60
+# No Windows `Popen.send_signal` não entrega SIGINT: só SIGTERM, CTRL_C_EVENT e CTRL_BREAK_EVENT, e os dois eventos
+# de console pedem um console que o processo e o filho compartilhem (o runner do CI roda sem ele).
+NO_CHILD_SIGINT = "este sistema não entrega SIGINT a um processo filho (Windows: só CTRL_C_EVENT e CTRL_BREAK_EVENT)"
 
 
 def _first_line(stream, timeout):
@@ -68,32 +72,41 @@ def serve_foreground(test, env_text):
         env.pop("GB_LOG_LEVEL", None)
         if not WHEEL_MODE:
             env["PYTHONPATH"] = str(ROOT / "scripts")
+        # No modo wheel o `getbrolls` é o pacote instalado na venv do wheel (`-P`: a pasta atual fica fora do
+        # `sys.path`), não o do Python que roda a suíte.
+        python = (str(WHEEL_PYTHON), "-P") if WHEEL_MODE else (sys.executable,)
         proc = subprocess.Popen(  # pylint: disable=consider-using-with
-            [sys.executable, "-c", _SIGINT_CHILD, "serve", "--project", str(project), "--port", str(_free_port())],
+            [*python, "-c", _SIGINT_CHILD, "serve", "--project", str(project), "--port", str(_free_port())],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
         )
+        collected = None
         try:
             assert proc.stdout is not None
             first = _first_line(proc.stdout, FIRST_LINE_TIMEOUT_S)
             test.assertIsNotNone(first, "o servidor não imprimiu a linha com a porta a tempo")
-            test.assertIn('"port"', first or "")
-        finally:
-            proc.send_signal(signal.SIGINT)
-            try:
-                proc.communicate(timeout=60)
-            except subprocess.TimeoutExpired:
+            if '"port"' not in (first or ""):
+                # A saída inteira, não só a linha `Traceback`: o erro que importa está nas linhas seguintes.
                 proc.kill()
-                proc.communicate()
-                raise
+                collected = proc.communicate()[0]
+                test.fail(f"a primeira linha não traz a porta:\n{first}{collected}")
+        finally:
+            if collected is None:
+                proc.send_signal(signal.SIGINT)
+                try:
+                    proc.communicate(timeout=60)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+                    raise
         log = project / "brolls" / "getbrolls.log"
         return log.read_text(encoding="utf-8") if log.exists() else None
 
 
-@unittest.skipUnless(POSIX, "SIGINT para o servidor em primeiro plano")
+@unittest.skipUnless(POSIX, NO_CHILD_SIGINT)
 class ForegroundServeHonoursTheEnvTests(unittest.TestCase):
     """o `serve` em primeiro plano lê o `.env` (e o perfil) antes de ligar o log."""
 
@@ -291,7 +304,7 @@ class MalformedSaltRepairRaceTests(unittest.TestCase):
                 ]
                 hashes = {child.communicate(timeout=120)[0].strip() for child in children}
                 self.assertEqual(1, len(hashes), hashes)
-                self.assertEqual([".log-salt"], sorted(p.name for p in home.iterdir()))
+                self.assertEqual([".log-salt"], visible_names(home))
                 self.assertRegex((home / ".log-salt").read_text(encoding="ascii").strip(), r"^[0-9a-f]{64}$")
 
 
@@ -307,7 +320,7 @@ class DurationAndCommandTests(unittest.TestCase):
         self.assertEqual(["7", "12", None], [row.get("duration_ms") for row in rows])
         self.assertEqual("12", rows[1]["waited_ms"])
 
-    @unittest.skipUnless(POSIX, "SIGINT para o servidor em primeiro plano")
+    @unittest.skipUnless(POSIX, NO_CHILD_SIGINT)
     def test_the_lines_of_the_foreground_server_name_the_serve_command(self):
         text = serve_foreground(self, "")
         rows = _logs.events((text or "").splitlines(), "op")

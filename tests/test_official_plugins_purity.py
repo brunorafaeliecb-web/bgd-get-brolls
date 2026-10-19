@@ -13,10 +13,11 @@ atributo que comece por `_` (`api._registry`, `api._resolve_roots()`), seja como
 O objeto `api` de `register` (e todo apelido dele que a AST enxerga) é uma LISTA DE PERMISSÃO, não uma lista de
 proibição: só os atributos de `API_ALLOWLIST` (os que `plugin.py` usa hoje) podem ser lidos nele, e ele nunca é
 passado adiante (argumento, lista, retorno), porque aí o que o recebe leria o que quisesse (`api.data_dir` devolve um
-`Path` que escreve). O código é lido pelos mesmos bytes que o loader compila (`ast.parse(path.read_bytes())`), e todo BOM ou linha de
-codificação PEP 263 é recusado, porque mudaria o texto que roda. `register` só pode ser um `def`/`async def` simples
-(sem decorador, com um único parâmetro posicional) e nenhuma outra coisa liga esse nome, porque é o que o loader
-chama com o `api` e o que o checador sabe rastrear. O teste de si mesmo prova que cada fuga conhecida é pega e que o `plugin.py` real passa.
+`Path` que escreve). O código é lido pelos mesmos bytes que o loader compila (`ast.parse(path.read_bytes())`), e todo
+BOM ou linha de codificação PEP 263 é recusado, porque mudaria o texto que roda. `register` só pode ser um
+`def`/`async def` simples (sem decorador, com um único parâmetro posicional) e nenhuma outra coisa liga esse nome,
+porque é o que o loader chama com o `api` e o que o checador sabe rastrear. O teste de si mesmo prova que cada fuga
+conhecida é pega e que o `plugin.py` real passa.
 """
 
 import ast
@@ -158,8 +159,8 @@ CODING_LINE = re.compile(rb"^[ \t\f]*#.*?coding[:=][ \t]*[-_.a-zA-Z0-9]+")
 ENTRY = re.compile(r"[A-Za-z0-9_]{1,64}\.py")
 # the allowlist of what the bridge may read on the `api` it receives (and on any alias of it). It is exactly what
 # the official plugins use today (`test_the_allowlist_is_exactly_what_the_bridge_reads` derives it from every pinned
-# entry, not from one file); every other member of `PluginApi` reads disk, network or the environment, or returns an object
-# (`data_dir` is a `Path`, `_registry` is the whole registry) whose methods do
+# entry, not from one file); every other member of `PluginApi` reads disk, network or the environment, or returns an
+# object (`data_dir` is a `Path`, `_registry` is the whole registry) whose methods do
 API_ALLOWLIST = frozenset({"environment"})
 # the name `api` is always treated as the object; so is the first parameter of any `register` function
 API_NAME = "api"

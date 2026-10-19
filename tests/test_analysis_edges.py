@@ -20,6 +20,10 @@ from getbrolls import analysis
 from getbrolls import analysis_contract as ac
 
 PRODUCER = store.PRODUCER
+# Os testes que forçam a gravação por `dir_fd` só valem onde `os.open`, `mkdir`, `rename` e `unlink` o aceitam
+# (o Windows não): lá a gravação por `lstat` é a que roda, e tem os testes dela.
+HAS_DIR_FD = all(fn in os.supports_dir_fd for fn in (os.open, os.mkdir, os.rename, os.unlink))
+DIR_FD_REASON = "este sistema não aceita dir_fd em os.open, os.mkdir, os.rename e os.unlink"
 
 
 def files_under(folder):
@@ -44,6 +48,7 @@ class WriteFailureTests(store.StoreTestCase):
         leftovers = [name for name in files_under(self.project) if name.endswith(".tmp")]
         self.assertEqual([], leftovers)
 
+    @unittest.skipUnless(HAS_DIR_FD, DIR_FD_REASON)
     def test_failed_rename_removes_the_temp_file_and_reraises(self):
         with (
             mock.patch.object(analysis, "_dir_fd_available", return_value=True),
@@ -95,6 +100,7 @@ class WriteFailureTests(store.StoreTestCase):
             self.write()
         self.assert_clean_failure()
 
+    @unittest.skipUnless(HAS_DIR_FD, DIR_FD_REASON)
     def test_child_that_opens_but_is_not_a_directory_is_refused(self):
         """Sem `O_DIRECTORY` (plataforma que não tem), `media` como arquivo abre; a conferência recusa."""
         media = self.project / "analysis" / "media"

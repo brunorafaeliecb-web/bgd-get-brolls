@@ -7,7 +7,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from typing import ClassVar
 from unittest import mock
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
@@ -44,6 +45,49 @@ class AnchorTreeCase(unittest.TestCase):
         with self.patched(), contextlib.redirect_stdout(out):
             code = anchors.main()
         return code, out.getvalue()
+
+
+class WindowsFile(PureWindowsPath):
+    """A Windows path with just enough of `Path` for `check()`: it reads from `files`, keyed by its text."""
+
+    files: ClassVar[dict[str, str]] = {}
+
+    def exists(self):
+        return str(self) in self.files
+
+    def read_text(self, encoding="utf-8"):  # pylint: disable=unused-argument
+        return self.files[str(self)]
+
+    def resolve(self):
+        return self
+
+
+class WindowsPathTests(unittest.TestCase):
+    def test_problems_name_a_windows_file_with_slashes(self):
+        root = WindowsFile(r"C:\r")
+        guide = root / "docs" / "GUIDE.md"
+        skill = root / "SKILL.md"
+        reference = root / "references" / "a.md"
+        files = {
+            str(guide): "# Guia\n",
+            str(skill): "[x](docs/GUIDE.md#nope)\n",
+            str(reference): "veja GUIDE.md#nope2 e [y](missing.md)\n",
+        }
+        with (
+            mock.patch.object(WindowsFile, "files", files),
+            mock.patch.object(anchors, "ROOT", root),
+            mock.patch.object(anchors, "GUIDE_PATH", guide),
+            mock.patch.object(anchors, "TARGET_FILES", [skill, reference]),
+        ):
+            problems = anchors.check()
+        self.assertEqual(
+            [
+                "SKILL.md: âncora quebrada GUIDE.md#nope",
+                "references/a.md: âncora quebrada GUIDE.md#nope2",
+                "references/a.md: link quebrado missing.md",
+            ],
+            problems,
+        )
 
 
 class CheckTests(AnchorTreeCase):

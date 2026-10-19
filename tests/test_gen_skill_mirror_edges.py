@@ -6,7 +6,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest import mock
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
@@ -98,7 +98,12 @@ class MirrorTests(MirrorTreeCase):
         with mock.patch.object(gen, "ROOT", self.tmp):
             self.assertEqual("docs/GUIDE.md", gen.display(self.tmp / "docs" / "GUIDE.md"))
             outside = Path(tempfile.gettempdir()).resolve() / "fora.md"
-            self.assertEqual(str(outside), gen.display(outside))
+            self.assertEqual(outside.as_posix(), gen.display(outside))
+
+    def test_display_writes_a_windows_path_with_slashes(self):
+        with mock.patch.object(gen, "ROOT", PureWindowsPath(r"C:\r")):
+            self.assertEqual("docs/GUIDE.md", gen.display(PureWindowsPath(r"C:\r\docs\GUIDE.md")))
+            self.assertEqual("D:/fora/x.md", gen.display(PureWindowsPath(r"D:\fora\x.md")))
 
 
 class RenderErrorTests(unittest.TestCase):

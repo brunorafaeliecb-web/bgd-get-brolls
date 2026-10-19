@@ -290,7 +290,7 @@ def measure(python: str, root: Path, workdir: Path, targets: Targets, runner: Ru
             "(python3 -m pip install -r requirements-dev.txt) antes de rodar o gate."
         )
     rcfile = workdir / "coveragerc"
-    rcfile.write_text(rcfile_text(root, targets.source, workdir / "data" / ".coverage"), encoding="utf-8")
+    rcfile.write_text(rcfile_text(root, targets.source, workdir / "data" / ".coverage"), encoding="utf-8", newline="\n")
     (workdir / "data").mkdir(exist_ok=True)
     # A `--keep` folder reused from an earlier run: its data would be combined into this one.
     for stale in (workdir / "data").glob(".coverage*"):

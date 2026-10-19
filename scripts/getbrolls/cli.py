@@ -1644,9 +1644,10 @@ def _refuse_link_loop(typed, path):
     try:
         Path(path).stat()
     except OSError as exc:
-        if exc.errno == errno.ELOOP:
+        # Windows has no `ELOOP`: a loop is `ERROR_CANT_RESOLVE_FILENAME`, with `errno` 22.
+        if exc.errno == errno.ELOOP or getattr(exc, "winerror", None) == _paths.WINERROR_CANT_RESOLVE_FILENAME:
             raise UsageError(
-                f"--project {typed}: o caminho tem um laço de links simbólicos. "
+                f"--project {typed}: o caminho tem um laço de links simbólicos ou um link que não resolve. "
                 "Aponte para a pasta de verdade do projeto."
             ) from None
 

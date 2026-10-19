@@ -43,6 +43,7 @@ from unittest.mock import patch
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _cli import run_cli
+from _symlink import needs_symlink
 from test_sdk_loader import MANIFEST, PLUGIN_CODE, LoaderTestCase
 
 from getbrolls import runtime
@@ -177,7 +178,7 @@ class FolderInstallTests(InstallTestCase):
         err = run_cli("plugins", "--action", "install", "--source", source, expect=1, env=self.env())
         self.assertIn("--action update", err["error"])
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_symlink_in_the_source_is_refused(self):
         source = write_plugin(self.work / "demo_src")
         (source / "atalho.txt").symlink_to(Path(tempfile.gettempdir()))
@@ -767,7 +768,7 @@ class GitInstallTests(InstallTestCase):
 
     # -- Link simbólico commitado e depois apagado do worktree local ---------
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_symlink_committed_then_removed_from_worktree_is_still_refused(self):
         repo = self.repo()
         link = repo / "atalho.py"

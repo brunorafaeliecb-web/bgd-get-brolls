@@ -3,12 +3,12 @@ projeto movido reaproveita o próprio arquivo, e uma cópia nunca lê o cache do
 projeto original (nem por uma entrada antiga com caminho absoluto)."""
 
 import json
-import os
 import shutil
 import unittest
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _media import skip_unless_ffmpeg
+from _symlink import needs_symlink
 from test_sdk_route_fetch import FetchRouteCase
 
 from getbrolls.runtime import OperationError
@@ -112,7 +112,7 @@ class FetchCacheLocationTests(FetchRouteCase):
 
         self.refetch_after(ident, drive_relative)
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_symlink_planted_in_the_cache_is_not_followed(self):
         ident = self.first_fetch()
         outside = self.project.parent / (self.project.name + "-fora.bin")

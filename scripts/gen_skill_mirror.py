@@ -36,7 +36,7 @@ import contextlib
 import difflib
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePath
 
 ROOT = Path(__file__).resolve().parent.parent
 ROOT_SKILL = ROOT / "SKILL.md"
@@ -121,13 +121,13 @@ def render_mirror(root_text: str) -> str:
     return frontmatter + body
 
 
-def display(path: Path) -> str:
+def display(path: PurePath) -> str:
     """Caminho relativo à raiz do repositório para mensagens; cai no caminho
     absoluto quando `path` está fora dela (ex.: testes com destino em `tmp`)."""
     try:
-        return str(path.relative_to(ROOT))
+        return path.relative_to(ROOT).as_posix()
     except ValueError:
-        return str(path)
+        return path.as_posix()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -161,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     MIRROR_SKILL.parent.mkdir(parents=True, exist_ok=True)
-    MIRROR_SKILL.write_text(mirror_text, encoding="utf-8")
+    MIRROR_SKILL.write_text(mirror_text, encoding="utf-8", newline="\n")
     print(f"{display(MIRROR_SKILL)} gerado a partir de {display(ROOT_SKILL)}.")
     return 0
 

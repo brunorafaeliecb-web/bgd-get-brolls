@@ -19,6 +19,7 @@ from unittest.mock import patch
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _logs import LogCase, events
 from _paths import CLI_ARGV
+from _symlink import needs_symlink
 from test_analysis_store import PRODUCER, StoreTestCase, _can_symlink, marker, transcript
 from test_roteiro_cli import REVIEW, CliCase
 
@@ -178,7 +179,7 @@ class AnalysisLogTests(StoreTestCase, LogCase):
         self.assertRegex(row["code"], r"^[A-Z_]+$")
         self.assertGreaterEqual(int(row["problems"]), 1)
 
-    @unittest.skipUnless(os.name != "nt", "link simbólico precisa de privilégio no Windows")
+    @needs_symlink
     def test_a_linked_analysis_folder_is_refused_as_a_link(self):
         if not _can_symlink(self.tmp):
             self.skipTest("sem permissão para criar link")

@@ -99,6 +99,7 @@ def _write_private(path, text):
                 os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
                 "w",
                 encoding="utf-8",
+                newline="\n",
             ) as f:
                 f.write(text)
                 f.flush()

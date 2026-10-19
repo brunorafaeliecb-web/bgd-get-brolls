@@ -179,7 +179,7 @@ def _open_private(path):
         if os.name != "nt" and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) != _PRIVATE_FILE_MODE:
             os.fchmod(fd, _PRIVATE_FILE_MODE)
         # effect-exempt: getbrolls.log handler itself; an op line from inside it would recurse into it
-        return os.fdopen(fd, "a", encoding="utf-8")
+        return os.fdopen(fd, "a", encoding="utf-8", newline="\n")
     except BaseException:
         os.close(fd)
         raise

@@ -18,6 +18,7 @@ from unittest.mock import patch
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _cli import run_cli
 from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys.path)  # pylint: disable=unused-import
+from _symlink import needs_symlink
 from test_recipe_init import REF, RecipeInitCase
 from test_recipe_store import OWNER, ROTEIRO, RecipeCase, reseal, rewrite_components, thaw, tree_hash
 
@@ -809,7 +810,7 @@ class RecipesRootRaceTests(RecipeCase):
 class LabelTests(RecipeCase):
     """A pasta numa mensagem da loja sai pela marca (`<cliente>/…`, `<projeto>/…`), nunca pelo caminho da máquina."""
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_a_recipes_folder_link_is_named_without_reading_the_registry(self):
         # `_place` recebe a pasta do cliente de quem chama: uma mensagem de erro não lê o registro de novo.
         root = self.client / "recipes"
@@ -842,7 +843,7 @@ class ListEdgeTests(RecipeCase):
         shutil.rmtree(self.client / "recipes", ignore_errors=True)
         self.assertEqual({"recipes": [], "clients_with_problems": []}, recipes.list_recipes())
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_junk_in_the_recipes_folder_is_skipped(self):
         self.seal()
         root = self.client / "recipes"
@@ -880,7 +881,7 @@ class ListEdgeTests(RecipeCase):
             recipes.show("reels-split@2", owner=OWNER)
         self.assertTrue(recipes.show("reels-split@1", owner=OWNER)["intact"])
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_a_link_named_like_a_version_is_not_a_version(self):
         self.seal()
         if not can_symlink(self.tmp):
@@ -972,7 +973,7 @@ class ListEdgeTests(RecipeCase):
             "A pasta recipes não pôde ser lida: Input/output error.", found["clients_with_problems"][0]["problem"]
         )
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_a_client_problem_that_is_not_an_io_error_has_the_unavailable_code(self):
         if not can_symlink(self.tmp):
             self.skipTest("sem permissão para criar link simbólico")
@@ -1093,7 +1094,7 @@ class LockEdgeTests(RecipeInitCase):
         self.init()
         self.lock_path = self.new / recipe_init.LOCK_FILE
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_lock_that_is_too_big_or_a_link_is_unreadable(self):
         with patch.object(recipe_init, "LOCK_MAX", 5):
             warnings = recipe_init.lock_warnings(self.new)

@@ -9,6 +9,7 @@ e `runtime.ERROR_EXIT`. Os comandos de plugin saem do manifesto, sem rodar códi
 # `cyclic-import` vem de getbrolls.capabilities <-> getbrolls.commands: o `commands` importa este
 # módulo dentro de `_execute_toolchain`, que só roda depois de tudo carregado.
 import argparse
+from pathlib import PurePath
 
 from . import __version__, _paths, cli, runtime
 from .sdk import environments, loader, marketplace
@@ -30,6 +31,8 @@ def _json_safe(value):
         return value
     if isinstance(value, (list, tuple, set, frozenset)):
         return [_json_safe(item) for item in value]
+    if isinstance(value, PurePath):
+        return value.as_posix()  # a manifest for machines: `/` on every system
     return str(value)
 
 

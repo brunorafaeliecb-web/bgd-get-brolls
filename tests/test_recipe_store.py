@@ -13,6 +13,7 @@ from unittest.mock import patch
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: disable=unused-import
 from _paths import ROOT
 from _schemas import close
+from _symlink import needs_symlink
 
 from getbrolls import __version__, clients, layout, open_enums, recipes, renamed, runtime
 from getbrolls.errors import UsageError
@@ -287,7 +288,7 @@ class SealTests(RecipeCase):
             self.seal()
         self.assertFalse(self.slug_dir().exists())
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_linked_recipes_folder_is_refused(self):
         outside = self.tmp / "fora"
         outside.mkdir()
@@ -297,7 +298,7 @@ class SealTests(RecipeCase):
             self.seal()
         self.assertEqual([], list(outside.iterdir()))
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_linked_recipes_lock_is_never_followed(self):
         (self.client / "recipes").mkdir(exist_ok=True)
         target = self.tmp / "fora.lock"
@@ -471,7 +472,7 @@ class ShowAndListTests(RecipeCase):
         shown = recipes.show(REF)
         self.assertEqual((False, None), (shown["intact"], shown["recipe"]))
 
-    @unittest.skipIf(os.name == "nt", "symlink exige privilégio no Windows")
+    @needs_symlink
     def test_linked_component_is_a_problem(self):
         self.seal()
         target = self.writable(self.slug_dir() / "1" / "assets" / "sfx" / "whoosh.wav")
