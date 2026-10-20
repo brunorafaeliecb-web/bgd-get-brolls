@@ -210,7 +210,7 @@ _SALT_SETTLE_S = 5.0
 _SALT_SETTLE_WAIT_S = 0.05
 # Lock file of the salt repair where there is no `flock` (Windows); its name never matches `.log-salt*`.
 SALT_REPAIR_LOCK = ".getbrolls-salt.lock"
-# How long a repairer waits for another one that holds the folder (then repairs on its own).
+# How long a repairer waits for another one that holds the folder (then POSIX repairs on its own; Windows reads again).
 _SALT_LOCK_WAIT_S = 2.0
 # A `.tmp` of a salt whose unlink failed is swept by the next repair once it is this old.
 _SALT_TEMP_STALE_S = 60.0
@@ -306,21 +306,28 @@ def _create_salt(path, *, swap=False, wait_s=_SALT_LOCK_WAIT_S):
     (`swap`) is repaired under a `flock` on its folder (POSIX; `SALT_REPAIR_LOCK` without it), waited
     for up to `wait_s`: the first repairer moves it aside (`_set_aside`) and creates a new one by that
     same first-wins path, and every repairer then rereads the one file that persisted, never a salt of
-    its own."""
+    its own. A lock not taken (still busy after the wait, or on Windows a lock file that does not open or lock):
+    POSIX repairs anyway; Windows (a rename moves whatever is at `path`) leaves the file alone and returns
+    `("malformed", None)` for the caller to read again, so with a lock file that cannot be used it never repairs."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not swap:
         return _link_new_salt(path)
     # POSIX: `flock` on `$GB_HOME` itself; without it (Windows), a lock file of its own there, the way
-    # the project log's rotation does it. A lock still busy after the wait: repair anyway.
+    # the project log's rotation does it. A lock still busy after the wait: POSIX repairs anyway; on Windows
+    # only the holder may move the file, and a repairer without the lock reads again.
     if logs.fcntl is not None:
         lock = logs.folder_lock(path.parent, wait_s)
     else:
         lock = runtime.try_lock(path.parent / SALT_REPAIR_LOCK, wait_s)
-    with lock:
+    with lock as held:
         state, found = _inspect_salt(path)
         if state != "malformed":
             # Another repairer already put a good salt in place (or it is gone): use that one.
             return (state, found) if state == "ok" else _link_new_salt(path)
+        if not held and logs.fcntl is None:
+            # Windows, lock not taken: another repairer holds it (or it does not open). A rename moves whatever
+            # is at `path`, so only the holder may move it aside; this one reads again (`_settle_salt`).
+            return state, found
         _set_aside(path)
         return _link_new_salt(path)
 

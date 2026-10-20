@@ -9,6 +9,7 @@ failure that ended it (`last=`, `errno=`).
 
 import contextlib
 import errno
+import importlib
 import os
 import threading
 import unittest
@@ -31,6 +32,12 @@ def windows_error(winerror, number=errno.EACCES):
     error = PermissionError(number, "O arquivo está em uso por outro processo")
     error.winerror = winerror  # pyright: ignore[reportAttributeAccessIssue]  # POSIX has no such attribute
     return error
+
+
+def open_refusal():
+    """The `PermissionError` that CPython's `os.open` raises on Windows for a sharing or lock violation: the CRT
+    (`_wopen`) answers `EACCES` and the error carries no `winerror` (`os.replace` and `os.link` do carry one)."""
+    return PermissionError(errno.EACCES, "Permission denied")
 
 
 class SaltFailureCase(SaltCase):
@@ -206,7 +213,8 @@ class PassingFailureTests(SaltFailureCase):
     def test_a_set_aside_refused_for_good_is_not_tried_again(self):
         self.write_salt("zz-not-hex\n")
         with (
-            mock.patch.object(Path, "replace", side_effect=PermissionError(errno.EACCES, "no")) as replaced,
+            # 1314 (a privilege not held): a refusal that is no sharing violation on any OS
+            mock.patch.object(Path, "replace", side_effect=windows_error(1314)) as replaced,
             mock.patch.object(effects.time, "sleep") as slept,
             self.assertRaises(PermissionError),
         ):
@@ -319,6 +327,8 @@ class GivingUpTests(SaltFailureCase):
                 self.fresh_salts()
                 self.recorder.calls.clear()
                 with (
+                    # POSIX semantics: on Windows a plain EACCES is tried again (`OpenRefusalWithoutWinerrorTests`)
+                    mock.patch.object(_salt_read, "WINDOWS", False),
                     mock.patch.object(effects, "_new_salt_file", side_effect=OSError(number, name)),
                     mock.patch.object(effects.time, "sleep") as slept,
                 ):
@@ -379,7 +389,10 @@ class GivingUpTests(SaltFailureCase):
         self.write_salt("ab" * 32 + "\n")
         self.salt_file().chmod(0)
         self.addCleanup(self.salt_file().chmod, 0o600)
-        with mock.patch.object(effects.time, "sleep") as slept:
+        with (
+            mock.patch.object(_salt_read, "WINDOWS", False),  # a POSIX permission: pinned for a run with it forced on
+            mock.patch.object(effects.time, "sleep") as slept,
+        ):
             shown = target_of("Cliente Acme")
         self.assertRegex(shown, f"^{HASH}$")
         self.assertEqual([("unreadable", {"last": "unreadable", "errno": errno.EACCES})], self.lines())
@@ -456,7 +469,8 @@ class SaltReadModuleTests(unittest.TestCase):
     def test_which_errors_are_sharing_and_which_are_patient(self):
         self.assertEqual([True, True, True, False], [_salt_read.sharing(windows_error(n)) for n in (5, 32, 33, 87)])
         self.assertEqual([False, True, True, False], [_salt_read.patient(windows_error(n)) for n in (5, 32, 33, 87)])
-        self.assertFalse(_salt_read.sharing(PermissionError(errno.EACCES, "no winerror")))
+        with mock.patch.object(_salt_read, "WINDOWS", False):  # POSIX: a plain EACCES is a permission (Windows: below)
+            self.assertFalse(_salt_read.sharing(PermissionError(errno.EACCES, "no winerror")))
         self.assertFalse(_salt_read.patient(OSError(errno.EIO, "not even a PermissionError")))
 
     def test_a_retry_covers_access_denied_and_lock_violations_too(self):
@@ -491,6 +505,219 @@ class SaltReadModuleTests(unittest.TestCase):
         ):
             self.assertEqual(("again", None), _salt_read.why_unreadable(Path("sal")))
         closed.assert_called_once_with(99)
+
+
+class OpenRefusalWithoutWinerrorTests(SaltFailureCase):
+    """On Windows `os.open` reports a sharing violation as a plain `EACCES` (no `winerror`): the salt is read
+    again, never replaced by a salt of the process because another process held the file for a moment."""
+
+    def refusing_open(self, times):
+        """`os.open` that raises `open_refusal()` for the first `times` opens of the salt, then opens it."""
+        real_open, left = os.open, [times]
+
+        def refusing(path, flags, *args, **kwargs):
+            if Path(path).name == effects.SALT_FILE and left[0] > 0:
+                left[0] -= 1
+                raise open_refusal()
+            return real_open(path, flags, *args, **kwargs)
+
+        return mock.patch.object(_salt_read.os, "open", side_effect=refusing)
+
+    def test_a_windows_open_refusal_without_winerror_is_read_again_not_a_salt_of_its_own(self):
+        salt = "ab" * 32
+        self.write_salt(salt + "\n")
+        # Both refusals fall inside the read's own retries (`while_shared`): `why_unreadable` is not reached.
+        with (
+            mock.patch.object(_salt_read, "WINDOWS", True),
+            self.refusing_open(2),
+            mock.patch.object(_salt_read.time, "sleep"),
+        ):
+            settled = effects._settle_salt(self.salt_file())
+        self.assertEqual((bytes.fromhex(salt), "ok", effects._NOTHING), settled)
+        self.assertEqual([], self.warnings())
+        self.assertEqual(salt + "\n", self.salt_file().read_text(encoding="ascii"))  # never replaced
+
+    def test_a_refusal_that_outlasts_the_read_retries_is_read_again_by_the_look_of_why_unreadable(self):
+        salt = "ab" * 32
+        self.write_salt(salt + "\n")
+        # `SHARING_TRIES` refusals end the read as unreadable; the next one is the look of `why_unreadable`, which
+        # must say "again" (not "denied", a private salt); the second pass then reads the file.
+        with (
+            mock.patch.object(_salt_read, "WINDOWS", True),
+            self.refusing_open(effects._SHARING_TRIES + 1) as opened,
+            mock.patch.object(_salt_read.time, "sleep"),
+        ):
+            settled = effects._settle_salt(self.salt_file())
+        self.assertEqual((bytes.fromhex(salt), "ok", effects._NOTHING), settled)
+        self.assertEqual(effects._SHARING_TRIES + 2, opened.call_count)  # 5 refused reads, 1 refused look, 1 read
+        self.assertEqual([], self.warnings())
+
+    def test_a_windows_open_refusal_that_never_ends_gives_up_as_unreadable(self):
+        self.write_salt("ab" * 32 + "\n")
+        with (
+            mock.patch.object(_salt_read, "WINDOWS", True),
+            self.refusing_open(10_000) as opened,
+            mock.patch.object(_salt_read.time, "sleep"),
+        ):
+            settled = effects._settle_salt(self.salt_file())
+            settled_opens = opened.call_count
+            shown = target_of("Cliente Acme")
+        self.assertEqual((None, "unreadable", ("unreadable", errno.EACCES)), settled)  # its true reason, not `busy`
+        # Every pass: the read's `SHARING_TRIES` opens plus the look of `why_unreadable`; `SHARING_TRIES` passes.
+        self.assertEqual(effects._SHARING_TRIES * (effects._SHARING_TRIES + 1), settled_opens)
+        self.assertRegex(shown, f"^{HASH}$")
+        self.assertEqual([("unreadable", {"last": "unreadable", "errno": errno.EACCES})], self.lines())
+
+    def test_the_same_refusal_is_final_where_it_cannot_be_a_sharing_violation(self):
+        self.write_salt("ab" * 32 + "\n")
+        with (
+            mock.patch.object(_salt_read, "WINDOWS", False),
+            self.refusing_open(10_000) as opened,
+            mock.patch.object(_salt_read.time, "sleep"),
+        ):
+            settled = effects._settle_salt(self.salt_file())
+        self.assertEqual((None, "unreadable", ("unreadable", errno.EACCES)), settled)
+        self.assertEqual(2, opened.call_count)  # the read and the one look of `why_unreadable`: no retry anywhere
+
+    def test_what_may_be_a_sharing_violation_on_windows(self):
+        cases = (
+            (open_refusal(), True, True),
+            (open_refusal(), False, False),
+            (PermissionError(errno.EPERM, "Operation not permitted"), True, False),
+            (windows_error(5), False, True),
+            (windows_error(32), False, True),
+            (windows_error(1314), True, False),
+            (OSError(errno.EIO, "not a PermissionError"), True, False),
+        )
+        for error, windows, expected in cases:
+            with self.subTest(error=repr(error), windows=windows), mock.patch.object(_salt_read, "WINDOWS", windows):
+                self.assertIs(expected, _salt_read.sharing(error))
+        with mock.patch.object(_salt_read, "WINDOWS", True):
+            self.assertFalse(_salt_read.patient(open_refusal()))  # ambiguous: a handful of tries, not the budget
+
+    def test_why_an_open_refusal_without_winerror_is_again_only_on_windows(self):
+        with mock.patch.object(_salt_read, "open_salt", side_effect=open_refusal()):
+            with mock.patch.object(_salt_read, "WINDOWS", True):
+                self.assertEqual(("again", errno.EACCES), _salt_read.why_unreadable(Path("sal")))
+            with mock.patch.object(_salt_read, "WINDOWS", False):
+                self.assertEqual(("denied", errno.EACCES), _salt_read.why_unreadable(Path("sal")))
+
+    def test_a_create_refused_without_winerror_on_windows_is_tried_again_then_readonly(self):
+        with (
+            mock.patch.object(_salt_read, "WINDOWS", True),
+            mock.patch.object(effects, "_new_salt_file", side_effect=open_refusal()),
+            mock.patch.object(effects.time, "sleep") as slept,
+        ):
+            shown = target_of("Cliente Acme")
+        self.assertRegex(shown, f"^{HASH}$")
+        self.assertEqual([("readonly", {"last": "create", "errno": errno.EACCES})], self.lines())
+        self.assertEqual(effects._SHARING_TRIES - 1, slept.call_count)  # a handful of passes, never the budget
+
+    @unittest.skipUnless(os.name == "nt", "Windows share modes")
+    def test_a_salt_another_handle_holds_for_delete_is_read_when_the_handle_closes(self):
+        winapi = importlib.import_module("_winapi")  # Windows only: not imported statically
+        salt = "cd" * 32
+        self.write_salt(salt + "\n")
+        # DELETE access, shared with everyone: what a rename or a delete of the file holds for a moment.
+        handle = winapi.CreateFile(str(self.salt_file()), 0x00010000, 7, 0, 3, 0, 0)
+        open_handles = [
+            handle
+        ]  # closed once: by the first wait of the retry, or by the cleanup if the test fails first
+
+        def close():
+            if open_handles:
+                winapi.CloseHandle(open_handles.pop())
+
+        self.addCleanup(close)
+        with self.assertRaises(PermissionError) as refused:
+            os.close(os.open(self.salt_file(), os.O_RDONLY))
+        self.assertIsNone(getattr(refused.exception, "winerror", None))  # the shape the fix depends on
+        self.assertEqual(errno.EACCES, refused.exception.errno)
+        # The other process lets go during the read's first wait: no timer, nothing to race.
+        with mock.patch.object(_salt_read.time, "sleep", side_effect=lambda _seconds: close()) as slept:
+            settled = effects._settle_salt(self.salt_file())
+        self.assertEqual(1, slept.call_count)
+        self.assertEqual((bytes.fromhex(salt), "ok", effects._NOTHING), settled)
+        self.assertEqual([], self.warnings())
+
+
+class RepairWithoutTheWindowsLockTests(SaltFailureCase):
+    """On Windows a rename moves whatever is at the path, so only the process that holds the repair lock may
+    move the malformed file aside; one that did not get the lock reads again."""
+
+    MALFORMED = "zz-not-hex\n"
+
+    def lockless_repairer(self):
+        """`(no flock, the repair lock already held by another party)`: the shape of Windows, on any OS."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(effects.logs, "fcntl", None))
+        self.home.mkdir(exist_ok=True)
+        held = stack.enter_context(effects.runtime.try_lock(self.home / effects.SALT_REPAIR_LOCK, 0))
+        self.assertTrue(held)  # party 1 holds it
+        return stack
+
+    def test_a_repairer_without_the_windows_lock_never_moves_the_file_aside(self):
+        self.write_salt(self.MALFORMED)
+        with (
+            self.lockless_repairer(),
+            mock.patch.object(effects, "_set_aside", wraps=effects._set_aside) as set_aside,  # the real one
+        ):
+            repaired = effects._create_salt(self.salt_file(), swap=True, wait_s=0.05)  # party 2
+        self.assertEqual(("malformed", None), repaired)
+        self.assertEqual(0, set_aside.call_count)
+        self.assertEqual(self.MALFORMED, self.salt_file().read_text(encoding="ascii"))
+        # The lock file is the repair protocol's own and stays (it is on POSIX too, here): not a leftover.
+        self.assertEqual([effects.SALT_FILE], [n for n in visible_names(self.home) if n != effects.SALT_REPAIR_LOCK])
+
+    def test_a_repairer_that_found_a_good_salt_or_none_does_not_need_the_lock(self):
+        good = "ab" * 32
+        with self.lockless_repairer():
+            self.assertEqual(("ok", bytes.fromhex(good)), self.create_over(good + "\n"))  # won by another
+        self.salt_file().unlink()
+        with self.lockless_repairer():
+            state, salt = self.create_over(None)  # gone: a first-wins link, never a move
+        self.assertEqual("ok", state)
+        self.assertEqual(salt, self.persisted())
+
+    def create_over(self, text):
+        if text is not None:
+            self.write_salt(text)
+        return effects._create_salt(self.salt_file(), swap=True, wait_s=0.05)
+
+    def test_a_repairer_without_the_lock_does_not_move_a_salt_another_repairer_just_linked(self):
+        """The interleaving: this one inspected the malformed file, then the holder moved it aside and linked a
+        good salt, then this one's rename would have moved that salt (and its sweep removed it)."""
+        self.write_salt(self.MALFORMED)
+        holder_salt = "ef" * 32
+        real_inspect, holder = effects._inspect_salt, {"ran": False}
+
+        def holder_wins_after_the_last_inspect(path, *args, **kwargs):
+            seen = real_inspect(path, *args, **kwargs)
+            if seen[0] == "malformed" and "tries" in kwargs and not holder["ran"]:  # `_set_aside`'s look
+                holder["ran"] = True
+                path.replace(path.with_name(path.name + ".bad-holder"))
+                path.write_text(holder_salt + "\n", encoding="ascii")
+            return seen
+
+        with (
+            self.lockless_repairer(),
+            mock.patch.object(effects, "_inspect_salt", holder_wins_after_the_last_inspect),
+        ):
+            repaired = effects._create_salt(self.salt_file(), swap=True, wait_s=0.05)
+        self.assertEqual(("malformed", None), repaired)  # it never got as far as the rename
+        self.assertFalse(holder["ran"])
+        self.assertEqual(self.MALFORMED, self.salt_file().read_text(encoding="ascii"))
+
+    def test_the_lock_less_repairers_of_a_settle_give_up_as_busy_and_leave_the_file_alone(self):
+        self.write_salt(self.MALFORMED)
+        with (
+            self.lockless_repairer(),
+            mock.patch.object(effects, "_SALT_LOCK_WAIT_S", 0.001),
+            mock.patch.object(effects.time, "sleep"),
+        ):
+            settled = effects._settle_salt(self.salt_file())
+        self.assertEqual((None, "busy", ("malformed", None)), settled)
+        self.assertEqual(self.MALFORMED, self.salt_file().read_text(encoding="ascii"))
 
 
 if __name__ == "__main__":

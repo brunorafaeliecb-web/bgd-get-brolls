@@ -144,6 +144,8 @@ class SaltSharingViolationTests(SaltCase):
 
     @staticmethod
     def sharing_violation():
+        # This shape (a `winerror`) is what `os.replace` and `os.link` raise; CPython's `os.open` on Windows raises a
+        # plain EACCES with no `winerror` (see `OpenRefusalWithoutWinerrorTests`). Kept: the retry logic is the same.
         error = PermissionError(errno.EACCES, "O arquivo está em uso por outro processo")
         error.winerror = 32  # pyright: ignore[reportAttributeAccessIssue]  # set by hand: POSIX has no such attribute
         return error
@@ -176,8 +178,9 @@ class SaltSharingViolationTests(SaltCase):
 
     def test_a_permission_error_that_is_no_sharing_violation_is_not_tried_again(self):
         self.write_salt("ab" * 32 + "\n")
-        denied = PermissionError(errno.EACCES, "Permission denied")  # no `winerror`: a real EACCES
+        denied = PermissionError(errno.EACCES, "Permission denied")  # no `winerror`: a real EACCES (POSIX)
         with (
+            mock.patch.object(_salt_read, "WINDOWS", False),  # on Windows this shape may be a sharing violation
             mock.patch.object(effects.os, "open", side_effect=denied) as opened,
             mock.patch.object(effects.time, "sleep") as slept,
         ):

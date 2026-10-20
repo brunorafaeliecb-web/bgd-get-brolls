@@ -1,6 +1,12 @@
 """Reading the log salt (`effects` creates and repairs it): the file name, how a salt is told from a partial
 or a malformed text, how a Windows sharing violation is waited out, and what a failed read means.
 
+What a Windows sharing violation looks like depends on the call. `os.replace`, `os.link`, `os.unlink` and
+`os.stat` raise a `PermissionError` with a `winerror` (5, 32, 33). CPython's `os.open` goes through the C
+runtime (`_wopen`), which turns the same violations into a plain `EACCES` and the error carries no
+`winerror`: an open refused by another process's handle cannot be told from a real denial, so on Windows
+it is read again a few times (`sharing`) and, if it does not pass, taken for a denial.
+
 Nothing here writes: the writes, the repair protocol and the policy of what to do when it fails stay in
 `effects.py`, which is where the side-effect guard looks.
 """
@@ -11,6 +17,7 @@ import re
 import stat
 import time
 
+WINDOWS = os.name == "nt"
 SALT_FILE = ".log-salt"
 SALT_HEX = re.compile(r"[0-9a-f]{64}")
 SALT_PARTIAL = re.compile(r"[0-9a-f]{0,63}")
@@ -27,9 +34,23 @@ SHARING_WINERRORS = frozenset({5, 32, 33})
 PATIENT_WINERRORS = frozenset({32, 33})
 
 
+def unattributed(exc):
+    """Is `exc` the `EACCES` that `os.open` raises on Windows with no `winerror`: a sharing violation, a lock
+    violation or a real denial, the call does not say which?"""
+    return (
+        WINDOWS
+        and isinstance(exc, PermissionError)
+        and getattr(exc, "winerror", None) is None
+        and exc.errno == errno.EACCES
+    )
+
+
 def sharing(exc):
-    """Is `exc` a Windows `PermissionError` that may be another process holding the file?"""
-    return isinstance(exc, PermissionError) and getattr(exc, "winerror", None) in SHARING_WINERRORS
+    """Is `exc` a `PermissionError` that may be another process holding the file: a `winerror` of
+    `SHARING_WINERRORS`, or on Windows an `unattributed` one?"""
+    return isinstance(exc, PermissionError) and (
+        getattr(exc, "winerror", None) in SHARING_WINERRORS or unattributed(exc)
+    )
 
 
 def patient(exc):
@@ -101,11 +122,14 @@ def inspect_salt(path, tries=SALT_READ_TRIES):
 def why_unreadable(path):
     """`(kind, errno)` for a salt that read as `unreadable`, from opening it once more: `busy` (a sharing or
     lock violation, another process has it), `denied` (a permission that no wait changes), `link` (it became
-    one) or `again` (it vanished mid-rename, a descriptor or interrupt error, or it opens now: it was passing)."""
+    one) or `again` (it vanished mid-rename, a descriptor or interrupt error, it opens now: it was passing, or
+    it was refused the way `os.open` reports a sharing violation on Windows: `unattributed`, read again a few times)."""
     try:
         fd = open_salt(path)
     except PermissionError as exc:
-        return ("busy" if patient(exc) else "denied"), exc.errno
+        if patient(exc):
+            return "busy", exc.errno
+        return ("again" if unattributed(exc) else "denied"), exc.errno
     except OSError as exc:
         return ("link" if exc.errno in (errno.ELOOP, errno.EMLINK) else "again"), exc.errno
     if fd is None:
