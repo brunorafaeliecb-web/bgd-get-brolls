@@ -386,16 +386,23 @@ def ffmpeg_pin(tmp):
     return str(shim)
 
 
+LOCAL_APP_DATA = "userhome/AppData/Local"
+
+
 def hermetic_env(tmp, bare=False):
     """Ambiente fechado da rodada; `bare` tira os pins do ffmpeg (doctor e providers sem ferramenta)."""
-    for name in ("bin", "userhome", "gbhome", "cache", "runtime", "tmp"):
+    for name in ("bin", "userhome", "gbhome", "cache", "runtime", "tmp", LOCAL_APP_DATA):
         (tmp / name).mkdir(parents=True, exist_ok=True)
+    (tmp / LOCAL_APP_DATA / "Temp").mkdir(exist_ok=True)
     # `.env` vazio por GB_ENV_FILE: o `.env` do checkout (com chaves de API) nunca entra no ouro.
     (tmp / "vazio.env").touch()
     env = {
         "PATH": str(tmp / "bin"),
         "HOME": str(tmp / "userhome"),
         "USERPROFILE": str(tmp / "userhome"),
+        # O perfil fechado também no Windows: o `/restore` do `make_private` grava seu texto em
+        # `%LOCALAPPDATA%\\Temp` (nunca no `TEMP`); sem ele, a ACL da rodada fica pela metade e a linha sai `error`.
+        "LOCALAPPDATA": str(tmp / LOCAL_APP_DATA),
         "GB_HOME": str(tmp / "gbhome"),
         "GB_CACHE_DIR": str(tmp / "cache"),
         "GB_RUNTIME_DIR": str(tmp / "runtime"),

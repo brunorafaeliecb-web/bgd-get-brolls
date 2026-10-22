@@ -860,6 +860,14 @@ class NormalizerTests(unittest.TestCase):
         self.assertEqual(str(self.tmp / "vazio.env"), env["GB_ENV_FILE"])
         self.assertEqual(b"", (self.tmp / "vazio.env").read_bytes())
 
+    def test_hermetic_env_gives_a_closed_profile_temporary_folder_never_the_callers(self):
+        with unittest.mock.patch.dict(os.environ, {"LOCALAPPDATA": "/real/AppData/Local"}):
+            env = _golden.hermetic_env(self.tmp)
+        local = self.tmp / "userhome" / "AppData" / "Local"
+        self.assertEqual(str(local), env["LOCALAPPDATA"])
+        self.assertTrue((local / "Temp").is_dir())
+        self.assertEqual(env["USERPROFILE"], str(local.parent.parent))
+
     def test_hermetic_env_keeps_coverage_measurement_and_nothing_else(self):
         # Sem a variável o filho sai do gate de cobertura; com ela, só ela passa.
         clean = {key: value for key, value in os.environ.items() if key != "COVERAGE_PROCESS_START"}
