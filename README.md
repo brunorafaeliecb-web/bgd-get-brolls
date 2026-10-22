@@ -109,7 +109,7 @@ getbrolls setup --check
 
 `pipx install git+https://github.com/engenheirodevideo/get-brolls@v2.6.0` também serve. Os exemplos deste README usam o comando `getbrolls …`. Num clone, sem instalar o pacote, `python3 scripts/gb.py …` roda os mesmos comandos (no Windows, `python scripts/gb.py …`; de outra pasta, use o caminho absoluto de `scripts/gb.py`). O `.env` do pacote fica em `$GB_HOME/.env`, e o runtime em `$GB_HOME/runtime/`. Quem usa o plugin do Claude Code não precisa mudar nada.
 
-#### Instalação como plugin do Codex e Outros
+#### Instalação como skill do Codex, do Claude Code e de outros agentes
 
 ```sh
 git clone https://github.com/engenheirodevideo/get-brolls.git
@@ -120,8 +120,9 @@ cd get-brolls
 |---|---|---|---|
 | Codex | `~/.agents/skills/get-brolls/` | `.agents/skills/get-brolls/` | `$get-brolls` |
 | Claude Code | `~/.claude/skills/get-brolls/` | `.claude/skills/get-brolls/` | `/get-brolls` |
+| Outros agentes | a pasta de skills do agente | a pasta de skills do projeto, se houver | pelo nome, `get-brolls` |
 
-Ao copiar uma pasta de desenvolvimento, exclua `.venv/`, `.tools/`, caches, projetos e arquivos privados. `skills/` e `.claude-plugin/` são artefatos do plugin do Claude Code e podem ser omitidos ao copiar para o Codex. Instale as dependências no destino final e abra uma nova sessão do agente. [Veja instalação, atualização e compatibilidade.](docs/GUIDE.md#instalação)
+Ao copiar uma pasta de desenvolvimento, exclua `.venv/`, `.tools/`, caches, projetos e arquivos privados. `skills/` e `.claude-plugin/` são artefatos do plugin do Claude Code e podem ser omitidos ao copiar para o Codex. Instale as dependências no destino final e abra uma nova sessão do agente. **Outros agentes:** clone como skill e rode `python3 <caminho-absoluto>/scripts/gb.py setup --check`, depois `setup` e `doctor`; não existe `${CLAUDE_PLUGIN_ROOT}` nem comando de barra fora do Claude Code, então peça o passo em palavras. Antes de rodar, o agente diz o que o `setup` faz (baixa do PyPI e do npm para `$GB_HOME/runtime`, sem tocar em instalações globais) e, se o host recusar um comando ou pedir elevação, para e entrega o comando à pessoa. Ele precisa de um shell com Python 3.11+, FFmpeg, curl e Node 22+ com npx. [Veja instalação, atualização e compatibilidade.](docs/GUIDE.md#instalação)
 ### 2. Prepare o ambiente
 
 Na pasta instalada da skill, use o instalador do seu sistema.
@@ -137,10 +138,12 @@ python3 scripts/gb.py doctor
 Windows PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/install.ps1 -Check
-powershell -ExecutionPolicy Bypass -File scripts/install.ps1
+powershell -ExecutionPolicy RemoteSigned -File scripts/install.ps1 -Check
+powershell -ExecutionPolicy RemoteSigned -File scripts/install.ps1
 python scripts/gb.py doctor
 ```
+
+No Windows, uma pasta que veio de um zip baixado pode precisar de `Unblock-File -Path scripts\*.ps1` uma vez, por conta da pessoa; nada aqui altera a política de execução da máquina.
 
 Aqui o comando é o script da pasta instalada: o `getbrolls` do `PATH`, se houver, pode ser outra instalação. O instalador chama o `setup`, que instala as versões registradas de yt-dlp/EJS e Playwright CLI em `$GB_HOME/runtime`, fora da pasta da skill. `--check` só valida pré-requisitos (Python, FFmpeg/ffprobe, Node, curl, Git) e não instala nada; rode-o antes do instalador completo para saber o que falta. `doctor` confere a disponibilidade das ferramentas depois de instaladas; o acesso a cada fonte depende da URL e, quando necessário, da sua sessão de navegador.
 
@@ -178,7 +181,7 @@ Se você nunca abriu um terminal, esta é a lista inteira. Todos os passos são 
 3. **Responda à entrevista.** O agente faz no máximo sete perguntas, uma por vez. "Tanto faz" é resposta válida: ele assume um padrão e mostra o que assumiu. Se preferir chamar direto, use `/getbrolls:get-brolls-brief`.
 4. **Confira o brief.** Ele devolve em cinco linhas o que entendeu e pergunta "fecho assim?". Corrija ali mesmo.
 5. **Olhe a shortlist.** Antes de baixar qualquer coisa, ele lista de 5 a 8 candidatos com título, autor e o trecho exato. Diga quais servem.
-6. **Aprove as prévias.** Ou pelo chat ("aprovei todos", ou nomeando quais), ou pelo Storyboard: peça `/getbrolls:get-brolls-review`, ele te manda um link, você clica em Aprovar / Pedir ajuste / Reprovar e em **Salvar decisões**, e volta para dizer que salvou. Sem essa etapa, nada é baixado.
+6. **Aprove as prévias.** Ou pelo chat ("aprovei todos", ou nomeando quais), ou pelo Storyboard: peça `/getbrolls:get-brolls-review`, ele te manda um link, você clica em Aprovar / Pedir ajuste / Reprovar e em **Salvar decisões**, e volta para dizer que salvou. Sem essa etapa, o corte final não sai.
 7. **Diga de quem é o material.** O agente registra as condições de uso com o que você informar. Quem responde pelas condições é você; ele só registra o que foi dito e de onde veio cada arquivo.
 8. **Receba.** Os cortes saem em `entrega/`, uma pasta por trecho, com um `ORIGEM.md` dizendo de onde veio cada um.
 9. **Perdeu o fio?** Peça `/getbrolls:get-brolls-status`: ele diz em que pé está e qual é o próximo passo.
@@ -269,7 +272,7 @@ O comando `review` gera `brolls/review.html`: uma página local para avaliar a c
 
 A galeria permanece estática; a animação acontece no quadro selecionado e respeita a preferência por movimento reduzido. Um print opcional da pessoa serve de contexto e permanece estático. Para avaliar uma composição pronta do mesmo insert, use `GB_GIF_SCOPE=full` com `--full-preview-file`.
 
-Compartilhe a pasta **`brolls/` completa**, para manter as imagens e os GIFs acessíveis. Para continuar editando ou regenerar prévias, preserve também os originais e `.getbrolls-sources/`. [Detalhes da revisão.](docs/GUIDE.md#storyboard)
+Para só mostrar o Storyboard, compartilhe o pacote mínimo: `brolls/review.html` com a pasta `brolls/previews/` ao lado, para as imagens e os GIFs continuarem acessíveis. Não envie a pasta `brolls/` inteira: ela guarda logs e diagnósticos. Para continuar editando ou regenerar prévias, preserve também os originais e `.getbrolls-sources/`. [Detalhes da revisão.](docs/GUIDE.md#storyboard)
 
 ## Fontes
 

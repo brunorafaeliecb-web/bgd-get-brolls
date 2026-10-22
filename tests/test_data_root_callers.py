@@ -167,7 +167,16 @@ class RuntimeDirTests(unittest.TestCase):
             self.assertEqual(playwright, commands._local_playwright(tmp))  # pylint: disable=protected-access
 
 
-class MissingToolTests(unittest.TestCase):
+class WithoutYtdlpPinCase(unittest.TestCase):
+    """A suíte fixa `GB_YTDLP_PATH` num yt-dlp de mentira (`_isolation`); aqui é a falta do yt-dlp que se testa."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(patch.dict(os.environ))
+        os.environ.pop("GB_YTDLP_PATH", None)
+
+
+class MissingToolTests(WithoutYtdlpPinCase):
     def test_missing_ffmpeg_is_a_prerequisite_error(self):
         with self.assertRaises(PrerequisiteError) as caught:
             media.run(["ffmpeg-inexistente-getbrolls"])
@@ -194,8 +203,9 @@ class MissingToolTests(unittest.TestCase):
         self.assertIn("python3 scripts/gb.py doctor", str(caught.exception))
 
 
-class WheelMessageTests(unittest.TestCase):
+class WheelMessageTests(WithoutYtdlpPinCase):
     def setUp(self):
+        super().setUp()
         base = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, base, ignore_errors=True)
         wheel = _relocated_wheel(base)

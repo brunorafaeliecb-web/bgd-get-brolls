@@ -570,6 +570,7 @@ def _write_store(home: Path, data: dict) -> None:
         fd, tmp = tempfile.mkstemp(prefix=f".{TRUST_FILE}.", dir=home)
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+                effects.make_private(tmp)  # inside: Ctrl-C during the wait closes the file and removes it
                 json.dump(data, stream, ensure_ascii=False, indent=2, sort_keys=True)
                 stream.write("\n")
             Path(tmp).chmod(0o600)

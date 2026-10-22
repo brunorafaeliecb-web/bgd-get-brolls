@@ -135,11 +135,15 @@ def _private_folder(folder):
     folder of this user is tightened to 0700. Never follows a link (`O_NOFOLLOW`; on
     Windows, an `lstat`).
     """
+    made = not folder.parent.is_dir()  # lenient: only a folder made here gets the private ACL on Windows
     # effect-exempt: getbrolls.log handler itself; an op line from inside it would recurse into it
     folder.parent.mkdir(mode=_PRIVATE_DIR_MODE, parents=True, exist_ok=True)
+    if made:
+        runtime.make_private(folder.parent, record=False)  # no line: the handler cannot log itself
     with contextlib.suppress(FileExistsError):
         # effect-exempt: getbrolls.log handler itself; an op line from inside it would recurse into it
         folder.mkdir(mode=_PRIVATE_DIR_MODE)
+        runtime.make_private(folder, record=False)
     if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):
         info = os.lstat(folder)
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or getattr(info, "st_reparse_tag", 0):
@@ -178,6 +182,8 @@ def _open_private(path):
             raise _refused_place(path, "not a regular file")
         if os.name != "nt" and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) != _PRIVATE_FILE_MODE:
             os.fchmod(fd, _PRIVATE_FILE_MODE)
+        if info.st_size == 0:  # new (or still empty): the private ACL on Windows, before the first line
+            runtime.make_private(path, record=False)
         # effect-exempt: getbrolls.log handler itself; an op line from inside it would recurse into it
         return os.fdopen(fd, "a", encoding="utf-8", newline="\n")
     except BaseException:

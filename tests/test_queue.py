@@ -188,7 +188,9 @@ class QueueStateTests(unittest.TestCase):
             self.assertIsNone(plain["cooldown"])
             got = queue.next_item(data, at=at, rng=rng())
             challenge = queue.mark(data, got["item"]["id"], "skipped", reason="login challenge", at=at)
-            self.assertEqual(1800, challenge["cooldown"]["seconds"])
+            # A login challenge is not a wait: no cooldown, the provider stops (tests/test_queue_refusal.py).
+            self.assertIsNone(challenge["cooldown"])
+            self.assertEqual("access_refused", challenge["stop"]["kind"])
         with self.assertRaises(ValueError):
             queue.mark(data, "instagram:missing", "done", at=at)
 

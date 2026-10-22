@@ -62,10 +62,17 @@ INSTALL_NOTES = ("README.md", "README.en.md", "docs/MANUAL.md", "docs/GUIDE.md")
 # Seções dos documentos de entrada que são procedimentos pela pasta da instalação (clone ou plugin): rodam o
 # script dela, nunca o `getbrolls` do PATH, que pode ser outra instalação. Fora delas, só a nota de instalação.
 CHECKOUT_SECTIONS = {
-    "README.md": ("2. Prepare o ambiente",),
-    "README.en.md": ("2. Prepare the environment",),
-    # Clone como skill de Codex e Claude Code, pelo caminho absoluto da pasta; e o plugin, pela raiz dele.
-    "docs/GUIDE.md": ("macOS", "Windows", "Codex e Claude Code", "Plugin do Claude Code — 2.3.6"),
+    "README.md": ("2. Prepare o ambiente", "Instalação como skill do Codex, do Claude Code e de outros agentes"),
+    "README.en.md": ("1. Add the skill to your agent", "2. Prepare the environment"),
+    # Clone como skill (Codex, Claude Code e outros agentes), pelo caminho absoluto da pasta; o plugin, pela raiz
+    # dele; e a permissão opcional, que escreve o caminho da instalação.
+    "docs/GUIDE.md": (
+        "macOS",
+        "Windows",
+        "Codex, Claude Code e outros agentes",
+        "Plugin do Claude Code — 2.3.6",
+        "Permissões (opcional)",
+    ),
     "docs/MANUAL.md": (),
 }
 # Um bloco de código que roda o instalador do clone; o resto da seção confere o resultado com o script do clone.

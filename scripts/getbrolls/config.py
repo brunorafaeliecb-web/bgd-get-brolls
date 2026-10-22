@@ -84,6 +84,14 @@ PROCESS_ONLY_KEYS = frozenset({"GB_ENV_FILE", "GB_PROFILE", "GB_PROFILE_SHA256"}
 # processo filho que nunca fala com um provedor.
 SECRET_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET")
 
+# Quem sobe o servidor de fundo (`serve.start_background`) põe isto no ambiente do filho, já sem os segredos
+# (`SECRET_ENV_SUFFIXES`). O filho também lê o `.env` ao subir; com o marcador, o comando `serve` não traz de volta as
+# chaves de segredo que o pai tirou (`load_environment`). As demais configurações do `.env` valem como em qualquer
+# processo. O valor é uma senha de uso interno, conferida por igualdade: a variável exportada à mão (`=0`, `=1`) não
+# faz nenhum outro comando perder as chaves.
+SERVE_CHILD_ENV = "GETBROLLS_SERVE_LOG_FILTER"
+SERVE_CHILD_TOKEN = "serve-child"  # noqa: S105 - marcador interno, não é senha
+
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 # Optional pins: an explicit path always wins over the usual discovery.
@@ -386,14 +394,20 @@ def _refuse_env_entries(entries, source, path=None):
             )
 
 
-def load_env(path, *, source=None):
+def is_serve_child(args):
+    """Este processo é o servidor de fundo: o comando é `serve` e o pai pôs a senha do marcador no ambiente."""
+    return getattr(args, "command", None) == "serve" and os.environ.get(SERVE_CHILD_ENV) == SERVE_CHILD_TOKEN
+
+
+def load_env(path, *, source=None, withhold_secrets=False):
     """Lê o `.env`: chaves do core (`KEYS`) vão para o ambiente do processo, como
     sempre; as de `permissions.env` de plugins instalados ficam só em `_PLUGIN_ENV`,
     lidas por `api.env` do plugin dono, nunca exportadas. As do core entram primeiro —
     `GB_HOME` no próprio `.env` decide em qual `plugins/` procurar os manifestos
     (menos no `.env` de `$GB_HOME`, onde ele é recusado: `source == "gb_home"`).
     Chave que ninguém declara é erro. Devolve as chaves do core que valeram deste arquivo
-    (as que o ambiente do processo já tinha ficam de fora: o processo vence)."""
+    (as que o ambiente do processo já tinha ficam de fora: o processo vence). Com `withhold_secrets` (o servidor de
+    fundo), as chaves com sufixo de segredo (`SECRET_ENV_SUFFIXES`) não entram no ambiente."""
     _PLUGIN_ENV.clear()
     path = Path(path)
     if not strict_is_file(path):
@@ -404,7 +418,7 @@ def load_env(path, *, source=None):
     applied = set()
     _note_home_ignored(entries, path, typed)
     for _number, key, value in entries:
-        if key not in KEYS:
+        if key not in KEYS or (withhold_secrets and key.endswith(SECRET_ENV_SUFFIXES)):
             continue
         if key not in os.environ:
             os.environ[key] = value
@@ -449,7 +463,7 @@ def _old_name_hint(key):
 _OUTPUT_IGNORED = "GB_OUTPUT só aceita `json`; o valor dado é ignorado e a saída continua JSON."
 
 
-def load_env_choice(choice, *, warn):
+def load_env_choice(choice, *, warn, withhold_secrets=False):
     """Carrega o `.env` escolhido por `_paths.env_file()`; com `warn`, registra os avisos.
 
     A origem do `.env` não vira aviso em todo comando: ela fica em `install.env_file`
@@ -458,7 +472,7 @@ def load_env_choice(choice, *, warn):
     if choice.path is None:
         _PLUGIN_ENV.clear()
         return
-    core_keys = load_env(choice.path, source=choice.source)
+    core_keys = load_env(choice.path, source=choice.source, withhold_secrets=withhold_secrets)
     if not warn:
         return
     from .runtime import record_warning
@@ -484,7 +498,7 @@ def load_environment(args, *, warn):
     active = profile.activate(args)
     profile.check_home_files()
     choice = _paths.env_file(getattr(args, "env_file", None))
-    load_env_choice(choice, warn=warn)
+    load_env_choice(choice, warn=warn, withhold_secrets=is_serve_child(args))
     profile.finish(active)
     if warn and cache_dir_alias_in_use():
         from .runtime import record_warning

@@ -95,6 +95,10 @@ class UrlRefusalTests(QuietCase):
         cases = {
             "https://[::1/secret": "invalid_url",
             "https://segredo.example.org:99999/x": "invalid_url",
+            "https://segredo.example.org/a\x00b": "invalid_url",
+            "https://segredo.example.org/a\x1fb": "invalid_url",
+            "https://segredo.example.org/a\x7fb": "invalid_url",
+            "https://segredo.example.org/a\tb": "invalid_url",
             "ftp://segredo.example.org/x": "scheme_or_host_invalid",
             "http://segredo.example.org/x": "scheme_or_host_invalid",
             "https:///segredo": "scheme_or_host_invalid",
@@ -296,18 +300,58 @@ class DownloadEdgeTests(QuietCase):
 
     def test_an_ip_literal_url_goes_to_curl_without_resolve(self):
         conf = write_conf(self.root / "v.conf", "https://93.184.216.34/v")
-        commands = []
+        commands, inputs = [], []
 
-        def ok(cmd, **_kwargs):
+        def ok(cmd, **kwargs):
             commands.append(cmd)
+            inputs.append(kwargs.get("input"))
             Path(cmd[cmd.index("--output") + 1]).write_bytes(b"midia")
             return subprocess.CompletedProcess(cmd, 0)
 
         with patch.object(ig.subprocess, "run", side_effect=ok):
             self.assertEqual("downloaded", self.download(conf))
         self.assertNotIn("--resolve", commands[0])
-        self.assertEqual("https://93.184.216.34/v", commands[0][-1])
+        self.assertEqual(b'url = "https://93.184.216.34/v"\n', inputs[0])
         self.assertEqual(b"midia", self.part.read_bytes())
+
+    def run_download(self, url):
+        """Baixa `url` com um curl de mentira e devolve (argv, stdin, kwargs) da chamada."""
+        conf = write_conf(self.root / "v.conf", url)
+        seen = {}
+
+        def ok(cmd, **kwargs):
+            seen.update(cmd=cmd, input=kwargs.get("input"), kwargs=kwargs)
+            Path(cmd[cmd.index("--output") + 1]).write_bytes(b"midia")
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with patch.object(ig.subprocess, "run", side_effect=ok):
+            self.assertEqual("downloaded", self.download(conf))
+        return seen["cmd"], seen["input"], seen["kwargs"]
+
+    def test_the_signed_url_reaches_curl_on_stdin_and_never_in_the_argument_list(self):
+        url = "https://media.example.test/v.mp4?oe=6A1B2C3D&oh=ASSINATURA-SECRETA&bytestart=0"
+        cmd, stdin, _kwargs = self.run_download(url)
+        self.assertFalse(any("ASSINATURA-SECRETA" in arg or url in arg for arg in cmd), cmd)
+        self.assertFalse(any(arg.startswith("http") for arg in cmd), cmd)
+        self.assertEqual(["--config", "-"], cmd[-2:])
+        self.assertEqual(f'url = "{url}"\n'.encode(), stdin)
+
+    def test_curl_skips_the_user_curlrc_with_q_as_its_first_option(self):
+        cmd, _stdin, _kwargs = self.run_download("https://media.example.test/v.mp4?oe=1")
+        self.assertEqual(["curl", "-q"], cmd[:2])
+        self.assertEqual(1, cmd.count("-q"))
+
+    def test_the_stdin_config_keeps_the_options_and_the_pin_of_the_transfer(self):
+        cmd, _stdin, _kwargs = self.run_download("https://media.example.test/v.mp4?oe=1")
+        for option, value in (("--proto", "=https"), ("--retry", "2"), ("--max-time", "180")):
+            self.assertEqual(value, cmd[cmd.index(option) + 1])
+        self.assertIn("--fail", cmd)
+        self.assertEqual("media.example.test:443:93.184.216.34", cmd[cmd.index("--resolve") + 1])
+
+    def test_a_quote_and_a_backslash_in_the_url_are_escaped_for_the_curl_config(self):
+        self.assertEqual(b'url = "https://h.example/a\\"b\\\\c"\n', ig.curl_config_input('https://h.example/a"b\\c'))
+        self.assertEqual(b'url = "https://h.example/\\tx"\n', ig.curl_config_input("https://h.example/\tx"))
+        self.assertEqual('url = "caf\u00e9"\n'.encode(), ig.curl_config_input("caf\u00e9"))
 
     def test_a_corrupt_config_output_is_refused_instead_of_reused(self):
         source = self.root / "ja-baixado.mp4"

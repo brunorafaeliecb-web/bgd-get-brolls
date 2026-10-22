@@ -4,6 +4,11 @@ O que mora aqui atravessa projetos porque é memória de trabalho — que busca
 acertou, que fonte falhou, que trecho já serviu e por quê. Direito de uso e
 aprovação humana **não** atravessam: continuam por projeto, por revisão e por
 intervalo, e toda resposta daqui repete isso em `rights_not_transferable`.
+
+Também não atravessa um cliente: o que foi guardado a partir de um projeto de cliente
+(`client` do `project.json`) leva o `client` na entrada, e só volta para projetos do mesmo
+cliente. Entrada sem cliente é da própria pessoa e vale em qualquer projeto; entrada de outro
+cliente nunca aparece (`search`, `hints`, contadores de fonte).
 """
 
 # pylint: disable=missing-function-docstring,too-many-locals
@@ -17,8 +22,9 @@ import os
 import time
 import unicodedata
 import uuid
+from pathlib import Path
 
-from . import effects, labels, logs, versioning
+from . import effects, labels, layout, logs, roteiro_frontmatter, versioning
 from ._paths import strict_exists
 from .errors import LockedError
 from .memory import load_references
@@ -51,6 +57,74 @@ def library_dir():
 
 def index_path():
     return library_dir() / "index.json"
+
+
+def _roteiro_names_a_client(project):
+    """O ROTEIRO.md do getbrolls tem uma linha `cliente:` com valor que o parser descartou."""
+    if not roteiro_frontmatter.is_roteiro(project):
+        return False
+    try:
+        text = roteiro_frontmatter.roteiro_path(project).read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return False
+    lines = text.replace("\r\n", "\n").split("\n")
+    meta, _, errors = roteiro_frontmatter.parse_frontmatter(lines)
+    return "cliente" not in meta and any(
+        0 < number <= len(lines) and roteiro_frontmatter.frontmatter_key(lines[number - 1]) == "cliente"
+        for number, _ in errors
+    )
+
+
+def project_client(project):
+    """`(slug, problema)` do cliente que o `project.json` de `project` declara.
+
+    Sem projeto, sem `project.json` ou sem `client` nele, o slug é `None`: contexto da
+    própria pessoa. `problema` é o motivo quando o arquivo não pôde ser lido (o slug é
+    `None` e quem grava recusa, em vez de gravar uma entrada que valeria para todos).
+    Um projeto de layout 0 (sem `project.json`) tem o cliente no `cliente` do ROTEIRO.md, como
+    `migrate` e `export` o leem; um `cliente` que não é slug é `problema`, nunca contexto da pessoa.
+    """
+    if project is None:
+        return None, None
+    found = layout.info(project)
+    if found.problem:
+        return None, found.problem
+    if found.doc is None:
+        from .migrate import _roteiro_client  # local: migrate importa clients e runtime
+
+        declared = _roteiro_client(Path(project))
+        if declared is None and _roteiro_names_a_client(Path(project)):
+            return (
+                None,
+                'o "cliente" do ROTEIRO.md não é um slug válido; rode `roteiro --action check --project PROJETO`',
+            )
+    else:
+        declared = found.doc.get("client")
+    try:
+        return layout.check_client(declared, "client"), None
+    except ValueError as error:
+        return None, str(error)
+
+
+def _recording_client(project):
+    """O cliente sob o qual uma entrada nova é gravada; recusa quando não dá para saber."""
+    client, problem = project_client(project)
+    if problem:
+        raise ValueError(
+            f"O cliente deste projeto não pôde ser lido do project.json ou do ROTEIRO.md ({problem}). Conserte-o "
+            "antes de guardar na biblioteca: sem ele não há como saber de qual cliente é a entrada."
+        )
+    return client
+
+
+def _visible(item, client):
+    """A entrada é da própria pessoa (sem cliente) ou do cliente de quem pergunta."""
+    return item.get("client") in (None, client)
+
+
+def _scope(client):
+    """O campo `scope` da resposta: só aparece dentro de um projeto de cliente."""
+    return {"scope": f"client:{client}"} if client else {}
 
 
 def answer(**extra):
@@ -91,7 +165,7 @@ def _write_private(path, text):
     O temporário leva pid e um sufixo aleatório: duas escritas simultâneas nunca
     disputam o mesmo arquivo nem apagam o `.tmp` uma da outra.
     """
-    effects.mkdir(path.parent, parents=True, exist_ok=True)
+    effects.mkdir(path.parent, parents=True, exist_ok=True, mode=0o700)
     temp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     with effects.op("fs.write", path):
         try:
@@ -101,6 +175,7 @@ def _write_private(path, text):
                 encoding="utf-8",
                 newline="\n",
             ) as f:
+                effects.make_private(temp)
                 f.write(text)
                 f.flush()
                 os.fsync(f.fileno())
@@ -197,8 +272,22 @@ def _tokens(text):
     return {t for t in _normalise(text).split() if t}
 
 
-def learn_query(query, provider, outcome, note=None, auto=False):
-    """Registra que uma busca acertou ou não numa fonte."""
+def _count_provider(data, provider, outcome, at, client):
+    """Soma ao contador gravado da fonte. Só a própria pessoa escreve aqui: o contador de um cliente
+    se refaz das buscas dele (`_provider_counts`), e assim nenhuma consulta de cliente sobrevive a
+    ela no contador quando o teto de buscas a descarta."""
+    if client is not None:
+        return
+    counts = data["providers"].setdefault(provider, {"outcomes": {"hit": 0, "miss": 0}, "last_at": None})
+    counts["outcomes"][outcome] = counts["outcomes"].get(outcome, 0) + 1
+    counts["last_at"] = at
+
+
+# pylint: disable-next=too-many-arguments
+def learn_query(  # noqa: PLR0913 - the four fields of a search record, `auto`, and the project that names its client
+    query, provider, outcome, note=None, auto=False, *, project=None
+):
+    """Registra que uma busca acertou ou não numa fonte (sob o cliente do projeto, se ele tiver um)."""
     query = (query or "").strip()
     if not query:
         raise ValueError("Informe a busca real em --query.")
@@ -211,6 +300,7 @@ def learn_query(query, provider, outcome, note=None, auto=False):
         result = _off(entry=None)
         logs.event(_log, logging.INFO, "library", action="learn", entries=0, disabled=True)
         return result
+    client = _recording_client(project)
     note_path = _write_note(note) if (note or "").strip() else None
 
     def mutate(data):
@@ -219,8 +309,8 @@ def learn_query(query, provider, outcome, note=None, auto=False):
             (
                 q
                 for q in data["queries"]
-                if (q["query"], q["provider"], q["outcome"], bool(q.get("auto")))
-                == (query, provider, outcome, bool(auto))
+                if (q["query"], q["provider"], q["outcome"], bool(q.get("auto")), q.get("client"))
+                == (query, provider, outcome, bool(auto), client)
             ),
             None,
         )
@@ -243,6 +333,8 @@ def learn_query(query, provider, outcome, note=None, auto=False):
             if auto:
                 # Marcado porque ninguém digitou: veio de uma falha real de provedor.
                 entry["auto"] = True
+            if client:
+                entry["client"] = client
             data["queries"].append(entry)
         if len(data["queries"]) > MAX_QUERIES:
             # Teto: o que ninguém digitou sai primeiro, do mais antigo para o mais novo.
@@ -255,9 +347,7 @@ def learn_query(query, provider, outcome, note=None, auto=False):
             )
             drop = set(order[: len(data["queries"]) - MAX_QUERIES])
             data["queries"] = [q for i, q in enumerate(data["queries"]) if i not in drop]
-        counts = data["providers"].setdefault(provider, {"outcomes": {"hit": 0, "miss": 0}, "last_at": None})
-        counts["outcomes"][outcome] = counts["outcomes"].get(outcome, 0) + 1
-        counts["last_at"] = at
+        _count_provider(data, provider, outcome, at, client)
         return entry
 
     result = answer(entry=_update(mutate))
@@ -265,8 +355,8 @@ def learn_query(query, provider, outcome, note=None, auto=False):
     return result
 
 
-def learn_preference(text, by=None):
-    """Guarda uma preferência editorial dita por uma pessoa."""
+def learn_preference(text, by=None, project=None):
+    """Guarda uma preferência editorial dita por uma pessoa (sob o cliente do projeto, se ele tiver um)."""
     text = (text or "").strip()
     if len(text) < 5:  # noqa: PLR2004 - matches the "pelo menos 5 caracteres" message below
         raise ValueError("Escreva a preferência como ela foi dita, com pelo menos 5 caracteres.")
@@ -275,6 +365,9 @@ def learn_preference(text, by=None):
         logs.event(_log, logging.INFO, "library", action="learn", entries=0, disabled=True)
         return result
     entry = {"text": text, "by": (by or "").strip() or None, "at": now()}
+    client = _recording_client(project)
+    if client:
+        entry["client"] = client
 
     def mutate(data):
         data["preferences"].append(entry)
@@ -316,6 +409,7 @@ def learn_from_candidate(project, ident, shot=None):
         return result
     from .models import signature
 
+    client = _recording_client(project)
     entry = {
         "asset_id": asset_id(c.get("source_url"), signature(c)),
         "source_url": c.get("source_url"),
@@ -339,11 +433,13 @@ def learn_from_candidate(project, ident, shot=None):
         "at": now(),
         "used_by": [],
     }
+    if client:
+        entry["client"] = client
     use = {"project_id": project_id(ledger), "shot": shot or c.get("shot"), "at": now()}
 
     def mutate(data):
         for existing in data["assets"]:
-            if existing["asset_id"] == entry["asset_id"]:
+            if existing["asset_id"] == entry["asset_id"] and existing.get("client") == client:
                 existing["used_by"].append(use)
                 existing["decision"] = entry["decision"]
                 existing["reason"] = entry["reason"]
@@ -364,17 +460,47 @@ def _score(term_tokens, text):
     return len(found) / len(term_tokens) if term_tokens else 0.0
 
 
-def search(term, limit=5):
-    """Procura assets, buscas e preferências que já falaram desse assunto."""
+def _provider_counts(data, named, client):
+    """Contadores das fontes `named`: os gravados (só da própria pessoa) e, num projeto de cliente,
+    mais os das buscas visíveis desse cliente (`data["queries"]` já vem filtrado)."""
+    counted = {
+        name: {"outcomes": dict(counts["outcomes"]), "last_at": counts["last_at"]}
+        for name, counts in data["providers"].items()
+        if name in named
+    }
+    for q in data["queries"] if client else ():
+        if q.get("client") == client and q.get("provider") in named:
+            mine = counted.setdefault(q["provider"], {"outcomes": {"hit": 0, "miss": 0}, "last_at": None})
+            mine["outcomes"][q["outcome"]] = mine["outcomes"].get(q["outcome"], 0) + q.get("count", 1)
+            mine["last_at"] = max(mine["last_at"] or "", q.get("at") or "") or None
+    return counted
+
+
+def search(term, limit=5, project=None):
+    """Procura assets, buscas e preferências que já falaram desse assunto.
+
+    Responde só pelo contexto de quem pergunta: dentro de um projeto de cliente, o que foi guardado
+    sob esse cliente ou sem cliente; fora de um, só o que foi guardado sem cliente. A resposta diz
+    `scope: "client:<slug>"` quando há cliente; sem a chave, o contexto é o da própria pessoa.
+    """
     term = (term or "").strip()
     if not term:
         raise ValueError("Informe o que procurar em --search.")
+    # Um project.json ilegível lê como contexto da própria pessoa: o que é de cliente fica escondido.
+    client = project_client(project)[0]
     if not enabled():
-        result = _off(assets=[], queries=[], providers={}, preferences=[])
+        result = _off(**_scope(client), assets=[], queries=[], providers={}, preferences=[])
         logs.event(_log, logging.INFO, "library", action="search", entries=0, disabled=True)
         return result
     wanted = _tokens(term)
     data = load_index()
+    # A cópia sem cliente de um trecho que o cliente também guardou fica à sombra da dele.
+    own = {a.get("asset_id") for a in data["assets"] if client and a.get("client") == client}
+    data["assets"] = [
+        a for a in data["assets"] if _visible(a, client) and (a.get("client") or a.get("asset_id") not in own)
+    ]
+    data["queries"] = [q for q in data["queries"] if _visible(q, client)]
+    data["preferences"] = [p for p in data["preferences"] if _visible(p, client)]
     assets = sorted(
         (
             (
@@ -406,11 +532,12 @@ def search(term, limit=5):
     found_preferences = keep(preferences)
     named = {item.get("provider") for item in found_assets + found_queries}
     result = answer(
+        **_scope(client),
         term=term,
         assets=found_assets,
         queries=found_queries,
         preferences=found_preferences,
-        providers={name: counts for name, counts in data["providers"].items() if name in named},
+        providers=_provider_counts(data, named, client),
     )
     logs.event(
         _log,
@@ -423,17 +550,18 @@ def search(term, limit=5):
     return result
 
 
-def hints(query, limit=5):
+def hints(query, limit=5, project=None):
     """Pistas curtas para anexar a `search`; silenciosas quando não há biblioteca.
 
     Sem `reason` e sem `by`: esses textos foram escritos noutro projeto, às vezes
-    sobre outro cliente. Quem quiser lê-los pede de propósito, em `library --search`.
+    sobre outro cliente. Quem quiser lê-los pede de propósito, em `library --search`. As pistas
+    seguem o mesmo escopo de `search`: nunca trazem entrada de outro cliente.
     """
     if not enabled():
         logs.event(_log, logging.INFO, "library", action="hints", entries=0, disabled=True)
         return []
     try:
-        found = search(query, limit=limit)
+        found = search(query, limit=limit, project=project)
     except (ValueError, OSError) as error:
         # Non-fatal (hints are advisory), but a corrupted index must not look
         # identical to "nothing found" — surface it on the same warnings channel

@@ -72,14 +72,19 @@ _NPM_ARGS = ("ci", "--ignore-scripts", "--no-audit", "--no-fund")
 _TOOLS_FILES = ("package.json", "package-lock.json")
 NPM_CACHE = ".npm-cache"
 TAIL_LINES = 40
+# Linhas `ERROR:` do passo (e a linha seguinte, que nomeia o pacote) que sobrevivem ao corte da cauda: o pip lista um
+# `Expected sha256` por hash do pacote (até 170), e sem isso a cauda perderia o diagnóstico de um arquivo adulterado.
+KEPT_ERROR_LINES = 8
 TIMED_OUT = 124
 NOT_FOUND = 127
 LOCK_NAME = ".getbrolls-setup.lock"
 LOW_DISK_BYTES = 1 << 30
 _PIP_FLAGS = ("--disable-pip-version-check", "--no-input", "--progress-bar", "off")
+_HASHED_FLAGS = ("--require-hashes", "--only-binary", ":all:")
 _UPGRADE_SPECS = ("yt-dlp[default]", "yt-dlp-ejs")
 _BATCH_SAFE = re.compile(r"[A-Za-z0-9_\-=.]+")
-_ENV_DROPPED = ("PYTHONPATH", "PYTHONHOME")
+# `PIP_NO_BINARY` traria o sdist de volta (e as ferramentas de construção sem hash) ao passo do pip.
+_ENV_DROPPED = ("PYTHONPATH", "PYTHONHOME", "PIP_NO_BINARY")
 # Segredos que o passo do npm precisa: o `.npmrc` de um registro privado costuma ler
 # `${NPM_TOKEN}`. Os outros `*_TOKEN`/`*_KEY` continuam de fora de todo passo.
 _NPM_SECRETS = ("NPM_TOKEN",)
@@ -282,6 +287,30 @@ def _kill_tree(proc: subprocess.Popen) -> None:
             proc.wait(timeout=10)
 
 
+class _Tail:
+    """As últimas `TAIL_LINES` linhas de um passo, mais as linhas `ERROR:` do começo que o corte levaria."""
+
+    def __init__(self) -> None:
+        self._last: collections.deque[tuple[int, str]] = collections.deque(maxlen=TAIL_LINES)
+        self._errors: list[tuple[int, str]] = []
+        self._count = 0
+        self._after_error = False
+
+    def add(self, text: str) -> None:
+        """Registra a próxima linha; guarda também as `ERROR:` (e a linha seguinte) do começo."""
+        self._count += 1
+        self._last.append((self._count, text))
+        if (self._after_error or text.startswith("ERROR:")) and len(self._errors) < KEPT_ERROR_LINES:
+            self._errors.append((self._count, text))
+        self._after_error = text.startswith("ERROR:")
+
+    def lines(self) -> tuple[str, ...]:
+        """Em ordem de leitura; uma linha `ERROR:` que ainda está na cauda não se repete."""
+        first = self._last[0][0] if self._last else 0
+        kept = [text for number, text in self._errors if number < first]
+        return tuple(kept + [text for _number, text in self._last])
+
+
 def run_step(
     argv: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None, timeout: int, label: str
 ) -> StepResult:
@@ -314,7 +343,7 @@ def run_step(
         except OSError as exc:
             running.set(exit=NOT_FOUND)
             return StepResult(NOT_FOUND, (f"{label}: {exc.strerror or exc}",))
-        tail: collections.deque[str] = collections.deque(maxlen=TAIL_LINES)
+        tail = _Tail()
         echo = sys.stderr.isatty()
         stream = proc.stdout
         if stream is None:  # stdout=PIPE sempre abre o pipe; só para o verificador de tipos
@@ -322,7 +351,7 @@ def run_step(
 
         def read():
             for line in stream:
-                tail.append(line.rstrip("\r\n"))
+                tail.add(line.rstrip("\r\n"))
                 if echo:
                     sys.stderr.write(line)
 
@@ -340,7 +369,7 @@ def run_step(
             reader.join(timeout=10)
             stream.close()
         running.set(exit=returncode)
-        return StepResult(returncode, tuple(tail))
+        return StepResult(returncode, tail.lines())
 
 
 class _RootLock:
@@ -600,8 +629,16 @@ def _build_venv(root: Path) -> str:
     recorded = root / "requirements.txt"
     effects.copy_file(_paths.data_path("requirements.txt"), recorded)
     python = str(_paths.venv_python(folder))
+    # `--require-hashes`: o pip só instala o arquivo cujo sha256 está no `requirements.txt`; um hash que
+    # não confere (ou falta) cai na falha do pip de sempre, sem código novo. `--only-binary :all:`: só rodas,
+    # nunca sdist: o pip não confere hash do que instala para construir um sdist, e a opção de linha de comando
+    # vence `PIP_NO_BINARY`/pip.conf. Plataforma sem roda falha rápido, também como falha do pip.
+    # O `--upgrade ytdlp` não usa nenhuma das duas.
     result = _step(
-        [python, "-m", "pip", "install", *_PIP_FLAGS, "-r", str(recorded)], cwd=root, label="pip", kind="pip"
+        [python, "-m", "pip", "install", *_PIP_FLAGS, *_HASHED_FLAGS, "-r", str(recorded)],
+        cwd=root,
+        label="pip",
+        kind="pip",
     )
     if result.returncode != 0:
         code, message = _classify_pip_code(result)

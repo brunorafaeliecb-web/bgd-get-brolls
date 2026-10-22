@@ -6,13 +6,19 @@ config somente vídeo e um config somente áudio. Este script baixa ou reaprovei
 partes, mescla com ffmpeg e verifica os streams/hash de áudio da saída.
 
 Nunca imprime URLs assinadas da CDN. Lotes têm ritmo (pausa aleatória entre stems, teto
-por execução) e param no primeiro HTTP 403/429 para nunca martelar uma conta enquanto a
-CDN já está recusando.
+por execução) e param no primeiro HTTP 401/403/429 para nunca martelar uma conta enquanto a
+CDN já está recusando. Três casos, porque esperar só serve a um deles: um 429 é limite de
+ritmo (cooldown, espere e volte ao mesmo escopo); um 403 cuja URL assinada tem `oe` no
+passado é URL expirada (falha do item, recapture pela mesma rota autorizada); qualquer outro
+401/403 é recusa (o lote termina, sem cooldown e sem horário para voltar: diagnostique).
 """
 
 # pylint: disable=missing-function-docstring,unreachable,too-many-arguments,too-many-locals
 # pylint: disable=raise-missing-from,too-many-statements,broad-exception-caught,unnecessary-lambda-assignment
 # Legado: ocorrências pré-existentes (corpo idêntico ao código anterior à 2.6.0).
+# pylint: disable=too-many-lines
+# `too-many-lines`: o script roda sozinho (`python3 scripts/getbrolls/instagram_pairs.py`, per docs/GUIDE.md) e
+# não pode ser partido em módulos sem mudar esse modo de execução; a classificação 401/403/429 fica ao lado do curl.
 
 from __future__ import annotations
 
@@ -33,7 +39,7 @@ import sys
 import time
 from pathlib import Path
 from typing import NoReturn
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 URL_RE = re.compile(r'^\s*url\s*=\s*"(.*)"\s*$')
 OUTPUT_RE = re.compile(r'^\s*output\s*=\s*"(.*)"\s*$')
@@ -67,7 +73,9 @@ HOST_RE = re.compile(
 STEM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$")
 PACE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
 # curl exit 22 com um destes códigos HTTP no stderr significa que a CDN está nos recusando.
-BLOCKED_RE = re.compile(r"(?:error|returned error|HTTP/[\d.]+)\s*:?\s*(403|429)\b", re.IGNORECASE)
+BLOCKED_RE = re.compile(r"(?:error|returned error|HTTP/[\d.]+)\s*:?\s*(401|403|429)\b", re.IGNORECASE)
+# O `oe` da URL assinada da CDN: o instante em que ela deixa de valer, em segundos Unix, em hexadecimal.
+_OE_RE = re.compile(r"^[0-9A-Fa-f]{1,16}$")
 DEFAULT_PACE = "20-60"
 DEFAULT_MAX_PER_RUN = 25
 # Same shape `infer_output_for_stem` uses to recognize a "student" stem (`<username>_<rank>_<code>`).
@@ -92,17 +100,24 @@ def _safe_item_id(stem: str) -> str:
 
 
 class CollectError(Exception):
-    """Erro de coleta com mensagem redigida, código de saída e sinal de cooldown."""
+    """Erro de coleta com mensagem redigida, código de saída e sinais de parada.
+
+    `cooldown`: limite de ritmo (429), o lote para e a fila ganha um cooldown. `refused`: a CDN
+    recusou o acesso (401/403 sem `oe` vencido), o lote termina e a fila ganha uma parada, sem
+    cooldown. Nenhum dos dois sinais é "espere e tudo volta".
+    """
 
     # O código que o `event=op` dá à recusa (`logs.error_code`): coleta recusada, não bug.
     error_code = "INVALID_DATA"
 
-    def __init__(self, message, code: int = 1, *, cooldown: bool = False):
+    def __init__(self, message, code: int = 1, *, cooldown: bool = False, refused: bool = False, expired: bool = False):
         super().__init__(message)
         self.message = redact(message)
         self.code = code
         self.cooldown = cooldown
-        # Only set (to the HTTP status text) for a CDN-block cooldown error; used solely
+        self.refused = refused
+        self.expired = expired
+        # Only set (to the HTTP status text) for a CDN refusal or rate limit; used solely
         # by the `blocked` log line, never by control flow.
         self.http_status: str | None = None
 
@@ -210,6 +225,9 @@ def _curl_resolution(host: str, source: Path) -> str | None:
 
 
 def validate_media_url(value: str, source: Path) -> tuple[str, str | None]:
+    # Um NUL (ou outro controle) no texto da URL chegaria ao config do curl, que o lê como texto C e busca só o prefixo.
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):  # noqa: PLR2004 - C0 e DEL
+        _die_url_refused("invalid_url", f"URL inválida no config curl: {source}")
     try:
         parsed = urlsplit(value)
         port = parsed.port
@@ -250,6 +268,15 @@ def parse_curl_config(path: Path) -> dict[str, str | None]:
         die(f"linha url ausente no config curl: {path}")
     url, curl_resolve = validate_media_url(url, path)
     return {"url": url, "output": output, "curl_resolve": curl_resolve}
+
+
+# What a quoted string of a curl config reads as an escape: the backslash and the quote, plus the controls curl names.
+_CURL_CONFIG_ESCAPES = str.maketrans({"\\": "\\\\", '"': '\\"', "\t": "\\t", "\n": "\\n", "\r": "\\r", "\v": "\\v"})
+
+
+def curl_config_input(url: str) -> bytes:
+    """The `curl --config -` text that carries `url`: one `url = "..."` line, escaped so curl reads it back as is."""
+    return f'url = "{url.translate(_CURL_CONFIG_ESCAPES)}"\n'.encode()
 
 
 def resolve_config_output(config_output: str | None, root: Path) -> Path | None:
@@ -334,7 +361,54 @@ def _log_pair_stage(stage: str | None, started: float, *, status: str, size: int
     )
 
 
-def download_or_reuse(  # noqa: C901, PLR0913, PLR0915 - existing size; one branch per source combination
+OE_SKEW_S = 300  # relógio local adiantado: um `oe` vencido há menos disso ainda pode ser uma recusa de verdade
+
+
+def signed_url_expired(url: str, now: float | None = None) -> bool:
+    """True só quando a URL assinada traz um `oe` legível, único, não nulo e vencido há mais de `OE_SKEW_S`.
+
+    Sem `oe`, com um `oe` ilegível, repetido ou zero, ou vencido há pouco, a expiração não está confirmada:
+    quem chama trata o 403 como recusa e para para diagnosticar, em vez de supor que bastava recapturar.
+    """
+    try:
+        values = parse_qs(urlsplit(url).query, keep_blank_values=True).get("oe", [])
+    except ValueError:
+        return False
+    if len(values) != 1 or not _OE_RE.match(values[0]):
+        return False
+    stamp = int(values[0], 16)
+    return stamp > 0 and stamp + OE_SKEW_S < (time.time() if now is None else now)
+
+
+def _cdn_error(status: str, where: str, url: str) -> CollectError:
+    """O erro de um curl 22 com 401/403/429, já impresso; a mensagem nunca leva a URL."""
+    if status == "429":
+        message = (
+            f"CDN limitou o ritmo do config {where} com HTTP 429; pare o lote, aguarde o cooldown e "
+            "volte ao mesmo escopo antes de tentar de novo"
+        )
+        error = CollectError(message, cooldown=True)
+    elif status == "403" and signed_url_expired(url):
+        # Sem o número do status: a fila lê "403" como recusa, e aqui o motivo é outro.
+        message = (
+            f"URL assinada expirada (oe no passado) no config {where}; "
+            "recapture pela mesma rota autorizada antes de tentar de novo"
+        )
+        error = CollectError(message, expired=True)
+    else:
+        message = (
+            f"CDN recusou o config {where} com HTTP {status}; pare o lote e diagnostique a causa com a "
+            "pessoa (sessão, desafio, bloqueio). Esperar não autoriza retomar"
+        )
+        error = CollectError(message, refused=True)
+    # Inlined `die()`: the raised error also carries the HTTP status (`http_status`) for the
+    # later `blocked` log line in `_record_failure`, without changing the printed message.
+    print(f"ERROR: {message}", file=sys.stderr)
+    error.http_status = status
+    return error
+
+
+def download_or_reuse(  # noqa: C901, PLR0913 - existing size; one branch per source combination
     *,
     cfg_path: Path,
     part_path: Path,
@@ -377,6 +451,7 @@ def download_or_reuse(  # noqa: C901, PLR0913, PLR0915 - existing size; one bran
         pending = Path(stage_dir) / "download.part"
         cmd = [
             "curl",
+            "-q",  # first option: no ~/.curlrc (a proxy, a header or a netrc of the person's) in this transfer
             "--fail",
             "--proto",
             "=https",
@@ -393,10 +468,11 @@ def download_or_reuse(  # noqa: C901, PLR0913, PLR0915 - existing size; one bran
         ]
         if parsed["curl_resolve"]:
             cmd += ["--resolve", str(parsed["curl_resolve"])]
-        cmd.append(str(parsed["url"]))
+        # The signed URL travels on stdin, never in the argument list (`ps` shows every argument).
+        cmd += ["--config", "-"]
         print(f"+ curl <url-de {cfg_path}> --output {part_path}", file=sys.stderr)
         try:
-            effects.run(cmd, check=True, capture_output=True, timeout=600)
+            effects.run(cmd, check=True, capture_output=True, timeout=600, input=curl_config_input(str(parsed["url"])))
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr or b""
             if isinstance(stderr, bytes):
@@ -405,17 +481,7 @@ def download_or_reuse(  # noqa: C901, PLR0913, PLR0915 - existing size; one bran
             blocked = BLOCKED_RE.search(stderr) if curl_fail else None
             if blocked:
                 _log_pair_stage(stage, started, status="error")
-                message = (
-                    f"CDN recusou o config {where} com HTTP {blocked.group(1)}; pare o lote, "
-                    "aguarde o cooldown e recapture as URLs antes de tentar de novo"
-                )
-                # Inlined `die()`: only this branch needs the raised error to carry the
-                # HTTP status separately (`http_status`), for the later `blocked` log line
-                # in `_record_failure`, without changing the printed/raised message.
-                print(f"ERROR: {message}", file=sys.stderr)
-                error = CollectError(message, cooldown=True)
-                error.http_status = blocked.group(1)
-                raise error  # noqa: B904 - implicit context, matching die()'s own raise
+                raise _cdn_error(blocked.group(1), where, str(parsed["url"]))  # noqa: B904 - as die() does
             tail = stderr_tail(stderr)
             _log_pair_stage(stage, started, status="error")
             die(f"curl falhou para o config {where} (exit {exc.returncode}): {tail}")
@@ -646,7 +712,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Lotes grandes: use --pace MIN-MAX (padrão 20-60s) e --max-per-run (padrão 25) para dividir "
             "o lote em execuções menores e manter o ritmo. O resumo em --summary-json é sempre gravado de forma "
             "incremental, com ou sem --continue-on-error; a flag só muda o que acontece após uma falha comum: "
-            "sem ela o lote é interrompido (403/429 sempre interrompe, com ou sem a flag); com ela, o lote segue "
+            "sem ela o lote é interrompido (401/403/429 sempre interrompe, com ou sem a flag); com ela, o lote segue "
             "para o próximo stem. "
             "Veja a seção Instagram (navegador/Playwright, dois streams e pares CDN) em docs/GUIDE.md."
         ),
@@ -674,7 +740,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--project",
         type=Path,
         default=None,
-        help="Raiz do projeto que guarda work/queue.json; usada para registrar o cooldown ao levar 403/429.",
+        help=(
+            "Raiz do projeto que guarda work/queue.json; registra o cooldown (429) ou a parada (401/403) e, "
+            "com a fila parada, impede o lote de sair."
+        ),
     )
     parser.add_argument(
         "--layout",
@@ -721,7 +790,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--continue-on-error",
         action="store_true",
         help=(
-            "Registra um stem com falha e continua em vez de interromper o lote. HTTP 403/429 sempre interrompe o lote."
+            "Registra um stem com falha e continua em vez de interromper o lote. "
+            "HTTP 401/403/429 sempre interrompe o lote."
         ),
     )
     return parser
@@ -751,35 +821,53 @@ def _build_summary(total: int, results: list[dict], stopped_by: str | None) -> d
     }
 
 
-def record_queue_cooldown(project: Path | None, reason: str) -> str | None:
-    """Abre um cooldown em `<project>/work/queue.json`, sob a trava do projeto; None quando não registrado."""
+def _record_in_queue(project: Path | None, reason: str, function: str, not_recorded: str, what: str, **extra: str):
+    """Grava `function` de `queue.py` em `<project>/work/queue.json`, sob a trava do projeto.
+
+    Devolve o instante registrado (`until` do cooldown, `at` da parada) ou None quando nada foi
+    gravado. `not_recorded` abre os avisos ("cooldown não registrado") e `what` diz o que se grava.
+    """
     if project is None:
         print(
-            "WARNING: cooldown não registrado (nenhum --project informado; use --project "
-            "para gravar o cooldown em work/queue.json)",
+            f"WARNING: {not_recorded} (nenhum --project informado; use --project para gravar {what} "
+            "em work/queue.json)",
             file=sys.stderr,
         )
         return None
     try:
         if __package__:
-            from .queue import record_cooldown
+            from .queue import record_cooldown, record_refusal
             from .runtime import project_lock
         else:
-            from getbrolls.queue import record_cooldown
+            from getbrolls.queue import record_cooldown, record_refusal
             from getbrolls.runtime import project_lock
     except ImportError as exc:
-        print(f"WARNING: cooldown não registrado (dependências indisponíveis: {redact(exc)})", file=sys.stderr)
+        print(f"WARNING: {not_recorded} (dependências indisponíveis: {redact(exc)})", file=sys.stderr)
         return None
     try:
         with project_lock(project):
-            result = record_cooldown(project, "instagram", reason)
+            result = {"record_cooldown": record_cooldown, "record_refusal": record_refusal}[function](
+                project, "instagram", reason, **extra
+            )
     except (OSError, ValueError) as exc:
-        print(f"WARNING: cooldown não registrado ({redact(exc)})", file=sys.stderr)
+        print(f"WARNING: {not_recorded} ({redact(exc)})", file=sys.stderr)
         return None
     if not result:
-        print(f"WARNING: cooldown não registrado (nenhum work/queue.json em {project})", file=sys.stderr)
+        print(f"WARNING: {not_recorded} (nenhum work/queue.json em {project})", file=sys.stderr)
         return None
-    return result["until"]
+    return result.get("until") or result.get("at")
+
+
+def record_queue_cooldown(project: Path | None, reason: str) -> str | None:
+    """Abre um cooldown em `<project>/work/queue.json`, sob a trava do projeto; None quando não registrado."""
+    return _record_in_queue(project, reason, "record_cooldown", "cooldown não registrado", "o cooldown")
+
+
+def record_queue_refusal(project: Path | None, reason: str, reason_class: str) -> str | None:
+    """Registra a parada (sem cooldown) em `<project>/work/queue.json`; None quando não registrada."""
+    return _record_in_queue(
+        project, reason, "record_refusal", "parada não registrada", "a parada", reason_class=reason_class
+    )
 
 
 def _skip(results: list[dict], stem: str, reason: str) -> None:
@@ -822,6 +910,15 @@ def _record_failure(
         reason = redact(f"{type(exc).__name__}: {exc}")
         cooldown = False
     results.append({"stem": stem, "status": "failed", "reason": reason})
+    if getattr(exc, "refused", False):
+        # Recusa de acesso: o lote termina pelo mesmo caminho de qualquer erro fatal, com ou sem
+        # --continue-on-error. A fila ganha uma parada, nunca um cooldown nem um horário.
+        status = getattr(exc, "http_status", None)
+        stopped_at = record_queue_refusal(getattr(args, "project", None), reason, f"http_{status}")
+        logs.event(_log, logging.WARNING, "refused", http_status=status, stop_recorded=bool(stopped_at))
+        if stopped_at:
+            print("-- parada registrada em queue.json (sem cooldown: esperar não libera o acesso)", file=sys.stderr)
+        return "aborted", exc
     if cooldown:
         until = record_queue_cooldown(getattr(args, "project", None), reason)
         logs.event(
@@ -836,6 +933,9 @@ def _record_failure(
         return "cooldown", None
     if not args.continue_on_error:
         return "aborted", exc
+    if getattr(exc, "expired", False):
+        # URLs capturadas juntas vencem juntas: o resto do lote espera a recaptura, sem um pedido por item.
+        return "recapture", None
     return None, None
 
 
@@ -878,8 +978,8 @@ def run_batch(pairs, *, output_for, args) -> dict:  # noqa: C901 - existing size
                 result = _collect_one(stem, video_config, audio_config, output, args)
             except Exception as exc:  # noqa: BLE001 - one item's failure must not kill the batch
                 stop_reason, fatal = _record_failure(results, stem, exc, args)
-                if stop_reason == "cooldown":
-                    stopped_by = "cooldown"
+                if stop_reason in ("cooldown", "recapture"):
+                    stopped_by = stop_reason
                 logs.event(_log, logging.INFO, "pair_item_end", shortcode=item_id, status="failed")
             else:
                 results.append({**result, "status": "done"})
@@ -901,6 +1001,42 @@ def run_batch(pairs, *, output_for, args) -> dict:  # noqa: C901 - existing size
     if fatal is not None:
         raise fatal
     return summary
+
+
+def refuse_when_stopped(pairs, args) -> None:
+    """Lê `work/queue.json` (só leitura) antes de qualquer pedido: com a fila do Instagram parada, o lote não sai.
+
+    Sem `--project` não há fila para ler: a parada é um registro do projeto, e o coletor sem projeto fica fora dela
+    (o aviso de "parada não registrada" já diz isso). Uma fila ilegível também recusa: sem saber, não se pede.
+    """
+    project = getattr(args, "project", None)
+    if project is None:
+        return
+    try:
+        if __package__:
+            from .queue import stop_of
+        else:
+            from getbrolls.queue import stop_of
+        stopped = stop_of(project, "instagram")
+    except ImportError as exc:
+        print(f"WARNING: fila não consultada (dependências indisponíveis: {redact(exc)})", file=sys.stderr)
+        return
+    except (OSError, ValueError) as exc:
+        stopped, message = True, f"fila do projeto ilegível ({redact(exc)}); sem ela o lote não sai"
+    else:
+        message = (
+            (
+                f"fila do instagram parada em {stopped['at']} por recusa de acesso; esperar não autoriza retomar. "
+                "Diagnostique com a pessoa; só a confirmação dela, no chat, libera (queue --action resume)"
+            )
+            if stopped
+            else ""
+        )
+    if not stopped:
+        return
+    results = [{"stem": stem, "status": "skipped", "reason": "aborted"} for stem, _video, _audio in pairs]
+    write_summary(args.summary_json, _build_summary(len(pairs), results, None))
+    die(message)
 
 
 def _plan(args):
@@ -933,6 +1069,7 @@ def _main(argv: list[str] | None = None) -> int:
         # Inside the `try`: a missing tool or argument ends like any batch error (exit 1 and
         # the message), never as a traceback.
         pairs, output_for = _plan(args)
+        refuse_when_stopped(pairs, args)
         summary = run_batch(pairs, output_for=output_for, args=args)
         results = [item for item in summary["results"] if item["status"] == "done"]
 

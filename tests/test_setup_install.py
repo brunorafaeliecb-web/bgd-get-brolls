@@ -293,7 +293,19 @@ class InstallTests(_Setup):
         self.assertEqual(str(self.root() / ".venv" / PYTHON_LAYOUT), argv[0])
         for flag in ("--disable-pip-version-check", "--no-input"):
             self.assertIn(flag, argv)
-        self.assertNotIn("--require-hashes", argv)
+        self.assertIn("--require-hashes", argv)
+        # Só rodas: o pip não confere hash das ferramentas de construção de um sdist.
+        self.assertEqual(":all:", argv[argv.index("--only-binary") + 1])
+        self.assertLess(argv.index("--only-binary"), argv.index("-r"))
+
+    def test_pip_no_binary_in_the_environment_never_reaches_a_step(self):
+        # `PIP_NO_BINARY` traria o sdist de volta; a opção `--only-binary :all:` da linha de comando já vence,
+        # e o ambiente do filho nem leva a variável.
+        with patch.dict(os.environ, {"PIP_NO_BINARY": ":all:", "PIP_ONLY_BINARY": ""}):
+            self.install()
+        self.assertTrue(self.runner.calls)
+        for label, _argv, _cwd, env in self.runner.calls:
+            self.assertNotIn("PIP_NO_BINARY", env, label)
 
     def test_child_environment_drops_secrets_and_pythonpath(self):
         self.install()
@@ -368,6 +380,43 @@ class FailureTests(_Setup):
         )
         entry = self.failed(self.install())
         self.assertIn("rede", entry["error"])
+
+    def test_a_file_whose_hash_is_not_listed_fails_through_the_existing_pip_error(self):
+        # Texto real do pip 26 diante de um hash que não confere: não é rede, nem versão do Python,
+        # nem conflito; cai na mensagem genérica que já existe, com o texto do pip em `output_tail`.
+        tail = [
+            (
+                "ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE. If you have updated "
+                "the package versions, please update the hashes. Otherwise, examine the package contents "
+                "carefully; someone may have tampered with them."
+            ),
+            "    idna==3.20 from https://files.pythonhosted.org/packages/idna-3.20-py3-none-any.whl:",
+            "        Expected sha256 " + "0" * 64,
+            "             Got        " + "ab" * 32,
+        ]
+        self.runner.fail["pip"] = (1, tail)
+        entry = self.failed(self.install())
+        self.assertEqual(bootstrap.PIP_FAILED.format(code=1), entry["error"])
+        self.assertIn("DO NOT MATCH THE HASHES", "\n".join(entry["output_tail"]))
+        classified = bootstrap._classify_pip_code(bootstrap.StepResult(1, tuple(tail)))  # pylint: disable=protected-access
+        self.assertEqual("pip_failed", classified[0])
+        self.assertEqual(["venv", "pip"], self.labels(VENV_LABELS))  # sem sonda: a venv não chega a ficar pronta
+        pip_argv = next(argv for label, argv, _cwd, _env in self.runner.calls if label == "pip")
+        self.assertIn("--require-hashes", pip_argv)
+
+    def test_a_missing_hash_in_the_file_fails_through_the_existing_pip_error(self):
+        self.runner.fail["pip"] = (
+            1,
+            [
+                (
+                    "ERROR: In --require-hashes mode, all requirements must have their versions pinned with ==. "
+                    "These do not:"
+                ),
+                "    brotlicffi from https://files.pythonhosted.org/packages/brotlicffi-1.2.0.2.tar.gz",
+            ],
+        )
+        entry = self.failed(self.install())
+        self.assertEqual(bootstrap.PIP_FAILED.format(code=1), entry["error"])
 
     def test_missing_ensurepip_points_at_python3_venv(self):
         self.runner.fail["venv"] = (1, ["Error: ensurepip is not available. apt install python3.12-venv"])
@@ -680,6 +729,25 @@ class UpgradeTests(_Setup):
         self.assertEqual("upgraded", result["upgrade"]["status"])
         self.assertEqual("2026.9.1", result["upgrade"]["version"])
 
+    def test_upgrade_is_the_explicit_opt_out_from_hashes(self):
+        # `--upgrade ytdlp` pede a versão mais nova ao índice: não há hash a conferir de antemão.
+        self.runner.upgrade_to = "2026.9.1"
+        self.install(upgrade="ytdlp")
+        _label, argv, _cwd, _env = next(call for call in self.runner.calls if call[0] == "upgrade")
+        self.assertNotIn("--require-hashes", argv)
+        self.assertNotIn("--only-binary", argv)
+        self.assertNotIn("-r", argv)
+
+    def test_the_rebuild_after_a_failed_upgrade_requires_hashes_again(self):
+        self.install()
+        self.runner.calls.clear()
+        self.runner.fail["upgrade"] = (1, ["ERROR: Could not find a version"])
+        self.install(upgrade="ytdlp")
+        pips = [argv for label, argv, _cwd, _env in self.runner.calls if label == "pip"]
+        self.assertEqual(1, len(pips))
+        self.assertIn("--require-hashes", pips[0])
+        self.assertIn("--only-binary", pips[0])
+
     def test_failed_upgrade_rebuilds_the_pinned_set(self):
         self.install()
         self.runner.calls.clear()
@@ -726,6 +794,37 @@ class RunStepTests(unittest.TestCase):
         self.assertEqual(bootstrap.TAIL_LINES, len(done.output))
         self.assertEqual("err", done.output[-1])
         self.assertEqual("59", done.output[-2])
+
+    def test_pips_error_lines_survive_a_tail_full_of_expected_hashes(self):
+        # O pip lista um `Expected sha256` por hash do pacote (até 170): o corte da cauda não pode levar o diagnóstico.
+        code = (
+            "print('Collecting websockets==17.1')\n"
+            "print('ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE.')\n"
+            "print('    websockets==17.1 from https://files.example/websockets.whl (from -r r.txt (line 7)):')\n"
+            "print('        Expected sha256 ' + '0' * 64)\n"
+            "for i in range(300): print('        Expected     or ' + format(i, '064x'))\n"
+            "print('             Got        ' + 'ab' * 32)\n"
+            "raise SystemExit(1)"
+        )
+        done = bootstrap.run_step([sys.executable, "-c", code], timeout=60, label="t")
+        self.assertEqual(1, done.returncode)
+        self.assertEqual("ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE.", done.output[0])
+        self.assertTrue(done.output[1].lstrip().startswith("websockets==17.1 from"))
+        self.assertTrue(done.output[-1].lstrip().startswith("Got"))
+        self.assertLessEqual(len(done.output), bootstrap.TAIL_LINES + bootstrap.KEPT_ERROR_LINES)
+        self.assertEqual(1, sum("DO NOT MATCH" in line for line in done.output))
+        self.assertNotIn("Collecting websockets==17.1", done.output)
+
+    def test_error_lines_already_in_the_tail_are_not_repeated(self):
+        code = "print('a')\nprint('ERROR: boom')\nprint('    pkg==1 from url:')\nprint('Got x')\nraise SystemExit(1)"
+        done = bootstrap.run_step([sys.executable, "-c", code], timeout=60, label="t")
+        self.assertEqual(("a", "ERROR: boom", "    pkg==1 from url:", "Got x"), done.output)
+
+    def test_only_a_few_error_lines_are_kept(self):
+        code = "for i in range(200): print('ERROR: line %d' % i)\nraise SystemExit(1)"
+        done = bootstrap.run_step([sys.executable, "-c", code], timeout=60, label="t")
+        self.assertEqual(bootstrap.TAIL_LINES + bootstrap.KEPT_ERROR_LINES, len(done.output))
+        self.assertEqual("ERROR: line 199", done.output[-1])
 
     def test_missing_executable_is_127(self):
         done = bootstrap.run_step([str(Path(tempfile.gettempdir()) / "no-such-tool-gb")], timeout=5, label="t")

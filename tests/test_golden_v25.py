@@ -5,6 +5,7 @@ Regravar: `GB_UPDATE_GOLDEN=1 GB_GOLDEN_REASON="<motivo>"` nesta suíte (o motiv
 """
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,8 @@ import _isolation  # noqa: F401  (efeito de import: define GB_HOME)  # pylint: d
 from _paths import CLI_ARGV, ROOT, WHEEL_MODE
 from test_repository import LOCAL_PATH_PATTERN
 
+from getbrolls import _paths as gb_paths
+
 UPDATE = os.environ.get("GB_UPDATE_GOLDEN") == "1"
 HAS_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 # UTC-12 e UTC+14: a qualquer hora do dia, ao menos um dos dois já está em outra data.
@@ -40,7 +43,12 @@ def assert_matches_golden(test, scenario, record):
     # A máscara não esconde campo que sumiu: as linhas `fetch` gravadas ainda têm os dois, com um clipe de verdade.
     actual = _golden.serialize(record)
     test.assertEqual([], _golden.fetch_lines_without_clip_fields(actual))
-    test.assertEqual(_golden.comparable(_expected(scenario, record["case"])), _golden.comparable(actual))
+    # A chave da venv do `doctor` tem de ser a que o checkout calcula do `requirements.txt`; o arquivo do ouro guarda a
+    # do dia em que foi gravado.
+    venv_key = gb_paths.part_sha("venv")
+    test.assertEqual(
+        _golden.comparable(_expected(scenario, record["case"])), _golden.comparable(actual, venv_key=venv_key)
+    )
 
 
 def skip_unless_pinned(test, tmp=None):
@@ -114,6 +122,101 @@ class GoldenOnAnotherDayTests(unittest.TestCase):
             for record in records:
                 with self.subTest(zone=zone, case=record["case"]):
                     assert_matches_golden(self, scenario, record)
+
+
+class VenvKeyMaskTests(unittest.TestCase):
+    """A chave da venv do `doctor` (sha do `requirements.txt`) é a única diferença que os dois lados podem ter."""
+
+    OTHER_SHA = "0123456789abcdef"
+
+    @staticmethod
+    def doctor():
+        return json.loads((_golden.EXPECTED / "fluxo" / "doctor.json").read_text(encoding="utf-8"))
+
+    @staticmethod
+    def text(record):
+        return json.dumps(record, ensure_ascii=False, indent=1) + "\n"
+
+    def with_key(self, key):
+        other = self.doctor()
+        other["stdout"]["json"]["install"]["runtime"]["shas"]["venv"] = key
+        return other
+
+    def test_the_key_the_checkout_computes_compares_equal_and_the_golden_file_is_untouched(self):
+        golden = self.doctor()
+        other = self.with_key(self.OTHER_SHA)
+        self.assertNotEqual(self.text(golden), self.text(other))
+        self.assertEqual(
+            _golden.comparable(self.text(golden)), _golden.comparable(self.text(other), venv_key=self.OTHER_SHA)
+        )
+        self.assertIn(_golden.VENV_KEY_MARK, _golden.comparable(self.text(other), venv_key=self.OTHER_SHA))
+        # O arquivo do ouro segue como foi gravado: a máscara só existe na comparação.
+        self.assertEqual("297cf4d1dab00b59", golden["stdout"]["json"]["install"]["runtime"]["shas"]["venv"])
+
+    def test_the_golden_file_text_compares_equal_to_a_record_with_the_expected_key(self):
+        raw = (_golden.EXPECTED / "fluxo" / "doctor.json").read_text(encoding="utf-8")
+        self.assertEqual(
+            _golden.comparable(raw),
+            _golden.comparable(_golden.serialize(self.with_key(self.OTHER_SHA)), venv_key=self.OTHER_SHA),
+        )
+
+    def test_a_wrong_or_stale_key_in_the_record_still_fails(self):
+        # A chave das ferramentas no lugar da da venv, a chave velha do ouro e uma qualquer: nenhuma é a calculada.
+        golden = self.doctor()
+        for wrong in ("7ff9d2913771b98c", "297cf4d1dab00b59", "fedcba9876543210"):
+            with self.subTest(wrong=wrong):
+                text = self.text(self.with_key(wrong))
+                self.assertNotEqual(
+                    _golden.comparable(self.text(golden)), _golden.comparable(text, venv_key=self.OTHER_SHA)
+                )
+                self.assertNotIn(_golden.VENV_KEY_MARK, _golden.comparable(text, venv_key=self.OTHER_SHA))
+
+    def test_any_other_change_in_the_doctor_still_fails(self):
+        golden = self.doctor()
+        changes = (
+            ("tools key", ("stdout", "json", "install", "runtime", "shas", "tools"), "0123456789abcdef"),
+            ("python", ("stdout", "json", "install", "python"), "<OTHER>"),
+            ("exit", ("exit",), 1),
+            ("ready", ("stdout", "json", "ready"), None),
+        )
+        for label, path, value in changes:
+            other = self.with_key(self.OTHER_SHA)
+            node = other
+            for key in path[:-1]:
+                node = node[key]
+            self.assertNotEqual(value, node.get(path[-1]), label)
+            node[path[-1]] = value
+            with self.subTest(label):
+                self.assertNotEqual(
+                    _golden.comparable(self.text(golden)), _golden.comparable(self.text(other), venv_key=self.OTHER_SHA)
+                )
+
+    def test_only_a_16_hex_key_at_that_path_is_masked(self):
+        golden = self.doctor()
+        for bad in ("zzzz", "0123456789abcde", "0123456789ABCDEF", "0123456789abcdef0", None, 7):
+            with self.subTest(venv=bad):
+                text = self.text(self.with_key(bad))
+                self.assertNotEqual(_golden.comparable(self.text(golden)), _golden.comparable(text))
+                self.assertNotIn(_golden.VENV_KEY_MARK, _golden.comparable(text))
+        # O mesmo campo em outro lugar não é mascarado.
+        moved = {"stdout": {"json": {"venv": self.OTHER_SHA}}}
+        self.assertEqual(self.text(moved), _golden.comparable(self.text(moved)))
+        misplaced = self.doctor()
+        misplaced["stdout"]["json"]["other"] = {"shas": {"venv": self.OTHER_SHA}}
+        self.assertIn(self.OTHER_SHA, _golden.comparable(self.text(misplaced)))
+
+    def test_the_checkout_key_is_the_sha_of_the_requirements_file(self):
+        # O que o teste do ouro compara com o `doctor`: a mesma conta do `runtime/<sha>`.
+        key = gb_paths.part_sha("venv")
+        self.assertRegex(key or "", r"[0-9a-f]{16}")
+        blob = (ROOT / "requirements.txt").read_bytes().replace(b"\r\n", b"\n")
+        self.assertEqual(hashlib.sha256(blob).hexdigest()[:16], key)
+
+    def test_text_that_is_not_a_record_is_left_alone(self):
+        for text in ("", "not json", '"level=INFO event=op"\n', "[1, 2]", '{"stdout": null}'):
+            with self.subTest(text=text):
+                self.assertNotIn(_golden.VENV_KEY_MARK, _golden.comparable(text))
+                self.assertNotIn(_golden.VENV_KEY_MARK, _golden.comparable(text, venv_key=self.OTHER_SHA))
 
 
 class ClipFieldsMaskTests(unittest.TestCase):
@@ -624,6 +727,20 @@ class NormalizerTests(unittest.TestCase):
             '"duration_ms": "<MS>", "traceback": "<TRACEBACK>"}'
         )
         self.assertEqual(expected, self.norm.text(raw))
+
+    def test_masks_the_version_of_the_pinned_playwright_package_and_nothing_else(self):
+        self.assertEqual(
+            '["npx", "--package", "@playwright/cli", "x"]',
+            self.norm.text('["npx", "--package", "@playwright/cli@0.1.21", "x"]'),
+        )
+        for kept in (
+            '"@playwright/cli"',
+            '"@playwright/cli@latest"',
+            '"@playwright/other@0.1.21"',
+            '"@playwright/cli@0.1"',
+        ):
+            with self.subTest(kept=kept):
+                self.assertEqual(kept, self.norm.text(kept))
 
     def test_masks_the_date_of_the_run_and_the_next_day_but_not_other_dates(self):
         norm = _golden.Normalizer(self.norm.roots, "2.6.0", today="2026-10-31")

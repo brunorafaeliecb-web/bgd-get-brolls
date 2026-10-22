@@ -17,6 +17,7 @@ import http.client
 import ipaddress
 import json
 import logging
+import os
 import re
 import socket
 import time
@@ -244,6 +245,42 @@ def _opener():
     # Environment proxies would bypass the checked destination. This transport
     # connects directly; redirects remain forbidden.
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), _PinnedHTTPSHandler(), _NoRedirect())
+
+
+# As variáveis de proxy que entram em `install.proxy`. `NO_PROXY` conta como posta. O aviso só vale para as que o
+# `curl` e o `yt-dlp` aplicam às transferências HTTPS do getbrolls (`HTTPS_PROXY` e `ALL_PROXY`): `HTTP_PROXY` só vale
+# para endereços `http://`.
+PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+HINT_VARIABLES = ("HTTPS_PROXY", "ALL_PROXY")
+PROXY_HINT = (
+    "curl e yt-dlp usam o proxy do ambiente nas transferências HTTPS; o navegador segue o proxy do sistema, não o do "
+    "ambiente; o transporte HTTP interno conecta direto"
+)
+
+
+def proxy_report():
+    """O que `doctor` mostra em `install.proxy`, ou `None` quando nenhuma variável de proxy está posta.
+
+    Só os nomes das variáveis (ordenados, nunca os valores, que podem levar usuário e senha) e quem as respeita.
+    Este transporte ignora todas (`_opener`); o `curl`, o `yt-dlp` e o navegador, que o getbrolls só dispara, leem do
+    ambiente. Com `HTTPS_PROXY` ou `ALL_PROXY` posta, `hint` diz quem a respeita. Nunca levanta."""
+    found = sorted(key for key, value in os.environ.items() if key.upper() in PROXY_VARIABLES and value.strip())
+    if not found:
+        return None
+    report: dict[str, list[str] | str] = {
+        "env": found,
+        "honored_by": ["curl", "yt-dlp", "browser"],
+        "ignored_by": ["http"],
+    }
+    if any(key.upper() in HINT_VARIABLES for key in found):
+        report["hint"] = PROXY_HINT
+    return report
+
+
+def proxy_install_entry():
+    """`{"proxy": proxy_report()}` para somar a `install` do `doctor`; `{}` sem variável de proxy."""
+    report = proxy_report()
+    return {} if report is None else {"proxy": report}
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -578,7 +615,13 @@ def get_json(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917
             effects.mkdir(cache_path.parent, parents=True, exist_ok=True, mode=0o700)
             temp = cache_path.with_suffix(".tmp")
             with effects.op("fs.write", cache_path):
-                temp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8", newline="\n")
+                # Created empty and exclusive (a leftover of a run that died is removed first), private, then written.
+                temp.unlink(missing_ok=True)
+                with open(  # noqa: PTH123 - wraps an os.open() fd (O_EXCL and mode), no Path equivalent
+                    os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8", newline="\n"
+                ) as stream:
+                    effects.make_private(temp)
+                    stream.write(json.dumps(data, ensure_ascii=False))
                 temp.chmod(0o600)
                 temp.replace(cache_path)
         except OSError:

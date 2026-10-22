@@ -3,12 +3,19 @@
 # pylint: disable=missing-function-docstring
 # Legado: ocorrências pré-existentes (corpo idêntico ao código anterior à 2.6.0).
 
+import json
 from datetime import UTC
 
-from . import effects
+from . import _paths, effects
 from .http import public_url
 from .review import project_id
 from .rules import domain_matches
+
+
+def playwright_spec():
+    """`@playwright/cli@<versão>`: a mesma versão que o `setup` instala, lida do `package.json` (fonte única)."""
+    manifest = json.loads(_paths.data_path("package.json").read_text(encoding="utf-8"))
+    return "@playwright/cli@" + manifest["dependencies"]["@playwright/cli"]
 
 
 def plan(ledger, url, rules):
@@ -35,7 +42,7 @@ def plan(ledger, url, rules):
         "npx",
         "--yes",
         "--package",
-        "@playwright/cli",
+        playwright_spec(),
         "playwright-cli",
         "-s=" + session,
     ]

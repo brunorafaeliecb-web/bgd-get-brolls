@@ -58,7 +58,7 @@ def _roteiro_client(project):
     try:
         if not roteiro_frontmatter.is_roteiro(project):
             return None
-        lines = roteiro_frontmatter.roteiro_path(project).read_text(encoding="utf-8").splitlines()
+        lines = roteiro_frontmatter.roteiro_path(project).read_text(encoding="utf-8-sig").splitlines()
     except (OSError, UnicodeDecodeError):
         return None
     meta, _, _ = roteiro_frontmatter.parse_frontmatter(lines)

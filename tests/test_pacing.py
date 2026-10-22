@@ -142,7 +142,7 @@ class PairsBatchTests(unittest.TestCase):
             self.assertEqual(["done", "failed", "skipped"], [item["status"] for item in summary["results"]])
             self.assertIsNone(summary["stopped_by"])
 
-    def test_curl_flags_and_http_403_429_stop_the_batch_with_cooldown(self):
+    def test_curl_flags_and_http_429_stop_the_batch_with_cooldown(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_pairs(root / "configs", ["01_A", "02_B", "03_C"])
@@ -152,16 +152,16 @@ class PairsBatchTests(unittest.TestCase):
             queue.save(queue_path, state)
             commands = []
 
-            def forbidden(cmd, **kwargs):
+            def limited(cmd, **kwargs):
                 commands.append(cmd)
-                raise subprocess.CalledProcessError(22, cmd, stderr=b"curl: (22) The requested URL returned error: 403")
+                raise subprocess.CalledProcessError(22, cmd, stderr=b"curl: (22) The requested URL returned error: 429")
 
             with (
                 patch.object(ig.socket, "getaddrinfo", return_value=PUBLIC_DNS),
-                patch.object(ig.subprocess, "run", side_effect=forbidden),
+                patch.object(ig.subprocess, "run", side_effect=limited),
             ):
                 self.assertEqual(1, ig.main(batch_args(root, "--pace", "0", "--continue-on-error")))
-            self.assertEqual(1, len(commands), "após 403/429 o lote para de imediato")
+            self.assertEqual(1, len(commands), "após 429 o lote para de imediato")
             self.assertIn("--retry", commands[0])
             self.assertEqual("2", commands[0][commands[0].index("--retry") + 1])
             self.assertEqual("5", commands[0][commands[0].index("--retry-delay") + 1])
@@ -169,24 +169,24 @@ class PairsBatchTests(unittest.TestCase):
             summary = json.loads((root / "work/summary.json").read_text(encoding="utf-8"))
             self.assertEqual(["failed", "skipped", "skipped"], [item["status"] for item in summary["results"]])
             self.assertEqual(["cooldown", "cooldown"], [item["reason"] for item in summary["results"][1:]])
-            self.assertIn("403", summary["results"][0]["reason"])
+            self.assertIn("429", summary["results"][0]["reason"])
             self.assertEqual("cooldown", summary["stopped_by"])
             saved = queue.load(queue_path)
             self.assertTrue(saved["providers"]["instagram"]["cooldown_until"])
             self.assertEqual(1, saved["providers"]["instagram"]["cooldown_strikes"])
 
-    def test_403_without_continue_on_error_exits_1_and_persists_summary(self):
+    def test_429_without_continue_on_error_exits_1_and_persists_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_pairs(root / "configs", ["01_A"])
             queue.save(queue.queue_path(root), queue.empty_state())
 
-            def forbidden(cmd, **kwargs):
-                raise subprocess.CalledProcessError(22, cmd, stderr=b"curl: (22) The requested URL returned error: 403")
+            def limited(cmd, **kwargs):
+                raise subprocess.CalledProcessError(22, cmd, stderr=b"curl: (22) The requested URL returned error: 429")
 
             with (
                 patch.object(ig.socket, "getaddrinfo", return_value=PUBLIC_DNS),
-                patch.object(ig.subprocess, "run", side_effect=forbidden),
+                patch.object(ig.subprocess, "run", side_effect=limited),
             ):
                 self.assertEqual(1, ig.main(batch_args(root, "--pace", "0")))
             summary = json.loads((root / "work/summary.json").read_text(encoding="utf-8"))
@@ -202,8 +202,8 @@ class PairsBatchTests(unittest.TestCase):
             queue.save(queue.queue_path(project), queue.empty_state())
             # queue.json não existe sob config-output-root (root); só sob --project.
 
-            def forbidden(cmd, **kwargs):
-                raise subprocess.CalledProcessError(22, cmd, stderr=b"curl: (22) The requested URL returned error: 403")
+            def limited(cmd, **kwargs):
+                raise subprocess.CalledProcessError(22, cmd, stderr=b"curl: (22) The requested URL returned error: 429")
 
             args = [
                 "--config-dir",
@@ -225,7 +225,7 @@ class PairsBatchTests(unittest.TestCase):
             ]
             with (
                 patch.object(ig.socket, "getaddrinfo", return_value=PUBLIC_DNS),
-                patch.object(ig.subprocess, "run", side_effect=forbidden),
+                patch.object(ig.subprocess, "run", side_effect=limited),
             ):
                 self.assertEqual(1, ig.main(args))
             saved = queue.load(queue.queue_path(project))
@@ -237,14 +237,14 @@ class PairsBatchTests(unittest.TestCase):
             root = Path(tmp)
             write_pairs(root / "configs", ["01_A"])
 
-            def forbidden(cmd, **kwargs):
-                raise subprocess.CalledProcessError(22, cmd, stderr=b"curl: (22) The requested URL returned error: 403")
+            def limited(cmd, **kwargs):
+                raise subprocess.CalledProcessError(22, cmd, stderr=b"curl: (22) The requested URL returned error: 429")
 
             stderr = io.StringIO()
             with (
                 contextlib.redirect_stderr(stderr),
                 patch.object(ig.socket, "getaddrinfo", return_value=PUBLIC_DNS),
-                patch.object(ig.subprocess, "run", side_effect=forbidden),
+                patch.object(ig.subprocess, "run", side_effect=limited),
             ):
                 self.assertEqual(1, ig.main(batch_args(root, "--pace", "0", project=False)))
             self.assertIn("WARNING: cooldown não registrado", stderr.getvalue())
@@ -254,14 +254,14 @@ class PairsBatchTests(unittest.TestCase):
             root = Path(tmp)
             write_pairs(root / "configs", ["01_A"])
 
-            def forbidden(cmd, **kwargs):
-                raise subprocess.CalledProcessError(22, cmd, stderr=b"curl: (22) The requested URL returned error: 403")
+            def limited(cmd, **kwargs):
+                raise subprocess.CalledProcessError(22, cmd, stderr=b"curl: (22) The requested URL returned error: 429")
 
             stderr = io.StringIO()
             with (
                 contextlib.redirect_stderr(stderr),
                 patch.object(ig.socket, "getaddrinfo", return_value=PUBLIC_DNS),
-                patch.object(ig.subprocess, "run", side_effect=forbidden),
+                patch.object(ig.subprocess, "run", side_effect=limited),
             ):
                 self.assertEqual(1, ig.main(batch_args(root, "--pace", "0")))
             self.assertIn("WARNING: cooldown não registrado", stderr.getvalue())

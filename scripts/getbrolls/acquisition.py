@@ -88,6 +88,7 @@ def _save_index(cache, index):
                     os.close(fd)
                 raise
             with stream:  # the only closer of the descriptor from here on
+                effects.make_private(temp)  # on the empty file, before the first byte
                 stream.write(json.dumps(index, ensure_ascii=False))
             temp.chmod(0o600)
             temp.replace(path)
@@ -480,6 +481,7 @@ def fetch_routed_source(ledger, candidate, reacquire=False):  # pylint: disable=
         final = cache / (id_stem(candidate["id"]) + "-fetch-" + sha + suffix)
         # lenient: content-addressed cache name: on a locked cache the replace below raises
         if not final.exists():
+            effects.make_private(routed.path)  # private before it takes the cache name (its writer made it)
             effects.replace(routed.path, final)
             final.chmod(0o600)
         elif digest(final) != sha:
@@ -535,6 +537,7 @@ def _move_into_cache(cache, candidate_id, target, sha, suffix):
     final = cache / (id_stem(candidate_id) + "-" + sha + suffix)
     # lenient: content-addressed cache name: on a locked cache the replace below raises
     if not final.exists():
+        effects.make_private(target)  # private before it takes the cache name (its writer made it)
         effects.replace(target, final)
         final.chmod(0o600)
     elif digest(final) != sha:

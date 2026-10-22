@@ -347,6 +347,8 @@ def copy_from_fd(fd, target, cap, *, mode=0o600, hasher=None):
         copied = 0
         try:
             with os.fdopen(target_fd, "wb") as out:
+                if not mode & 0o077:  # a private copy (the default 0600) gets the private ACL on Windows too
+                    effects.make_private(target)
                 while chunk := os.read(fd, CHUNK_BYTES):
                     copied += len(chunk)
                     if copied > cap:

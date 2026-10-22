@@ -1,9 +1,12 @@
 """Leitor único de arquivo de fora (`getbrolls.reader`): link, teto, permissão, `--project-dir`, cópia e texto."""
 
+import contextlib
+import errno
 import hashlib
 import os
 import pickle
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -131,14 +134,17 @@ class OpenUnderTests(ReaderCase):
         with self.assertRaises(reader.UnreadableError) as caught:
             reader.open_under(self.root, "project/index.html", max_bytes=10)
         self.assertEqual("IO_ERROR", runtime.error_code_for(caught.exception))
-        with self.assertRaises(reader.UnreadableError):
+        self.assertEqual(errno.EACCES, caught.exception.errno)
+        with self.assertRaises(reader.UnreadableError) as listed:
             reader.list_under(self.root, "project")
+        self.assertEqual(errno.EACCES, listed.exception.errno)
 
     @unittest.skipUnless(CAN_CHMOD, "permissões POSIX, sem root")
     def test_a_file_without_permission_is_unreadable(self):
         self.write("x.txt", b"x").chmod(0)
-        with self.assertRaises(reader.UnreadableError):
+        with self.assertRaises(reader.UnreadableError) as caught:
             reader.open_under(self.root, "x.txt", max_bytes=10)
+        self.assertEqual(errno.EACCES, caught.exception.errno)
 
     def test_the_refusal_carries_its_reason_code_and_survives_pickle(self):
         refusal = reader.Refused("link", "project/x")
@@ -172,6 +178,128 @@ class TextAndJsonTests(ReaderCase):
             with self.subTest(name=name):
                 self.write(name, raw)
                 self.refused("bad_json", reader.json_under, self.root, name)
+
+    def test_json_refuses_non_finite_floats_and_lone_surrogates(self):
+        for text in ('{"a": 1e999}', '{"a": -1e999}', '{"a": [1, 1e400]}', '{"a": "\\ud800"}', '{"\\udfff": 1}',
+                     '{"a": {"b": ["x", "\\ud83d"]}}'):  # fmt: skip
+            with self.subTest(text=text):
+                self.write("c.json", text.encode("utf-8"))
+                self.refused("bad_json", reader.json_under, self.root, "c.json")
+
+    def test_finite_floats_pass_and_huge_literals_are_bad_json(self):
+        self.write("c.json", b'{"a": 1e308, "b": -0.0, "c": 1E5, "d": 5e-324, "e": "\\ud83d\\ude00"}')
+        value = reader.json_under(self.root, "c.json")
+        self.assertEqual((1e308, -0.0, 1e5, 5e-324, "😀"), (value["a"], value["b"], value["c"], value["d"], value["e"]))
+        self.addCleanup(sys.set_int_max_str_digits, sys.get_int_max_str_digits())
+        sys.set_int_max_str_digits(4300)  # the default limit, whatever the interpreter was started with
+        self.write("c.json", b'{"a": ' + b"9" * 5000 + b"}")
+        self.refused("bad_json", reader.json_under, self.root, "c.json")
+
+
+class UnreadableHintsTests(ReaderCase):
+    def test_the_hint_follows_the_errno(self):
+        self.assertIn("permissão", reader.hint_for(errno.EACCES))
+        self.assertIn("limite de arquivos abertos", reader.hint_for(errno.EMFILE))
+        self.assertIn("disco", reader.hint_for(errno.EIO))
+        self.assertIn("link", reader.hint_for(errno.ELOOP))
+        self.assertEqual("confira a pasta", reader.hint_for(None))
+        exc = reader.UnreadableError("a/b", "OSError", errno.EMFILE)
+        self.assertEqual(errno.EMFILE, exc.errno)
+        self.assertEqual(
+            "a/b: não consegui ler (OSError); feche outros programas ou aumente o limite de arquivos abertos.",
+            str(exc),
+        )
+
+    def test_an_io_error_mid_read_is_unreadable_with_its_rel(self):
+        self.write("x.txt", b"abc")
+        with (
+            mock.patch.object(reader.os, "read", side_effect=OSError(errno.EIO, "Input/output error")),
+            self.assertRaises(reader.UnreadableError) as caught,
+        ):
+            reader.open_under(self.root, "x.txt", max_bytes=10)
+        self.assertEqual(("x.txt", errno.EIO), (caught.exception.rel, caught.exception.errno))
+        self.assertIn("disco", str(caught.exception))
+
+    @unittest.skipUnless(FD_DIR.is_dir(), "lista de descritores abertos em /dev/fd")
+    def test_a_failed_fstat_is_unreadable_and_closes_the_descriptor(self):
+        # the Windows branch (`_BY_FD` False) kept the fd open when `os.fstat` raised
+        self.write("x.txt", b"abc")
+        before = len(list(FD_DIR.iterdir()))
+        with (
+            mock.patch.object(reader, "_BY_FD", False),
+            mock.patch.object(reader.os, "fstat", side_effect=OSError(errno.EIO, "Input/output error")),
+            self.assertRaises(reader.UnreadableError) as caught,
+        ):
+            reader.open_under(self.root, "x.txt", max_bytes=10)
+        self.assertEqual(("x.txt", errno.EIO), (caught.exception.rel, caught.exception.errno))
+        self.assertEqual(before, len(list(FD_DIR.iterdir())))
+
+    def test_a_failed_fstat_after_the_open_is_unreadable_on_either_path(self):
+        self.write("x.txt", b"abc")
+        for by_fd in (True, False):
+            with self.subTest(by_fd=by_fd):
+                with (
+                    mock.patch.object(reader, "_BY_FD", by_fd),
+                    mock.patch.object(reader.os, "fstat", side_effect=OSError(errno.EIO, "Input/output error")),
+                    self.assertRaises(reader.UnreadableError) as caught,
+                ):
+                    reader.open_under(self.root, "x.txt", max_bytes=10)
+                self.assertEqual(("x.txt", errno.EIO), (caught.exception.rel, caught.exception.errno))
+
+    def test_a_descriptor_shortage_while_opening_is_unreadable_with_the_descriptor_hint(self):
+        self.write("d/x.txt")
+        real_open = os.open
+
+        def short(path, flags, *args, **kwargs):
+            if str(path).endswith("x.txt"):
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real_open(path, flags, *args, **kwargs)
+
+        with (
+            mock.patch.object(reader.os, "open", side_effect=short),
+            self.assertRaises(reader.UnreadableError) as caught,
+        ):
+            reader.open_under(self.root, "d/x.txt", max_bytes=10)
+        self.assertEqual((errno.EMFILE, "d/x.txt"), (caught.exception.errno, caught.exception.rel))
+        self.assertIn("limite de arquivos abertos", str(caught.exception))
+
+    @unittest.skipUnless(POSIX, "descida por descritor só no POSIX")
+    def test_when_the_follow_up_stat_fails_too_its_errno_wins(self):
+        self.write("d/x.txt")
+        real_open, real_stat = os.open, os.stat
+
+        def refuse(path, flags, *args, **kwargs):
+            if str(path) == "x.txt":
+                raise OSError(errno.EACCES, "Permission denied")
+            return real_open(path, flags, *args, **kwargs)
+
+        def broken(path, *args, **kwargs):
+            if str(path) == "x.txt":
+                raise OSError(errno.EIO, "Input/output error")
+            return real_stat(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(reader.os, "open", side_effect=refuse),
+            mock.patch.object(reader.os, "stat", side_effect=broken),
+            self.assertRaises(reader.UnreadableError) as caught,
+        ):
+            reader.open_under(self.root, "d/x.txt", max_bytes=10)
+        self.assertEqual((errno.EIO, "d/x.txt"), (caught.exception.errno, caught.exception.rel))
+        self.assertIn("disco", str(caught.exception))
+
+    def test_a_scan_failure_keeps_its_errno_and_the_error_survives_pickle(self):
+        self.write("d/x.txt")
+        with (
+            mock.patch.object(reader.os, "scandir", side_effect=OSError(errno.EIO, "Input/output error")),
+            self.assertRaises(reader.UnreadableError) as caught,
+        ):
+            reader.list_under(self.root, "d")
+        self.assertEqual(("d", errno.EIO), (caught.exception.rel, caught.exception.errno))
+        for exc in (caught.exception, reader.UnreadableError("a", "OSError")):
+            again = pickle.loads(pickle.dumps(exc))  # noqa: S301 - round trip do nosso próprio objeto
+            self.assertEqual(
+                (str(exc), exc.rel, exc.type_name, exc.errno), (str(again), again.rel, again.type_name, again.errno)
+            )
 
 
 class ListUnderTests(ReaderCase):
@@ -236,6 +364,115 @@ class ListUnderTests(ReaderCase):
         if hasattr(os, "mkfifo"):
             os.mkfifo(self.root / "cano")
             self.assertEqual([("cano", "other")], [e[:2] for e in reader.list_under(self.root).entries])
+
+    @unittest.skipUnless(POSIX, "RLIMIT_NOFILE é POSIX")
+    def test_a_wide_folder_lists_under_a_low_descriptor_limit(self):
+        import resource  # pylint: disable=import-outside-toplevel
+
+        for index in range(300):
+            (self.root / "node_modules" / f"pkg{index:03d}").mkdir(parents=True)
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        used = len(list(FD_DIR.iterdir())) if FD_DIR.exists() else 32
+        low = used + 16
+        if low >= soft:
+            self.skipTest("soft limit already low")
+        resource.setrlimit(resource.RLIMIT_NOFILE, (low, hard))
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        listing = reader.list_under(self.root)
+        self.assertTrue(listing.complete)
+        self.assertEqual(301, len(listing.entries))
+
+    def test_at_most_depth_plus_one_folders_are_open_at_once(self):
+        for index in range(40):
+            (self.root / f"d{index:02d}" / "e" / "f").mkdir(parents=True)
+        peak = [0]
+        real_scan = reader._scan
+
+        def counting(where, rel):
+            if FD_DIR.exists():
+                peak[0] = max(peak[0], len(list(FD_DIR.iterdir())))
+            return real_scan(where, rel)
+
+        base = len(list(FD_DIR.iterdir())) if FD_DIR.exists() else 0
+        with mock.patch.object(reader, "_scan", side_effect=counting):
+            listing = reader.list_under(self.root, max_depth=3)
+        self.assertEqual(40 * 3, len(listing.entries))
+        if FD_DIR.exists():
+            self.assertLessEqual(peak[0] - base, 2)  # uma pasta e a cópia do descritor que o scandir faz
+
+    def test_the_listing_stops_scanning_at_the_entry_ceiling(self):
+        for index in range(6):
+            (self.root / f"d{index}" / "x").mkdir(parents=True)
+        scanned = []
+        opened = []
+        real_scan = reader._scan
+        real_open_folder = reader._open_folder
+
+        def noting(where, rel):
+            scanned.append(rel)
+            return real_scan(where, rel)
+
+        def opening(root, parts, rel, identity):
+            opened.append(rel)
+            return real_open_folder(root, parts, rel, identity)
+
+        with (
+            mock.patch.object(reader, "_scan", side_effect=noting),
+            mock.patch.object(reader, "_open_folder", side_effect=opening),
+        ):
+            listing = reader.list_under(self.root, max_entries=4)
+        self.assertFalse(listing.complete)
+        self.assertEqual(4, len(listing.entries))
+        self.assertEqual([""], scanned)  # a raiz encheu a lista; nenhuma subpasta foi lida
+        self.assertEqual([""], opened)  # nem aberta
+
+    def test_a_subfolder_gone_before_its_visit_is_missing(self):
+        (self.root / "a" / "b").mkdir(parents=True)
+        real_scan = reader._scan
+
+        def removing(where, rel):
+            found = real_scan(where, rel)
+            if rel == "":
+                shutil.rmtree(self.root / "a")
+            return found
+
+        with mock.patch.object(reader, "_scan", side_effect=removing), self.assertRaises(reader.MissingError) as caught:
+            reader.list_under(self.root)
+        self.assertEqual("a", caught.exception.rel)
+
+    def test_a_descriptor_shortage_is_unreadable_with_its_hint_and_leaves_nothing_open(self):
+        (self.root / "a" / "b").mkdir(parents=True)
+        real_open = os.open
+
+        def short(path, flags, *args, **kwargs):
+            if path == "a":
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real_open(path, flags, *args, **kwargs)
+
+        before = len(list(FD_DIR.iterdir())) if FD_DIR.exists() else None
+        with (
+            mock.patch.object(reader.os, "open", side_effect=short),
+            self.assertRaises(reader.UnreadableError) as caught,
+        ):
+            reader.list_under(self.root)
+        self.assertEqual(("a", errno.EMFILE), (caught.exception.rel, caught.exception.errno))
+        if before is not None:
+            self.assertEqual(before, len(list(FD_DIR.iterdir())))
+
+    def test_a_subfolder_replaced_by_another_folder_before_its_visit_is_changed(self):
+        (self.root / "a" / "b").mkdir(parents=True)
+        real_scan = reader._scan
+
+        def replacing(where, rel):
+            found = real_scan(where, rel)
+            if rel == "":
+                (self.root / "a").rename(self.root / "a.old")  # a velha segue viva: o inode não se repete
+                (self.root / "a" / "c").mkdir(parents=True)
+            return found
+
+        with mock.patch.object(reader, "_scan", side_effect=replacing):
+            exc = self.refused("changed", reader.list_under, self.root)
+        self.assertEqual("a", exc.rel)
 
 
 class ProjectDirTests(ReaderCase):
@@ -319,15 +556,85 @@ class WithoutDirFdTests(ReaderCase):
     @unittest.skipUnless(CAN_CHMOD, "permissões POSIX, sem root")
     def test_without_permission_is_unreadable(self):
         self.write("x.txt").chmod(0)
-        with self.assertRaises(reader.UnreadableError):
+        with self.assertRaises(reader.UnreadableError) as caught:
             reader.open_under(self.root, "x.txt", max_bytes=10)
+        self.assertEqual(errno.EACCES, caught.exception.errno)
         (self.root / "p").mkdir()
         (self.root / "p").chmod(0)
         self.addCleanup((self.root / "p").chmod, 0o700)
-        with self.assertRaises(reader.UnreadableError):
+        with self.assertRaises(reader.UnreadableError) as folder:
             reader.open_under(self.root, "p/x.txt", max_bytes=10)
-        with self.assertRaises(reader.UnreadableError):
+        self.assertEqual(errno.EACCES, folder.exception.errno)
+        with self.assertRaises(reader.UnreadableError) as listed:
             reader.list_under(self.root, "p")
+        self.assertEqual(errno.EACCES, listed.exception.errno)
+
+    @needs_symlink
+    def test_a_subfolder_swapped_for_a_link_before_its_visit_is_refused(self):
+        (self.root / "a" / "b").mkdir(parents=True)
+        real_scan = reader._scan
+
+        def swapping(where, rel):
+            found = real_scan(where, rel)
+            if rel == "":
+                shutil.rmtree(self.root / "a")
+                (self.root / "a").symlink_to(self.outside, target_is_directory=True)
+            return found
+
+        with mock.patch.object(reader, "_scan", side_effect=swapping):
+            exc = self.refused("link", reader.list_under, self.root)
+        self.assertEqual("a", exc.rel)
+
+    def test_a_subfolder_replaced_by_another_folder_before_its_visit_is_changed(self):
+        (self.root / "a" / "b").mkdir(parents=True)
+        real_scan = reader._scan
+
+        def replacing(where, rel):
+            found = real_scan(where, rel)
+            if rel == "":
+                (self.root / "a").rename(self.root / "a.old")  # a velha segue viva: o inode não se repete
+                (self.root / "a" / "c").mkdir(parents=True)
+            return found
+
+        with mock.patch.object(reader, "_scan", side_effect=replacing):
+            exc = self.refused("changed", reader.list_under, self.root)
+        self.assertEqual("a", exc.rel)
+
+    def test_a_scan_without_inode_numbers_still_checks_the_subfolder(self):
+        """No Windows o `stat` do `scandir` vem com `st_ino` 0: a identidade vem do `lstat`."""
+        (self.root / "a" / "b").mkdir(parents=True)
+        real_scandir = os.scandir
+
+        class Zeroed:
+            def __init__(self, item):
+                self.name, self.path, self.item = item.name, item.path, item
+
+            def __getattr__(self, attribute):
+                return getattr(self.item, attribute)
+
+            def stat(self, *, follow_symlinks=True):
+                info = self.item.stat(follow_symlinks=follow_symlinks)
+                return os.stat_result((info.st_mode, 0, 0, *tuple(info)[3:10]))
+
+        @contextlib.contextmanager
+        def zeroed(where):
+            with real_scandir(where) as found:
+                yield [Zeroed(item) for item in found]
+
+        with mock.patch.object(reader.os, "scandir", side_effect=zeroed):
+            listing = reader.list_under(self.root)
+            self.assertEqual((["a", "a/b"], True), ([entry.rel for entry in listing.entries], listing.complete))
+            real_scan = reader._scan
+
+            def replacing(where, rel):
+                found = real_scan(where, rel)
+                if rel == "":
+                    (self.root / "a").rename(self.root / "a.old")  # a velha segue viva: o inode não se repete
+                    (self.root / "a" / "c").mkdir(parents=True)
+                return found
+
+            with mock.patch.object(reader, "_scan", side_effect=replacing):
+                self.refused("changed", reader.list_under, self.root)
 
 
 class CopyUnderTests(ReaderCase):
@@ -450,6 +757,161 @@ class UntrustedTextTests(unittest.TestCase):
         self.assertLessEqual(len(body.encode("utf-8")), reader.UNTRUSTED_LIMIT)
         self.assertTrue(body.endswith("…"))
         self.assertEqual("\ufffd", reader.untrusted_text(b"\xff", origin="hyperframes")["body"])
+
+    def test_a_secret_sliding_across_the_edge_never_leaves_a_prefix(self):
+        token = joined("ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0")
+        for offset in range(reader.UNTRUSTED_LIMIT - 120, reader.UNTRUSTED_LIMIT + 40, 4):
+            with self.subTest(offset=offset):
+                body = reader.untrusted_text("x" * offset + " token " + token + " fim", origin="env1")["body"]
+                self.assertNotIn("ghp_", body)
+                self.assertNotIn(token[:12], body)
+                self.assertLessEqual(len(body.encode("utf-8")), reader.UNTRUSTED_LIMIT)
+
+    def test_a_url_and_a_path_at_the_edge_never_survive(self):
+        tails = (
+            "https://ex.com/segredo?token=abc",
+            "/Volumes/Acervo/cliente/x.mp4",
+            "C:\\Users\\cliente\\Acervo\\x.mp4",
+        )
+        for tail in tails:
+            for offset in range(reader.UNTRUSTED_LIMIT - 60, reader.UNTRUSTED_LIMIT + 10, 2):
+                with self.subTest(tail=tail, offset=offset):
+                    body = reader.untrusted_text("x" * offset + " " + tail, origin="env1")["body"]
+                    self.assertNotIn("segredo", body)
+                    self.assertNotIn("Acervo", body)
+
+    def test_a_multibyte_character_at_the_edge_never_breaks_utf8(self):
+        text = "x" * (reader.UNTRUSTED_LIMIT - 4) + "😀😀😀"
+        body = reader.untrusted_text(text, origin="env1")["body"]
+        body.encode("utf-8")  # must not raise
+        self.assertTrue(body.endswith("…"))
+        self.assertLessEqual(len(body.encode("utf-8")), reader.UNTRUSTED_LIMIT)
+
+    def test_a_secret_cut_by_the_input_window_never_leaves_a_prefix_after_the_blanks_collapse(self):
+        token = joined("ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0")
+        window = reader.UNTRUSTED_LIMIT * 4
+        for blanks in (window - 6, window - 12, window - 30):
+            with self.subTest(blanks=blanks):
+                body = reader.untrusted_text("ok" + " " * blanks + token, origin="env1")["body"]
+                inside = window - len("ok") - blanks  # characters of the token that the window keeps
+                self.assertNotIn(token[:inside], body)
+                self.assertNotIn("ghp_", body)
+                self.assertTrue(body.startswith("ok"))
+
+    def test_a_cut_secret_never_survives_however_much_the_blanks_collapse(self):
+        token = joined("ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0")
+        window = reader.UNTRUSTED_LIMIT * 4
+        for filler in (" ", "\n", "\x07", "\t \x00", "\u200b"):
+            for lead in (0, 1500, 5000):
+                with self.subTest(filler=filler, lead=lead):
+                    text = "ok " * lead + filler * (window - len("ok ") * lead - 9) + token
+                    body = reader.untrusted_text(text, origin="env1")["body"]
+                    self.assertNotIn("ghp_", body)
+                    self.assertNotIn(token[:9], body)
+
+    def test_a_cut_secret_never_survives_when_the_redactor_shortens_what_came_before(self):
+        token = joined("ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0")
+        window = reader.UNTRUSTED_LIMIT * 4
+        aws = joined("AKI", "A") + "A" * 16
+        cases = {
+            "aws key then padding": aws + "x" * 16342 + "," + token + " more",
+            "url up to a quote": "https://ex.com/" + "a" * 16347 + '"' + token + " more",
+        }
+        urls = ",".join('"https://cdn.ex.com/' + "a" * 140 + '"' for _ in range(100))
+        head, tail = '{"u":[' + urls + '],"p":"', '","t":"'
+        pad = window - 21 - len(head) - len(tail)
+        cases["minified json with a hundred urls"] = head + "x" * pad + tail + token + '"} more'
+        for name, text in cases.items():
+            with self.subTest(name=name):
+                self.assertGreater(len(text), window)
+                body = reader.untrusted_text(text, origin="env1")["body"]
+                self.assertNotIn("ghp_", body)
+                self.assertNotIn(token[:9], body)
+        quoted = '{"client_secret":"' + "Zq9" * 6000 + '"}'
+        self.assertNotIn("Zq9", reader.untrusted_text(quoted, origin="env1")["body"])
+
+    def test_a_cut_secret_after_a_spaced_url_list_never_leaves_a_prefix(self):
+        token = joined("ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0")
+        window = reader.UNTRUSTED_LIMIT * 4
+        head = ("https://cdn.ex.com/" + "a" * 140 + " ") * 100
+        pad = window - 9 - len(head) - 1
+        text = head + "x" * pad + " " + token + " more"
+        self.assertEqual(window - 9, len(head) + pad + 1)
+        body = reader.untrusted_text(text, origin="env1")["body"]
+        self.assertNotIn("ghp_", body)
+        self.assertTrue(body.startswith("[URL omitida]"))
+
+    def test_a_token_split_by_an_invisible_character_is_still_redacted(self):
+        token = joined("ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0")
+        for invisible in ("\u200b", "\u202e", "\ufeff", "\u2066", "\u00ad", "\x00"):
+            with self.subTest(invisible=invisible):
+                body = reader.untrusted_text("texto " + token[:4] + invisible + token[4:], origin="env1")["body"]
+                self.assertNotIn("ghp_", body)
+                self.assertNotIn(token[4:12], body)
+        self.assertEqual("a olleh b", reader.untrusted_text("a \u202eolleh\u202c b", origin="env1")["body"])
+
+    def test_a_token_split_at_every_point_by_an_invisible_character_is_redacted(self):
+        token = joined("ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0")
+        for invisible in ("\u200b", "\u202e", "\ufeff", "\u00ad", "\x00"):
+            for cut in range(1, len(token)):
+                with self.subTest(invisible=invisible, cut=cut):
+                    text = "texto " + token[:cut] + invisible + token[cut:] + " fim"
+                    body = reader.untrusted_text(text, origin="env1")["body"]
+                    self.assertNotIn("ghp_", body)
+                    self.assertNotIn(token[4:12], body)
+
+    def test_an_invisible_character_never_hides_a_secret_keyword_from_the_redactor(self):
+        value = "Zk3pQ8wLmn4R"
+        cases = (
+            "x{z}password={v}",
+            "x{z}token={v}",
+            "x{z}secret={v}",
+            "x{z}senha: {v}",
+            "x{z}Token: {v}",
+            "x{z}Cookie: sid={v}",
+            "Bearer{z}{v}",
+            "Basic{z}{v}",
+            "ok x{z}api_key={v} fim",
+            "x{z}Authorization: {v}",
+            "x{z}Bearer {v}",
+            "x{z}Basic {v}",
+            "ab{z}Bearer {v}",
+            "x{z}password{z}={v}",
+            "x{z}token{z}: {v}",
+            "x{z}Authorization{z}: {v}",
+            "x{z}Bearer{z}{v}",
+        )
+        for invisible in ("\u200b", "\u202e", "\ufeff", "\x00"):
+            for template in cases:
+                with self.subTest(invisible=invisible, template=template):
+                    body = reader.untrusted_text(template.format(z=invisible, v=value), origin="env1")["body"]
+                    self.assertNotIn(value, body)
+                    self.assertNotIn(value[:6], body)
+
+    def test_an_invisible_character_never_glues_a_path_or_a_url_to_the_word_before(self):
+        cases = (
+            ("x\u200b/Volumes/Acervo/cliente/x.mp4", ("Acervo", "cliente")),
+            ("x\u200bhttps://ex.com/segredo", ("segredo",)),
+            ("x\x00https://ex.com/segredo", ("segredo",)),
+            ("ok\u202e/Volumes/Acervo/cliente/x.mp4", ("Acervo", "cliente")),
+            ("x\u200b\u200b\ufeffC:\\Users\\cliente\\Acervo\\x.mp4", ("Acervo", "cliente")),
+        )
+        for text, secrets in cases:
+            with self.subTest(text=text):
+                body = reader.untrusted_text(text, origin="env1")["body"]
+                for secret in secrets:
+                    self.assertNotIn(secret, body)
+
+    def test_a_normal_long_text_still_ends_with_an_ellipsis_within_the_limit(self):
+        for text in ("palavra " * 6000, "ação " * 6000):
+            with self.subTest(text=text[:8]):
+                body = reader.untrusted_text(text, origin="env1")["body"]
+                self.assertTrue(body.endswith("…"))
+                self.assertLessEqual(len(body.encode("utf-8")), reader.UNTRUSTED_LIMIT)
+                self.assertGreater(len(body.encode("utf-8")), reader.UNTRUSTED_LIMIT - 8)
+
+    def test_one_word_longer_than_the_window_has_no_body(self):
+        self.assertEqual("", reader.untrusted_text("x" * 20000, origin="env1")["body"])
 
     def test_the_origin_is_an_id(self):
         for origin in ("", "Hyper Frames", "../x", None):

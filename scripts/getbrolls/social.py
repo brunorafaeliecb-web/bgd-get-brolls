@@ -324,6 +324,7 @@ def _write_private(path, text):
             newline="\n",
         ) as stream,
     ):
+        effects.make_private(path)
         stream.write(text)
 
 
@@ -410,7 +411,7 @@ def probe_remote(  # noqa: C901 - existing size; one branch per cache/retry/subt
     resolve(url)
     cache = Path(cache) if cache is not None else None
     if cache is not None:
-        effects.mkdir(cache, parents=True, exist_ok=True)
+        effects.mkdir(cache, parents=True, exist_ok=True, mode=0o700)
         cache.chmod(0o700)
     subtitles = {}
     with effects.temp_dir(folder=str(cache) if cache else None) as work:

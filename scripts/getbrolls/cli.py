@@ -119,7 +119,7 @@ SUMMARIES = {
     "learn": "Guardar busca, preferência ou trecho útil na biblioteca entre projetos",
     "library": "Consultar a biblioteca entre projetos antes de sair buscando",
     "browser-plan": "Planejar a captura de uma página pelo navegador autorizado",
-    "queue": "Enfileirar URLs sociais e ditar o ritmo do lote (add, next, mark, status)",
+    "queue": "Enfileirar URLs sociais e ditar o ritmo do lote (add, next, mark, status, resume)",
     "serve": "Servir brolls/review.html em 127.0.0.1 para abrir o Storyboard no navegador",
     "deliver": "Organizar os trechos coletados em entrega/, uma pasta por beat",
     "roteiro": "Criar, validar, revisar e sincronizar o ROTEIRO.md com os beats do BRIEF.md",
@@ -957,23 +957,26 @@ def _add_queue_args(p, name):
     if name != "queue":
         return
     mark_help = (
-        "mark: item falhou; motivo com 403/429, challenge/login, 'rate limit'/'too many requests' ou as "
-        "mensagens de bloqueio da própria skill (sessão de acesso, IP bloqueado, limite de requisições) "
-        "abre cooldown"
+        "mark: item falhou; motivo com 429, 'rate limit', 'too many requests' ou 'limite de requisições' abre "
+        "cooldown (ritmo); motivo com "
+        "login, challenge, captcha, 401/403 ou as mensagens de bloqueio da própria skill (sessão de acesso, IP "
+        "bloqueado) para a fila do provedor, sem cooldown e sem horário para voltar"
     )
     p.add_argument(
         "--action",
-        choices=["add", "next", "mark", "status"],
+        choices=["add", "next", "mark", "status", "resume"],
         required=True,
         help=(
             "add: enfileirar URLs; next: próximo item ou tempo de espera; mark: registrar resultado; "
-            "status: contagens e cooldown"
+            "status: contagens, cooldown e paradas; "
+            "resume: com --provider, --by, --phrase e --expect, limpa a parada de um provedor depois que a "
+            "pessoa confirmou, no chat, que o acesso voltou"
         ),
     )
     p.add_argument(
         "--provider",
         choices=["instagram", "tiktok", "youtube"],
-        help="Fonte das URLs em add; em next, limita a fila a essa fonte",
+        help="Fonte das URLs em add; em next, limita a fila a essa fonte; em resume, o provedor a retomar",
     )
     p.add_argument("urls", nargs="*", help="URLs públicas a enfileirar (add); repetidas são ignoradas")
     p.add_argument("--url", action="append", help="URL pública a enfileirar (add); pode repetir")
@@ -983,6 +986,11 @@ def _add_queue_args(p, name):
     g.add_argument("--failed", action="store_true", help=mark_help)
     g.add_argument("--skipped", action="store_true", help="mark: item pulado sem tentar")
     p.add_argument("--reason", help="Motivo real registrado no item (mark)")
+    p.add_argument("--by", help="resume: nome de quem confirmou, no chat, que o acesso voltou")
+    p.add_argument(
+        "--phrase", dest="statement", help="resume: frase exata dita por essa pessoa, registrada literalmente"
+    )
+    p.add_argument("--expect", help="resume: o instante `at` da parada que a pessoa viu (status: stopped.at)")
 
 
 def _add_candidate_arg(p, name):

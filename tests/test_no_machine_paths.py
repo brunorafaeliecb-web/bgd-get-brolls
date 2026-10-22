@@ -9,6 +9,7 @@ linha acrescentada a um log é um caminho da máquina. Só os campos de `ALLOWED
 máquina usa e o contrato lista (`docs/CLI_CONTRACT.md`, "Sem caminho da máquina") — podem levá-lo.
 """
 
+import json
 import os
 import re
 import shutil
@@ -81,6 +82,7 @@ ALLOWED_FIELDS = frozenset(
         ("queue add", "stdout.json.queue"),
         ("queue mark", "stdout.json.queue"),
         ("queue next", "stdout.json.queue"),
+        ("queue resume", "stdout.json.queue"),
         ("queue status", "stdout.json.queue"),
         ("recipe show", "stdout.json.path"),
         ("reject", "stdout.json.local_path"),
@@ -216,6 +218,28 @@ def extra_cases(tmp, _state):
     yield "roteiro_plan", ["roteiro", "--action", "plan", "--project", v2], {}
     yield "assets_list", ["assets", "--action", "list", "--project", v2], {}
     yield "assets_where", ["assets", "--action", "where", "--kind", "sfx", "--name", "whoosh", "--project", v2], {}
+    # A fila parada e retomada: o `--expect` é o `at` que o `status` mostrou, lido do disco entre os casos.
+    q = str(work / "qproj")
+    yield "queue_add_q", ["queue", "--action", "add", "--provider", "instagram", *REELS, "--project", q], {}
+    yield "queue_next_q", ["queue", "--action", "next", "--project", q], {}
+    yield (
+        "queue_mark_q",
+        ["queue", "--action", "mark", "--id", "instagram:ABC123xyz", "--failed", "--reason", "login", "--project", q],
+        {},
+    )
+    yield "queue_next_stopped_q", ["queue", "--action", "next", "--project", q], {}
+    yield "queue_status_stopped_q", ["queue", "--action", "status", "--project", q], {}
+    stopped_at = json.loads((work / "qproj" / "work" / "queue.json").read_text(encoding="utf-8"))["providers"][
+        "instagram"
+    ]["stopped"]["at"]
+    yield (
+        "queue_resume_q",
+        [
+            *("queue", "--action", "resume", "--provider", "instagram", "--by", "Bruno"),
+            *("--phrase", "voltei a logar", "--expect", stopped_at, "--project", q),
+        ],
+        {},
+    )
     yield "analysis_register", ["analysis", "--action", "register", "--path", "aroll/c01.mp4", "--project", v2], {}
     # Uma ferramenta que falha e diz o caminho no stderr (o ffprobe numa mídia quebrada): o erro leva a marca.
     yield "resolve_broken_media", ["resolve", "--file", "v2/aroll/quebrado.mp4", "--project", v2], {}
@@ -249,6 +273,7 @@ def extra_cases(tmp, _state):
 
 
 REF = "cat:getbrolls/recipe/acme.reels-acme@1"
+REELS = ("https://www.instagram.com/reel/ABC123xyz/", "https://www.instagram.com/reel/DEF456uvw/")
 
 
 def prepare_extra(tmp):

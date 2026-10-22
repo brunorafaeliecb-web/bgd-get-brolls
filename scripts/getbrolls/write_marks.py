@@ -79,6 +79,8 @@ MARKS: dict[tuple[str, str | None], str] = {
     ("queue", "add"): "G",
     ("queue", "mark"): "G",
     ("queue", "next"): "G",
+    # Portão humano (`--by --phrase --expect`): tira `stopped` de `work/queue.json` e grava quem e com que frase.
+    ("queue", "resume"): "P",
     ("queue", "status"): "L",
     ("recipe", "list"): "L",
     ("recipe", "show"): "L",

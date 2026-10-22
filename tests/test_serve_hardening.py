@@ -17,6 +17,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from argparse import Namespace
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -29,7 +30,7 @@ from _paths import ROOT  # noqa: F401  (efeito de import: insere scripts/ em sys
 from _posix import without_nofollow
 from _symlink import needs_symlink
 
-from getbrolls import serve
+from getbrolls import config, serve
 
 
 def _project_with_review(root):
@@ -568,6 +569,98 @@ class BackgroundEnvironmentTests(unittest.TestCase):
             self.assertEqual(4242, result["pid"])
 
 
+class BackgroundDoesNotReloadSecretsTests(unittest.TestCase):
+    """O pai tira as chaves do ambiente do filho; o filho não pode trazê-las de volta lendo o `.env`."""
+
+    SECRETS = ("PEXELS_API_KEY", "PIXABAY_API_KEY", "YOUTUBE_API_KEY")
+
+    def write_env(self, folder):
+        path = Path(folder) / "chaves.env"
+        path.write_text(
+            "PEXELS_API_KEY=segredo-pexels\nPIXABAY_API_KEY=segredo-pixabay\nYOUTUBE_API_KEY=segredo-youtube\n"
+            "GB_GIF_WIDTH=400\nGB_LOG_LEVEL=DEBUG\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        return path
+
+    @contextmanager
+    def clean_environment(self, *, marker=None):
+        """Ambiente sem as chaves e com `marker` (ou nenhum) no marcador; o registro de `load_env` limpo."""
+        names = (*self.SECRETS, "GB_GIF_WIDTH", "GB_LOG_LEVEL", serve.CHILD_ENV)
+        with patch.dict(os.environ), patch.dict(config._ENV_APPLIED):  # pylint: disable=protected-access
+            for name in names:
+                os.environ.pop(name, None)
+            if marker is not None:
+                os.environ[serve.CHILD_ENV] = marker
+            yield
+
+    def load(self, command, folder):
+        """O que o despacho do comando faz com o `.env` (`load_environment`); devolve o que o ambiente ficou tendo."""
+        args = Namespace(command=command, project=None, env_file=str(self.write_env(folder)), profile=None)
+        config.load_environment(args, warn=False)
+        return {key: os.environ.get(key) for key in (*self.SECRETS, "GB_GIF_WIDTH")}
+
+    def test_the_marker_is_the_one_the_parent_puts_in_the_child_environment(self):
+        self.assertEqual(config.SERVE_CHILD_ENV, serve.CHILD_ENV)
+        self.assertEqual(config.SERVE_CHILD_TOKEN, serve._child_environment({}, None)[config.SERVE_CHILD_ENV])
+        self.assertNotIn(config.SERVE_CHILD_TOKEN, ("", "0", "1"))
+
+    def test_the_serve_child_skips_secret_keys_and_still_loads_the_other_settings(self):
+        with tempfile.TemporaryDirectory() as tmp, self.clean_environment(marker=config.SERVE_CHILD_TOKEN):
+            loaded = self.load("serve", tmp)
+            for key in self.SECRETS:
+                self.assertIsNone(loaded[key], key)
+            self.assertEqual("400", loaded["GB_GIF_WIDTH"])
+            self.assertEqual(400, config.settings()["width"])
+
+    def test_load_env_withholds_only_when_asked(self):
+        with tempfile.TemporaryDirectory() as tmp, self.clean_environment():
+            applied = config.load_env(self.write_env(tmp), withhold_secrets=True)
+            self.assertEqual({"GB_GIF_WIDTH", "GB_LOG_LEVEL"}, set(applied))
+        with tempfile.TemporaryDirectory() as tmp, self.clean_environment():
+            applied = config.load_env(self.write_env(tmp))
+            self.assertTrue(set(self.SECRETS) <= set(applied))
+
+    def test_a_foreground_command_with_the_variable_exported_still_reads_the_keys(self):
+        for command in ("search", "doctor", "serve"):
+            for value in (config.SERVE_CHILD_TOKEN, "1", "0", "true"):
+                if command == "serve" and value == config.SERVE_CHILD_TOKEN:
+                    continue  # esse é o filho de fundo
+                with (
+                    self.subTest(command=command, value=value),
+                    tempfile.TemporaryDirectory() as tmp,
+                    self.clean_environment(marker=value),
+                ):
+                    loaded = self.load(command, tmp)
+                    self.assertEqual("segredo-pexels", loaded["PEXELS_API_KEY"])
+                    self.assertEqual("segredo-youtube", loaded["YOUTUBE_API_KEY"])
+
+    def test_every_process_other_than_the_serve_child_still_reads_the_keys(self):
+        with tempfile.TemporaryDirectory() as tmp, self.clean_environment():
+            loaded = self.load("search", tmp)
+            self.assertEqual("segredo-pexels", loaded["PEXELS_API_KEY"])
+
+    def test_a_real_background_child_never_sees_the_keys_of_the_env_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _project_with_review(Path(tmp) / "projeto")
+            env_file = self.write_env(tmp)
+            with self.clean_environment():
+                os.environ["GB_ENV_FILE"] = str(env_file)
+                started = _start_background(self, root)
+                try:
+                    self.assertTrue(started["background"])
+                    log = (root / "brolls" / "getbrolls.log").read_text(encoding="utf-8")
+                finally:
+                    serve.stop(root)
+            lines = [line for line in log.splitlines() if "event=config" in line]
+            # O `.env` foi lido (o nível DEBUG vem dele, e a linha só existe nesse nível) e as chaves ficaram de fora.
+            self.assertEqual(1, len(lines), log)
+            self.assertRegex(lines[0], r"provider_keys=(?![a-z])")
+            for secret in ("segredo-pexels", "segredo-pixabay", "segredo-youtube"):
+                self.assertNotIn(secret, log)
+
+
 class MissingStoryboardMessageTests(unittest.TestCase):
     def test_the_storyboard_of_the_project_is_named_under_the_project(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -584,7 +677,7 @@ class ServeLogRedactionTests(unittest.TestCase):
     """O que o servidor de fundo escreve em `.serve.log` passa pela mesma redação do `getbrolls.log`."""
 
     def test_the_child_environment_asks_for_the_filter(self):
-        self.assertEqual("1", serve._child_environment({}, None)[serve.CHILD_ENV])
+        self.assertEqual(config.SERVE_CHILD_TOKEN, serve._child_environment({}, None)[serve.CHILD_ENV])
 
     def test_a_foreground_process_is_left_alone(self):
         before = (serve.sys.stdout, serve.sys.stderr)

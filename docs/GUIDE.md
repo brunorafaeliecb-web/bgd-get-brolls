@@ -84,12 +84,12 @@ python3 scripts/gb.py doctor
 Instale Python 3.11+, FFmpeg e Node 22+ pelos instaladores oficiais ou pelo gerenciador de pacotes da sua preferência. Durante a instalação, habilite o `PATH`. Abra PowerShell na pasta `get-brolls/` e execute:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/install.ps1 -Check
-powershell -ExecutionPolicy Bypass -File scripts/install.ps1
+powershell -ExecutionPolicy RemoteSigned -File scripts/install.ps1 -Check
+powershell -ExecutionPolicy RemoteSigned -File scripts/install.ps1
 python scripts/gb.py doctor
 ```
 
-O instalador delega ao `python scripts/gb.py setup`, com o runtime em `$GB_HOME\runtime` (layout `.venv\Scripts`), e o launcher `.cmd` do Playwright; não exige Git Bash nem WSL. Se a política local já permite scripts, também é possível executar `& .\scripts\install.ps1`. Os helpers `.sh` de YouTube são opcionais; no Windows, use `search`, `preview`, `fetch` e `verify` pela CLI principal.
+Uma pasta que veio de um zip baixado pode precisar de `Unblock-File -Path scripts\*.ps1` uma vez; esse passo é da pessoa, não do agente, e nada aqui altera a política de execução da máquina. Se a política recusar `.ps1`, `python scripts/gb.py setup --check` e `setup` rodam sem executar script. O instalador delega ao `python scripts/gb.py setup`, com o runtime em `$GB_HOME\runtime` (layout `.venv\Scripts`), e o launcher `.cmd` do Playwright; não exige Git Bash nem WSL. Se a política local já permite scripts, também é possível executar `& .\scripts\install.ps1`. Os helpers `.sh` de YouTube são opcionais; no Windows, use `search`, `preview`, `fetch` e `verify` pela CLI principal.
 
 Linux continua compatível como plataforma secundária. Em Ubuntu/Debian, instale `python3`, `python3-venv`, `ffmpeg` e `curl`, além de Node 22+, e use `scripts/install.sh` como no macOS.
 
@@ -117,7 +117,7 @@ No Windows PowerShell, use os mesmos argumentos pelo launcher nativo:
 
 A extensão Playwright e o plugin de navegador do agente são integrações diferentes. Use a que estiver disponível; não tente conectar a extensão de uma ferramenta com a CLI da outra. A instalação da CLI não instala extensões nem importa cookies. Consulte a [documentação oficial da extensão](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md) quando precisar configurar essa alternativa.
 
-Sem navegador existente, crie sessão própria:
+Sem navegador existente, as ferramentas e a política do host decidem: uma sessão própria só se o host permitir rodar a CLI do Playwright e a pessoa entrar sozinha nela; senão, explique e aceite o MP4 dela:
 
 ```sh
 bash scripts/playwright.sh -s=getbrolls-instagram open https://www.instagram.com/ --headed
@@ -177,7 +177,7 @@ ffprobe = "/usr/local/bin/ffprobe"
 
 Como migrar: escreva o arquivo, rode `getbrolls profile --action trust` (mostra o que ele fixaria e o sha256), confira e rode `getbrolls profile --action trust --yes --expect <sha256>`; depois compare `getbrolls profile --action show` com o `doctor` do script antigo. A precedência é flag > ambiente (e `.env`) > perfil > padrão, então um `GB_*` exportado ainda ganha do arquivo. O perfil não habilita plugin nem aceita caminho relativo em `[tools]`. Num repositório compartilhado, prefira um `home` absoluto fora dele (o `.env` e o `plugins.json` de lá não entram no sha do perfil; com o `home` dentro da pasta do toml, o `profile --action trust` avisa). Referência completa em [MANUAL.md](MANUAL.md#-perfil-do-workspace-getbrollstoml).
 
-### Codex e Claude Code
+### Codex, Claude Code e outros agentes
 
 Use o repositório oficial [engenheirodevideo/get-brolls](https://github.com/engenheirodevideo/get-brolls): `git clone https://github.com/engenheirodevideo/get-brolls.git`. Clone ou copie a pasta completa da skill para **um** dos destinos abaixo. Escolha instalação pessoal ou por projeto para evitar duplicatas com o mesmo nome. Exclua `.venv/`, `.tools/`, `__pycache__/`, projetos e arquivos privados ao copiar uma árvore de desenvolvimento. Execute o instalador no destino final; não mova uma venv entre pastas:
 
@@ -185,6 +185,9 @@ Use o repositório oficial [engenheirodevideo/get-brolls](https://github.com/eng
 |---|---|---|---|
 | Codex | `~/.agents/skills/get-brolls/` | `.agents/skills/get-brolls/` | `$get-brolls` |
 | Claude Code | `~/.claude/skills/get-brolls/` | `.claude/skills/get-brolls/` | `/get-brolls` |
+| Outros agentes | a pasta de skills do agente (clone como skill) | a pasta de skills do projeto, se houver | pelo nome da skill, `get-brolls`; sem comandos `/getbrolls:…` |
+
+**Outros agentes.** Clone como skill e rode, pelo caminho absoluto: `python3 <caminho-absoluto>/scripts/gb.py setup --check`, depois `setup` e `doctor`. Não existe `${CLAUDE_PLUGIN_ROOT}` nem comando de barra fora do Claude Code: onde o SKILL.md cita `/getbrolls:get-brolls-setup` ou `/getbrolls:get-brolls-brief`, peça o passo em palavras (preparar o ambiente, entrevistar o brief). Antes de rodar, diga à pessoa o que o `setup` faz: baixa yt-dlp/EJS do PyPI e o Playwright CLI do npm para `$GB_HOME/runtime`, sem tocar em instalações globais; rode só o que ela autorizou, e, se o host recusar um comando ou pedir elevação, pare e entregue o comando exato à pessoa. O agente precisa de um shell com Python 3.11+, FFmpeg, curl e Node 22+ com npx. Para Instagram, ainda precisa de respostas de rede do navegador; sem isso, a pessoa fornece o MP4.
 
 Preserve cópias anteriores antes de substituir. Abra nova sessão para verificar descoberta. Use caminhos absolutos quando executar de outra pasta:
 
@@ -209,7 +212,7 @@ Se `--check` falhar, instale o executável/versão apontado. Se a extração fal
 
 - Python 3.11+, FFmpeg/ffprobe; yt-dlp[default]/EJS e runtime JS para fontes sociais. Navegador/Playwright e curl no processo Instagram.
 - O Storyboard usa navegador moderno com JavaScript, Blob e localStorage. Se armazenamento local falhar, exporte o JSON antes de fechar.
-- Caminhos de prévias são relativos: compartilhe `brolls/` completo.
+- Caminhos de prévias são relativos: para só mostrar o Storyboard, compartilhe o pacote mínimo, `review.html` com a pasta `previews/` ao lado. Nunca a pasta `brolls/` inteira: ela guarda logs e diagnósticos.
 - CLI preserva schema do manifest v1 e adiciona `project_id`, metadados de prévia e revisão. Exportação de revisão usa `templateVersion: 2`.
 - Artefatos do protótipo anterior não têm assinatura de fonte/intervalo; não podem ser importados. Regenere o storyboard com `review`.
 - `--shot` permite múltiplos inserts da mesma fonte; sem ele, a resolução deduplica por fonte.
@@ -246,22 +249,24 @@ Se você não quiser confirmar cada execução do CLI, registre uma permissão p
 ```text
 /permissions
 Allow → Bash
-python3 */gb.py *
+python3 /caminho/real/do/plugin/scripts/gb.py *
 ```
 
-É uma escolha do usuário, não um requisito da skill: sem ela, cada comando é apenas confirmado na hora. A regra vale para o CLI do plugin em qualquer pasta; não conceda permissão ampla de shell.
+Escreva o caminho absoluto já resolvido da instalação revisada, porque o `/permissions` não expande variáveis: no plugin, o que `${CLAUDE_PLUGIN_ROOT}/scripts/gb.py` vale na pasta real do plugin (o mesmo caminho em que o comando roda); num clone, o caminho absoluto dele. A pasta de cache do plugin é versionada, então refaça a regra depois de um `/plugin update`. Um curinga como `python3 */gb.py *` cobriria qualquer instalação, inclusive uma que você nunca revisou.
+
+É uma escolha do usuário, não um requisito da skill: sem ela, cada comando é apenas confirmado na hora. A regra vale só para esse CLI, nessa pasta; não conceda permissão ampla de shell.
 
 ### Migração para 2.3.5
 
 Preserve `.env`, projetos, originais e `.getbrolls-sources/`. Atualize a pasta da skill e repita o instalador do seu sistema para aplicar o conjunto de dependências registrado. Gere novamente o Storyboard com `review`, confira as decisões e exporte um novo JSON. O importador agora confere `reviewEpoch`: um JSON sem esse campo ou baseado numa decisão substituída é recusado, mesmo que vídeo e intervalo sejam os mesmos. Isso também impede reimportar o mesmo JSON depois de sua primeira importação; exporte novamente do Storyboard atualizado. Nenhum item é salvo quando o lote contém uma decisão obsoleta. A atribuição `--by` continua sendo humana e não autentica o revisor.
 
-O transporte HTTP de APIs e bancos conecta diretamente aos IPs públicos validados, mantendo a validação normal do certificado e hostname HTTPS. Redirecionamentos continuam bloqueados. Proxies configurados automaticamente no ambiente ou sistema não são usados por esse transporte; redes corporativas que exigem proxy precisam de uma conexão direta autorizada. Isso não configura nem altera os transportes externos de yt-dlp, curl ou navegador.
+O transporte HTTP de APIs e bancos conecta diretamente aos IPs públicos validados, mantendo a validação normal do certificado e hostname HTTPS. Redirecionamentos continuam bloqueados. Proxies configurados automaticamente no ambiente ou sistema não são usados por esse transporte; redes corporativas que exigem proxy precisam de uma conexão direta autorizada. Isso não configura nem altera os transportes externos de yt-dlp, curl ou navegador, e curl e yt-dlp **herdam** o proxy do ambiente (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`) e a configuração própria de cada um, enquanto o navegador usa o proxy do sistema: a assimetria é esta, o transporte interno ignora o proxy e as ferramentas externas o usam.
 
 ### Migração para 2.3.4
 
 A prévia remota agora pode adquirir um trecho e guardar `local_start_s` junto ao hash da fonte. A assinatura inclui esse offset. Preserve o projeto e as decisões antigas como histórico, gere nova prévia/review e solicite nova decisão quando a revisão anterior for recusada por assinatura desatualizada. Não edite hashes/assinaturas para forçar uma aprovação antiga.
 
-Projetos que já possuíam arquivo local continuam usando esse arquivo. Preserve os caminhos dos originais e `.getbrolls-sources/` para regenerar prévias; compartilhar só `brolls/` permite visualizar o storyboard, não continuar toda a edição em outro computador.
+Projetos que já possuíam arquivo local continuam usando esse arquivo. Preserve os caminhos dos originais e `.getbrolls-sources/` para regenerar prévias; compartilhar só `review.html` e `previews/` permite visualizar o storyboard, não continuar a edição em outro computador. Nunca envie a pasta `brolls/` inteira: ela guarda logs e diagnósticos do projeto.
 
 A matriz da 2.3.4 passou em macOS e Windows em Python 3.11/3.13, com Linux/Python 3.13 como plataforma secundária. O Windows usa instalador PowerShell, layout `.venv\Scripts` e trava nativa; os helpers Bash opcionais não fazem parte do caminho principal nesse sistema. Cada atualização deve passar pela matriz do próprio PR antes do merge. As versões de dependências ensaiadas estão na seção [Instalação](#instalação).
 
@@ -352,7 +357,7 @@ Descubra a URL pelo navegador; não há busca global TikTok por palavra-chave im
 
 Desde a 2.4.0, `resolve --url` de um post do TikTok faz **um** pedido de metadados ao yt-dlp (`--dump-single-json --skip-download`) e já grava `title`, `creator.name`, `creator.handle` (o `@usuario`) e `media.duration_s`. Antes disso o candidato entrava como `TikTok · <id>` com autoria e duração nulas, e o checkpoint C2 — "título, canal, duração" — não tinha o que listar. O pedido é opcional por construção: se a página recusar (post privado, região bloqueada, 429), o candidato é registrado do mesmo jeito, com os campos vazios e um aviso no diagnóstico.
 
-**Como achar os posts recentes de um perfil.** A grade pública de `tiktok.com/@usuario` não serve para visitante: ela carrega por JavaScript atrás de checagem de sessão, e um visitante deslogado recebe uma página vazia ou um desafio. A rota que funciona sem sessão é a página de incorporação — `https://www.tiktok.com/embed/@usuario` —, que lista os posts recentes do perfil com os ids de cada um no HTML. Abra essa página no navegador, colete os ids que interessam e monte a URL canônica de cada um (`https://www.tiktok.com/@usuario/video/<id>`) para passar ao `resolve --url`. Continua valendo o de sempre: a página de incorporação é ponto de partida para achar o endereço, não autorização de uso — as condições do post seguem pelo `permit`, como em qualquer outra fonte.
+**Como achar os posts recentes de um perfil.** A página de incorporação — `https://www.tiktok.com/embed/@usuario` — é a listagem pública principal para descobrir os posts recentes sem sessão: ela lista os posts do perfil com os ids de cada um no HTML. Abra essa página no navegador, colete os ids que interessam e monte a URL canônica de cada um (`https://www.tiktok.com/@usuario/video/<id>`) para passar ao `resolve --url`. A grade do perfil (`tiktok.com/@usuario`) exige sessão; a página de incorporação é a listagem pública. Por isso a grade não é visitada quando pedir login. A página de incorporação é ponto de partida para achar o endereço, não autorização de uso — as condições do post seguem pelo `permit`, como em qualquer outra fonte. **Condição de parada:** login, CAPTCHA ou desafio, recusa explícita ou limite de requisições em qualquer página, do perfil ou da incorporação, é uma parada. Pare, conte isso à pessoa e peça as URLs dos posts; não troque de rota para contornar a exigência.
 
 ## Provedor — Pexels
 
@@ -590,7 +595,7 @@ O fluxo Instagram usa o módulo `scripts/getbrolls/instagram_pairs.py` (no pacot
 
 ### 1. Abrir o Reel e capturar as fontes
 
-Use a URL real do Reel na sessão autorizada. **Se há Chrome logado indicado pelo usuário, reutilize esse Chrome pelo plugin do agente.** Não abra outra sessão sem necessidade. Com a extensão oficial Playwright disponível, a alternativa executável é:
+Use a URL real do Reel na sessão autorizada. **Se há Chrome logado indicado pelo usuário, reutilize esse Chrome pelo plugin do agente**, dentro do que as ferramentas e as políticas do host permitem. Não abra outra sessão sem necessidade. Com a extensão oficial Playwright disponível, a alternativa executável é:
 
 Os exemplos abaixo usam macOS. No Windows PowerShell, substitua o início `bash "$GB_SKILL_DIR/scripts/playwright.sh"` por `& "$env:GB_SKILL_DIR\scripts\playwright.ps1"`, mantendo os argumentos.
 
@@ -612,7 +617,7 @@ Windows PowerShell:
 & "$env:GB_SKILL_DIR\scripts\playwright.ps1" -s=getbrolls-instagram snapshot
 ```
 
-`INDICE_OBSERVADO` vem de `tab-list`. A extensão Playwright não é a extensão do plugin Codex; quando só esta estiver conectada, controle o Chrome por ela. Sem sessão existente, `open "$REEL_URL" --headed` cria uma sessão própria. Login necessário é realizado pelo humano nessa sessão.
+`INDICE_OBSERVADO` vem de `tab-list`. A extensão Playwright não é a extensão do plugin Codex; quando só esta estiver conectada, controle o Chrome por ela. Sem sessão existente, as ferramentas e a política do host decidem: só se o host permitir, `open "$REEL_URL" --headed` cria uma sessão própria, e o login necessário é feito pela própria pessoa nessa sessão; o agente nunca pede a senha. Sem permissão do host, explique e aceite o MP4 que a pessoa fornecer.
 
 #### Captura pela rede da página
 
@@ -620,7 +625,7 @@ Windows PowerShell:
 2. Registre as respostas antes de reproduzir/recarregar o Reel. No plugin com CDP: obtenha a capacidade `cdp`, leia sua documentação, envie `Network.enable`, guarde o cursor de `readEvents` e observe `Network.responseReceived` após a reprodução. No Playwright CLI instalado, os comandos são `requests` e `response-body` (não `network`).
 3. Examine as respostas da página e do manifesto DASH que contêm o **mesmo código/ID do Reel**. Use a resposta/documento observado; não invente endpoints. Se o manifesto estiver em JSON, decodifique o campo de manifesto e depois seu XML. Identifique `AdaptationSet` de vídeo/áudio por `mimeType`/`contentType`, selecione suas `Representation` e `BaseURL`, preservando os parâmetros assinados. Prefira vídeo até 1080p quando disponível.
 4. Se só houver requests de segmentos, relacione as representações ao mesmo Reel. No ensaio real, o parâmetro `efg` em base64 JSON identificou o mesmo `xpv_asset_id`, duração e `vencode_tag` de vídeo/áudio; isso distinguiu o Reel ativo de recomendações pré-carregadas. Compare também duração/dimensões do player e inspecione o conteúdo baixado.
-5. Os URLs observados nesse formato tinham `bytestart`/`byteend`, seletores explícitos de faixa. Para obter o arquivo completo, remova **somente esses dois parâmetros de faixa**, preservando todos os demais parâmetros e assinatura exatamente como capturados. Não remova `oh`, `oe` ou parâmetros desconhecidos. Valide duração e decodificação completa; um fragmento/HTTP 206 não comprova download integral. Se a CDN rejeitar a URL completa, recapture a representação pelo manifesto; não altere assinatura nem credenciais.
+5. Os URLs observados nesse formato tinham `bytestart`/`byteend`, seletores explícitos de faixa. Para obter o arquivo completo, e somente se o método for permitido pelo host e pelo serviço, remova **somente esses dois parâmetros de faixa**, preservando todos os demais parâmetros e assinatura exatamente como capturados. Não remova `oh`, `oe` ou parâmetros desconhecidos. Valide duração e decodificação completa; um fragmento/HTTP 206 não comprova download integral. Se a CDN rejeitar a URL completa, recapture a representação pelo manifesto só se a expiração da URL estiver confirmada (por exemplo, o `oe` da assinatura já venceu) e pela mesma rota autorizada; sem confirmação, pare e diagnostique. Não altere assinatura nem credenciais.
 6. Grave somente as duas URLs selecionadas em configs privados. Nunca exporte cookies, headers de autenticação ou todo o perfil para o pacote.
 
 Exemplo de inspeção CLI, com saída sensível retida no projeto:
@@ -633,19 +638,19 @@ bash "$GB_SKILL_DIR/scripts/playwright.sh" -s=getbrolls-instagram requests > "$G
 bash "$GB_SKILL_DIR/scripts/playwright.sh" -s=getbrolls-instagram --raw response-body INDICE_OBSERVADO > "$GB_PROJECT/work/instagram-configs/reel-response.private.txt"
 ```
 
-Windows PowerShell cria a pasta dentro do projeto e restringe sua ACL ao usuário atual antes de gravar as respostas:
+No Windows, o 0600/0700 do POSIX não tem equivalente: a permissão da pasta é a ACL. O Windows PowerShell cria a pasta dentro do projeto e restringe sua ACL ao dono (quem cria a pasta; numa sessão elevada, com a política de posse do Windows, o grupo Administradores), a SYSTEM e a Administradores, sem herança, antes de gravar as respostas (é a mesma ACL que o getbrolls aplica sozinho aos arquivos e pastas privados que ele cria; veja [Arquivos e pastas privados](SECURITY.md#arquivos-e-pastas-privados)):
 
 ```powershell
 $ConfigDir = Join-Path $env:GB_PROJECT 'work\instagram-configs'
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
-icacls $ConfigDir /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F" | Out-Null
+& "$env:SystemRoot\System32\icacls.exe" $ConfigDir /grant:r '*S-1-3-4:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /inheritance:r | Out-Null
 & "$env:GB_SKILL_DIR\scripts\playwright.ps1" -s=getbrolls-instagram requests |
   Set-Content -Encoding UTF8 (Join-Path $ConfigDir 'requests.private.txt')
 & "$env:GB_SKILL_DIR\scripts\playwright.ps1" -s=getbrolls-instagram --raw response-body INDICE_OBSERVADO |
   Set-Content -Encoding UTF8 (Join-Path $ConfigDir 'reel-response.private.txt')
 ```
 
-`response-body` salva corpos binários em arquivo e informa o caminho. Em resposta textual, o agente analisa JSON/XML observado e escreve os configs a seguir; não há parser de captura automática embutido. Se a ferramenta não oferece respostas/manifesto, informe essa limitação e use a integração autorizada que ofereça, sem substituir a origem por stock.
+`response-body` salva corpos binários em arquivo e informa o caminho. Em resposta textual, o agente analisa JSON/XML observado e escreve os configs a seguir; não há parser de captura automática embutido. Se a ferramenta não oferece respostas/manifesto, ou o host proíbe reproduzir as URLs, diga isso, aceite o MP4 que a pessoa fornecer (`resolve --file`) ou outra fonte permitida, sem substituir a origem por stock e sem ler o perfil, cookies ou tráfego por outro caminho.
 
 Escolha as duas representações **do mesmo Reel** pelo manifesto/identificador e conteúdo, não simplesmente os dois primeiros MP4 da página. Recomendações e pré-carregamento podem pertencer a outros vídeos. URL `blob:` é referência interna do player e não serve ao curl; use a URL HTTPS real de CDN que a página requisitou. Preserve query assinada necessária à requisição.
 
@@ -702,13 +707,15 @@ Em batch, mantenha o gate de hash de áudio. Dois Reels podem ter áudio igual l
 
 ### Lotes e ritmo
 
-Cem Reels de uma vez, sem pausa, são o jeito mais rápido de perder a conta. A CLI não dorme: ela diz **quanto** esperar e o agente espera. O estado fica em `<projeto>/work/queue.json` (privado, gravação atômica, permissão 0600) e nunca contém URL assinada — só a URL pública normalizada de cada post.
+Cem Reels de uma vez, sem pausa, são o jeito mais rápido de perder a conta. A CLI não dorme: ela diz **quanto** esperar. Para limite de ritmo ou limite temporário, o agente espera o que ela disser; com login, desafio, recusa ou causa desconhecida, ele para e diagnostica, porque esperar não autoriza nada. O estado fica em `<projeto>/work/queue.json` (privado, gravação atômica, permissão 0600) e nunca contém URL assinada — só a URL pública normalizada de cada post.
 
 ```sh
 getbrolls queue --action add --provider instagram --project "$GB_PROJECT" "$REEL_URL_1" "$REEL_URL_2" --url "$REEL_URL_3"
 getbrolls queue --action next --project "$GB_PROJECT"
 # {"item": {...}} → capture os pares desse Reel e rode instagram_pairs.py
-# {"item": null, "wait_seconds": 83, "resume_at": "..."} → aguarde 83 s e chame next de novo
+# {"item": null, "wait_seconds": 83, "resume_at": "..."} → ritmo ou limite temporário: aguarde 83 s e chame next de novo
+#   (reason cooldown = limite temporário, 429: aguarde e volte ao mesmo escopo; se o bloqueio voltar, pare)
+# next que sai com 1 e "Fila de `instagram` parada em ..." → recusa de acesso: pare e diagnostique com a pessoa
 getbrolls queue --action mark --id instagram:CODIGO --done --project "$GB_PROJECT"
 getbrolls queue --action mark --id instagram:CODIGO --failed --reason "curl 22 HTTP 429" --project "$GB_PROJECT"
 getbrolls queue --action status --project "$GB_PROJECT"
@@ -717,9 +724,15 @@ getbrolls queue --action status --project "$GB_PROJECT"
 Windows PowerShell usa os mesmos argumentos com `$env:GB_PROJECT`.
 
 - `add` aceita `--provider instagram|tiktok|youtube`, URLs posicionais e `--url` repetido; a URL é normalizada pelo mesmo resolvedor de `resolve` e repetidas são ignoradas. Cada item nasce `pending`.
-- `next` devolve um item quando o ritmo permite ou quando já existe um item `active` aguardando `mark` — nesse segundo caso ele repete o mesmo item, sem reiniciar o relógio (`reason: "active"`). Ao devolver um item novo, marca-o `active`. Quando não há nada para devolver, responde `wait_seconds`, `resume_at` e `reason` com saída 0 e `item: null`; `reason` pode ser `pace`, `cooldown`, `max_per_hour`, `max_per_day` (aguarde) ou `empty` (fila sem pendentes, nada a esperar). `--provider` limita a fila a uma fonte.
-- `mark --id ID --done|--failed|--skipped [--reason "..."]` fecha o item. Um motivo contendo `403`, `429`, `challenge`, `login` ou `rate` abre **cooldown**: 30 min, dobrando a cada disparo consecutivo (1 h, 2 h, 4 h — teto 4 h); um `--done` zera a contagem.
-- `status` lista contagens (`pending`, `active`, `done`, `failed`, `skipped`), o cooldown e o próximo horário permitido por provedor. O `status` do projeto também mostra uma linha da fila e a chave `queue`, sem gravar nada.
+- `next` devolve um item quando o ritmo permite ou quando já existe um item `active` aguardando `mark` — nesse segundo caso ele repete o mesmo item, sem reiniciar o relógio (`reason: "active"`). Ao devolver um item novo, marca-o `active`. Quando não há nada para devolver, responde `wait_seconds`, `resume_at` e `reason` com saída 0 e `item: null`; `reason` pode ser `pace`, `max_per_hour`, `max_per_day` (aguarde), `cooldown` (limite temporário da fonte, 429: aguarde e volte ao mesmo escopo; se o bloqueio voltar, pare) ou `empty` (fila sem pendentes, nada a esperar). Um provedor **parado** por recusa de acesso não espera: com pendentes só dele, `next` sai com 1, `INVALID_DATA` e "Fila de `<provedor>` parada em `<instante>`", sem `resume_at`, e não entrega nenhum item dele; os outros provedores seguem. `--provider` limita a fila a uma fonte.
+- `mark --id ID --done|--failed|--skipped [--reason "..."]` fecha o item e lê o `--reason` em um de três tipos (uma recusa vence uma palavra de limite no mesmo texto):
+  - **limite de ritmo** (`429`, `rate limit`, `too many requests`, `limite de requisições`): abre **cooldown** de 30 min, dobrando a cada disparo consecutivo (1 h, 2 h, 4 h — teto 4 h); um `--done` zera a contagem. O cooldown é ritmo, não liberação: espere o que a CLI indicar e volte ao mesmo escopo.
+  - **recusa de acesso** (`login`, `challenge`, `captcha`, `checkpoint`, `401`, `403`, `unauthorized`, `forbidden`, `access denied`, `acesso negado`, `sessão de acesso`, `bloqueou o IP`, `IP bloqueado`): **para** a fila do provedor, sem cooldown e sem `resume_at` (`providers.<provedor>.stopped` em `work/queue.json`). Esperar não autoriza nada: pare e diagnostique com a pessoa.
+  - qualquer outro texto: só o item falha.
+
+  Uma URL expirada que o coletor confirmou (`stopped_by` `recapture`, abaixo) não para a fila: recapture só pela mesma rota autorizada.
+- `resume --provider PROVEDOR --by NOME --phrase "FRASE EXATA" --expect AT` limpa a parada. Quem roda é a pessoa, depois de confirmar no chat que o acesso voltou, com a frase dela, literal; `AT` é o `stopped.at` do `status`. Sem os três, ou com um `AT` que não é o da parada gravada agora, recusa sem mudar nada. Só a chave `stopped` sai (cooldown, contagens e itens ficam); quem limpou e com que frase fica em `providers.<provedor>.last_resume`. O agente nunca a roda por conta própria nem inventa a frase, e editar o `queue.json` para furar a parada também é proibido. Detalhes em [CLI_CONTRACT.md](CLI_CONTRACT.md#fila-queue).
+- `status` lista contagens (`pending`, `active`, `done`, `failed`, `skipped`), o cooldown, a parada (`providers.<provedor>.stopped`) e o próximo horário permitido por provedor. O `status` do projeto também mostra uma linha da fila e a chave `queue`, sem gravar nada.
 
 Padrões por provedor — quando nenhuma variável nem regra é definida, o intervalo entre itens é sorteado no intervalo abaixo e contado a partir do item devolvido; os tetos contam itens `done`/`failed` na última hora e nas últimas 24 h:
 
@@ -731,7 +744,7 @@ Padrões por provedor — quando nenhuma variável nem regra é definida, o inte
 
 `GB_PACE_MIN_S`, `GB_PACE_MAX_S`, `GB_MAX_PER_HOUR` e `GB_MAX_PER_DAY` são **globais**: uma vez definidas, o mesmo valor vale para todos os provedores, substituindo os padrões acima por igual. Para diferenciar o ritmo por provedor, use o bloco opcional `pacing` em RULES.md, `"pacing": {"instagram": {"min_s": 60, "max_s": 180, "max_per_hour": 15, "max_per_day": 40}, "tiktok": {...}}`; a variável de ambiente, quando definida, vence a regra do projeto.
 
-No coletor, rode o lote com `--pace 20-60 --max-per-run 25 --continue-on-error --project "$GB_PROJECT"`: pausa aleatória entre pares (nunca antes do primeiro; `--pace 0` desliga), no máximo 25 pares por execução (o restante sai como `skipped`, motivo `max-per-run`) e falha por stem registrada sem interromper os demais. O summary JSON é reescrito após cada stem com `status` `done|failed|skipped` e o processo sai com 1 quando houver falha. O curl faz até 2 retentativas com 5 s de espera; um HTTP 403/429 encerra o lote na hora, marca o restante como `skipped` com motivo `cooldown` e, com `--project` informado e `work/queue.json` existente nele, registra o cooldown na fila — **use sempre `--project "$GB_PROJECT"` no coletor**, não `--config-output-root`, para que o cooldown vá para o projeto certo. Ao ver isso, pare: espere o `resume_at`, recapture as URLs no navegador e só então volte.
+No coletor, rode o lote com `--pace 20-60 --max-per-run 25 --continue-on-error --project "$GB_PROJECT"`: pausa aleatória entre pares (nunca antes do primeiro; `--pace 0` desliga), no máximo 25 pares por execução (o restante sai como `skipped`, motivo `max-per-run`) e falha por stem registrada sem interromper os demais. O summary JSON é reescrito após cada stem com `status` `done|failed|skipped` e o processo sai com 1 quando houver falha. O curl faz até 2 retentativas com 5 s de espera. A resposta da CDN decide o resto: um **429** encerra o lote na hora (o restante sai `skipped` com motivo `cooldown`) e registra o cooldown na fila (com `--project` e um `work/queue.json` no projeto); um **403 com o `oe` da URL assinada vencido há mais de 300 s** é URL expirada (com `--continue-on-error` o lote para ali, o restante `skipped` com motivo `recapture`): recapture pela mesma rota autorizada; **qualquer outro 403, ou um 401**, é recusa: o lote termina como erro fatal (restante `skipped` com motivo `aborted`, saída 1) e a fila grava a parada do provedor, sem cooldown. Com a fila parada, o coletor com `--project` sai com 1 antes de qualquer pedido. **Use sempre `--project "$GB_PROJECT"` no coletor**, não `--config-output-root`: sem ele não há fila para ler, a parada nunca é gravada e o lote sai fora dela. Ao ver qualquer um dos três, pare e não insista; detalhes na tabela do coletor em [CLI_CONTRACT.md](CLI_CONTRACT.md#fila-queue).
 
 Para as rotas yt-dlp, o comando base já inclui `--sleep-requests 1 --sleep-interval 3 --max-sleep-interval 8`; `GB_YTDLP_SLEEP=req,min,max` ajusta. Nas APIs de bancos, um HTTP 429 com `Retry-After` de até 60 s é respeitado uma vez; acima disso o erro informa a espera pedida.
 
@@ -882,7 +895,7 @@ Executar nesta ordem:
 
 ### Segurança
 
-Não ler nem imprimir cookies, `.env`, browser credential stores ou tokens. Usar signed CDN URLs já capturadas em `.conf` como fonte operacional temporária. A solicitação de coleta autoriza a captura das URLs do post na sessão indicada. Reutilize essa autorização; peça acesso somente se faltar sessão/autorização necessária. A captura é temporária e operada pelo agente, conforme a seção [Instagram pelo navegador](#instagram--navegadorplaywright-dois-streams-e-mp4).
+Não ler nem imprimir cookies, `.env`, browser credential stores ou tokens. Usar signed CDN URLs já capturadas em `.conf` como fonte operacional temporária. A solicitação de coleta autoriza a captura das URLs desse post, nessa sessão. Vale só isso: as ferramentas e as políticas do host vêm primeiro, e o pedido não concede ferramenta que o host não tem nem método que o serviço proíbe. Se o host não expõe respostas de rede ou proíbe reproduzir as URLs, diga isso e aceite mídia fornecida pela pessoa ou outra fonte permitida; nunca leia o perfil, os cookies ou o tráfego por outro caminho. Peça acesso somente se faltar sessão/autorização necessária. A captura é temporária e operada pelo agente, conforme a seção [Instagram pelo navegador](#instagram--navegadorplaywright-dois-streams-e-mp4).
 
 ## Storyboard
 

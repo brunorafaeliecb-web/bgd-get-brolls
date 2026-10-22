@@ -260,7 +260,7 @@ class InstagramPairsMediaUrlRefusedTests(unittest.TestCase):
 class InstagramPairsBlockedLoggingTests(unittest.TestCase):
     """`event=blocked` from _record_failure(), including the CDN-block detection path."""
 
-    def test_curl_403_sets_http_status_and_cooldown_flag(self):
+    def test_curl_429_sets_http_status_and_cooldown_flag(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             conf = root / "video.conf"
@@ -268,7 +268,7 @@ class InstagramPairsBlockedLoggingTests(unittest.TestCase):
             target = root / "part.mp4"
 
             def blocked_curl(cmd, **kwargs):
-                raise subprocess.CalledProcessError(22, cmd, stderr=b"curl: (22) The requested URL returned error: 403")
+                raise subprocess.CalledProcessError(22, cmd, stderr=b"curl: (22) The requested URL returned error: 429")
 
             with (
                 patch.object(ig.socket, "getaddrinfo", return_value=PUBLIC_DNS),
@@ -285,6 +285,34 @@ class InstagramPairsBlockedLoggingTests(unittest.TestCase):
                 )
             exc = ctx.exception
             self.assertTrue(exc.cooldown)
+            self.assertEqual("429", exc.http_status)
+            self.assertFalse(exc.refused)
+
+    def test_curl_403_without_a_confirmed_expiry_is_a_refusal_not_a_cooldown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conf = root / "video.conf"
+            conf.write_text('url = "https://example.org/media"\n', encoding="utf-8")
+
+            def refused_curl(cmd, **kwargs):
+                raise subprocess.CalledProcessError(22, cmd, stderr=b"curl: (22) The requested URL returned error: 403")
+
+            with (
+                patch.object(ig.socket, "getaddrinfo", return_value=PUBLIC_DNS),
+                patch.object(ig.subprocess, "run", side_effect=refused_curl),
+                self.assertRaises(ig.CollectError) as ctx,
+            ):
+                ig.download_or_reuse(
+                    cfg_path=conf,
+                    part_path=root / "part.mp4",
+                    config_output_root=root,
+                    force_download=False,
+                    prefer_config_output=False,
+                    stage="video",
+                )
+            exc = ctx.exception
+            self.assertTrue(exc.refused)
+            self.assertFalse(exc.cooldown)
             self.assertEqual("403", exc.http_status)
 
     def test_record_failure_logs_blocked_with_http_status_and_recorded_flag(self):

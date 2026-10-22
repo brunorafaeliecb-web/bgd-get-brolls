@@ -52,3 +52,19 @@ GB_HOME = Path(os.environ["GB_HOME"])
 if not os.environ.get("GB_CACHE_DIR"):
     os.environ["GB_CACHE_DIR"] = str(GB_HOME / "cache")
     os.environ.pop("GETBROLLS_CACHE_DIR", None)
+
+# Nenhum teste chega à internet por acidente: o yt-dlp da suíte é o de mentira de `_offline` (uma máquina com
+# yt-dlp no PATH ou num runtime perguntaria ao YouTube de verdade, e um teste sem rede falharia à toa). O teste
+# que precisa do binário real já fixa o próprio `GB_YTDLP_PATH`. Só a rodada de rede (`GB_EVAL_NETWORK=1`) fica
+# de fora.
+if os.environ.get("GB_EVAL_NETWORK") != "1":
+    from _offline import OFFLINE_YTDLP
+
+    os.environ.update(OFFLINE_YTDLP)
+
+# `GB_TEST_OFFLINE=1` simula a máquina sem rede: qualquer nome pedido ao DNS é recusado (e, com
+# `GB_TEST_OFFLINE_LOG`, anotado). Loopback e endereço literal seguem valendo.
+if os.environ.get("GB_TEST_OFFLINE") == "1":
+    from _offline import install_dns_guard
+
+    install_dns_guard(os.environ.get("GB_TEST_OFFLINE_LOG"))

@@ -550,19 +550,26 @@ if __name__ == "__main__":
 
 
 class CooldownReasonSkillMessagesTests(unittest.TestCase):
-    """As mensagens de bloqueio que a própria skill emite (social.py) abrem cooldown."""
+    """As mensagens de bloqueio que a própria skill emite (social.py): limite abre cooldown, recusa para a fila."""
 
     def test_skill_messages_trigger_and_local_errors_do_not(self):
-
-        positives = [
-            "A fonte exige uma sessão de acesso. Use o navegador autorizado.",
-            "A fonte bloqueou o IP desta rede para esse post; download não concluído.",
+        cooldowns = [
             "limite de requisições da fonte (429); aguarde e tente de novo",
             "rate-limit atingido",
+            "HTTP 429",
+        ]
+        refusals = [
+            "A fonte exige uma sessão de acesso. Use o navegador autorizado.",
+            "A fonte bloqueou o IP desta rede para esse post; download não concluído.",
             "HTTP 403",
         ]
         negatives = ["ffmpeg falhou: bitrate inválido", "inaccurate seek", "frame= 429 fps=30 is not here"]
-        for text in positives:
+        for text in cooldowns:
             self.assertTrue(queue.is_cooldown_reason(text), text)
+            self.assertEqual("rate_limit", queue.failure_kind(text), text)
+        for text in refusals:
+            self.assertFalse(queue.is_cooldown_reason(text), text)
+            self.assertEqual("access_refused", queue.failure_kind(text), text)
         for text in negatives[:2]:
             self.assertFalse(queue.is_cooldown_reason(text), text)
+            self.assertIsNone(queue.failure_kind(text), text)

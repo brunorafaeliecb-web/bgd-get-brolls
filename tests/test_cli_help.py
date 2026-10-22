@@ -120,7 +120,9 @@ class DoctorVerdictTests(unittest.TestCase):
 
 class ActionableErrorTests(unittest.TestCase):
     def test_missing_ytdlp_names_the_installer(self):
-
+        # A suíte fixa `GB_YTDLP_PATH` num yt-dlp de mentira (`_isolation`); aqui é a falta do yt-dlp que se testa.
+        self.enterContext(mock.patch.dict(os.environ))
+        os.environ.pop("GB_YTDLP_PATH", None)
         original_local = social.local_ytdlp
         original_which = social.shutil.which
         social.local_ytdlp = lambda root=None: None

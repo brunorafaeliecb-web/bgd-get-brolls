@@ -84,7 +84,7 @@ python3 -m unittest discover -s tests -v
 
 No pacote instalado, `getbrolls doctor` e `getbrolls setup --check` fazem o papel de `python3 scripts/gb.py doctor`; `doctor` sai com `4` quando falta algo e o `.env` do pacote é `$GB_HOME/.env`. O nome do produto na prosa é "getbrolls" (CLI e pacote); a skill continua `get-brolls`. Procedimento pela pasta da instalação (depois do `install.sh`/`install.ps1`, a skill copiada, o plugin) confere com o script dela, nunca com o `getbrolls` do PATH; o que vai para o projeto (`BRIEF.md`, `RULES.md`, `EXPORT.md`, o Storyboard) cita o subcomando sem prefixo. `tests/test_command_name.py` confere as duas coisas.
 
-No Windows PowerShell, troque o primeiro comando por `powershell -ExecutionPolicy Bypass -File scripts/install.ps1 -Check` e use `python` nos dois seguintes.
+No Windows PowerShell, troque o primeiro comando por `powershell -ExecutionPolicy RemoteSigned -File scripts/install.ps1 -Check` e use `python` nos dois seguintes.
 
 `--check` valida pré-requisitos do instalador; não instala bibliotecas nem testa sessão/rede. `doctor` informa disponibilidade; `doctor --live` faz buscas/refresh limitados e pode consumir quota. Nenhum deles substitui teste de aquisição, prévia e decodificação da fonte afetada.
 

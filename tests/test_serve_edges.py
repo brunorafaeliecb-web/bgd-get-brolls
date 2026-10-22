@@ -849,7 +849,10 @@ class ChildEnvironmentTests(unittest.TestCase):
     def test_secret_shaped_variables_are_dropped_and_utf8_is_forced(self):
         source = {"PATH": "/bin", "PEXELS_API_KEY": "k", "X_TOKEN": "t", "MY_SECRET": "s", "HOME": "/h"}
         environment = serve._child_environment(source, None)
-        self.assertEqual({"PATH": "/bin", "HOME": "/h", "PYTHONIOENCODING": "utf-8", serve.CHILD_ENV: "1"}, environment)
+        self.assertEqual(
+            {"PATH": "/bin", "HOME": "/h", "PYTHONIOENCODING": "utf-8", serve.CHILD_ENV: serve.SERVE_CHILD_TOKEN},
+            environment,
+        )
         self.assertIn("PEXELS_API_KEY", source)  # a cópia não toca o original
 
     def test_a_checkout_prepends_its_scripts_and_an_installed_package_drops_pythonpath(self):

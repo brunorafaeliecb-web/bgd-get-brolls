@@ -81,6 +81,9 @@ _TARGET_PYTHON = re.compile(r"(\btarget=)python(?:3(?:\.\d+)?)?(?=\s|$)")
 # No Windows o pino do ffmpeg é `ffmpeg.cmd` (`ffmpeg_pin`); o log guarda o nome do arquivo, e só `.exe` sai dele.
 _TARGET_PIN_CMD = re.compile(r"(\btarget=)ffmpeg\.cmd(?=\s|$)")
 _CACHE_KEY = re.compile(r"(\btarget=\$GB_CACHE_DIR/)#[0-9a-f]{8}")
+# O `browser-plan` fixa o pacote do npx na versão do `package.json` (`@playwright/cli@0.1.21`); a v2.5.0 emitia o
+# nome sem versão. A versão muda a cada bump do pacote e não é comportamento do plano: o ouro guarda o nome.
+_PLAYWRIGHT_PIN = re.compile(r'("@playwright/cli)@\d+\.\d+\.\d+(?=")')
 _PY_VERSION = re.compile(r"(Python |\"python\":\s*\")\d+\.\d+\.\d+")
 _STDERR_TAIL = re.compile(r"(; stderr: )(?:[^\"\\]|\\.)*")
 # A época da revisão é o sha de quem aprovou e quando: muda a cada rodada, como o instante.
@@ -217,6 +220,7 @@ class Normalizer:
             value = _TARGET_PIN_CMD.sub(r"\1ffmpeg", value)
         value = _CACHE_KEY.sub(r"\1#<CACHE>", value)
         value = _PY_VERSION.sub(r"\1<PYV>", value)
+        value = _PLAYWRIGHT_PIN.sub(r"\1", value)
         value = self.version.sub(r"\1<VERSION>", value)
         value = _STDERR_TAIL.sub(r"\1<STDERR_TAIL>", value)
         return _MACHINE_KEYS.sub(r'\1"<MACHINE>"', value)
@@ -234,10 +238,41 @@ class Normalizer:
         return {"text": lines}
 
 
-def comparable(text):
-    """O texto do ouro como a comparação o vê: `bytes=` e `sha256_prefix=` do `event=fetch` viram marcadores.
-    Vale para os dois lados (o arquivo do ouro e o registro serializado); nada mais é mascarado."""
-    return _FETCH_LINE.sub(lambda line: _CLIP_FIELDS.sub("bytes=<N> sha256_prefix=<SHA>", line.group(0)), text)
+# A chave da venv do runtime é um resumo derivado (o sha do `requirements.txt`, `_paths.part_sha`): muda a cada
+# bump de dependência e a cada regeração dos hashes, sem que o comando mude. Só esse campo, nesse caminho do
+# `doctor`; a chave das ferramentas (`tools`) e qualquer outro campo valem byte a byte. O arquivo do ouro guarda a
+# chave do dia em que foi gravado (qualquer 16 hex vira marcador); o registro da rodada só vira marcador quando traz
+# a chave que o checkout calcula (`venv_key`), então uma chave errada ou velha no `doctor` continua reprovando.
+_VENV_KEY_PATH = ("stdout", "json", "install", "runtime", "shas")
+_VENV_KEY = re.compile(r"[0-9a-f]{16}")
+VENV_KEY_MARK = "<VENV_KEY>"
+
+
+def _mask_venv_key(text, venv_key=None):
+    """`text` com a chave da venv do `doctor` trocada por `<VENV_KEY>`; sem esse campo, o próprio `text`.
+
+    `venv_key=None`: qualquer chave de 16 hex (o arquivo do ouro); com valor: só essa chave (o registro da rodada)."""
+    try:
+        record = json.loads(text)
+    except ValueError:
+        return text
+    node = record
+    for key in _VENV_KEY_PATH:
+        node = node.get(key) if isinstance(node, dict) else None
+    if not isinstance(node, dict) or not isinstance(node.get("venv"), str) or not _VENV_KEY.fullmatch(node["venv"]):
+        return text
+    if venv_key is not None and node["venv"] != venv_key:
+        return text
+    node["venv"] = VENV_KEY_MARK
+    return json.dumps(record, ensure_ascii=False, indent=1) + "\n"
+
+
+def comparable(text, venv_key=None):
+    """O texto do ouro como a comparação o vê: `bytes=` e `sha256_prefix=` do `event=fetch` viram marcadores, e a
+    chave da venv do `doctor` vira `<VENV_KEY>` (ver `_mask_venv_key`). Vale para os dois lados (o arquivo do ouro e o
+    registro serializado); nada mais é mascarado."""
+    text = _FETCH_LINE.sub(lambda line: _CLIP_FIELDS.sub("bytes=<N> sha256_prefix=<SHA>", line.group(0)), text)
+    return _mask_venv_key(text, venv_key)
 
 
 def fetch_lines_without_clip_fields(text):

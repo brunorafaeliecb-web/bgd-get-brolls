@@ -100,8 +100,9 @@ cd get-brolls
 |---|---|---|---|
 | Codex | `~/.agents/skills/get-brolls/` | `.agents/skills/get-brolls/` | `$get-brolls` |
 | Claude Code | `~/.claude/skills/get-brolls/` | `.claude/skills/get-brolls/` | `/get-brolls` |
+| Other agents | the agent's skills folder | the project's skills folder, if any | by name, `get-brolls` |
 
-When copying a development folder, exclude `.venv/`, `.tools/`, caches, projects, and private files. `skills/` and `.claude-plugin/` are Claude Code plugin artifacts and can be omitted when copying to Codex. Install dependencies in the final destination and open a new agent session. [See installation, updates, and compatibility.](docs/GUIDE.md#instalação)
+When copying a development folder, exclude `.venv/`, `.tools/`, caches, projects, and private files. `skills/` and `.claude-plugin/` are Claude Code plugin artifacts and can be omitted when copying to Codex. Install dependencies in the final destination and open a new agent session. **Other agents:** clone as a skill and run `python3 <absolute-path>/scripts/gb.py setup --check`, then `setup` and `doctor`; there is no `${CLAUDE_PLUGIN_ROOT}` and no slash command outside Claude Code, so ask for the step in words. Before running, the agent says what `setup` does (downloads from PyPI and npm into `$GB_HOME/runtime`, touches no global installation) and, if the host refuses a command or asks for elevation, stops and hands the command to the person. It needs a shell with Python 3.11+, FFmpeg, curl and Node 22+ with npx. [See installation, updates, and compatibility.](docs/GUIDE.md#instalação)
 
 #### Install as a command
 
@@ -145,10 +146,12 @@ python3 scripts/gb.py doctor
 Windows PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/install.ps1 -Check
-powershell -ExecutionPolicy Bypass -File scripts/install.ps1
+powershell -ExecutionPolicy RemoteSigned -File scripts/install.ps1 -Check
+powershell -ExecutionPolicy RemoteSigned -File scripts/install.ps1
 python scripts/gb.py doctor
 ```
+
+On Windows, a folder that came from a downloaded zip may need `Unblock-File -Path scripts\*.ps1` once, run by the person; nothing here changes the machine's execution policy.
 
 Here the command is the installed folder's own script: a `getbrolls` on `PATH`, if any, may be another installation. The installer calls `setup`, which installs the pinned yt-dlp/EJS and Playwright CLI in `$GB_HOME/runtime`, outside the skill folder. `--check` only validates prerequisites (Python, FFmpeg/ffprobe, Node, curl, Git) and installs nothing; run it before the full installer to see what is missing. `doctor` checks tool availability once installed; access to each source depends on the URL and, when required, your browser session.
 
@@ -199,7 +202,7 @@ If you have never opened a terminal, this is the whole list. Every step is a con
 3. **Answer the interview.** At most seven questions, one at a time. "Whatever you think" is a valid answer: the agent applies a default and shows you what it assumed. To start there directly, use `/getbrolls:get-brolls-brief`.
 4. **Check the brief.** It hands back five lines of what it understood and asks whether that is right. Correct it there.
 5. **Look at the shortlist.** Before downloading anything, it lists 5 to 8 candidates with title, creator, and the exact window. Say which ones work.
-6. **Approve the previews.** Either in chat ("I approve all", or naming the ones you want), or on the Storyboard: ask for `/getbrolls:get-brolls-review`, it sends you a link, you click Approve / Request change / Reject and then **Save decisions**, and come back to say you saved. Nothing is downloaded without this step.
+6. **Approve the previews.** Either in chat ("I approve all", or naming the ones you want), or on the Storyboard: ask for `/getbrolls:get-brolls-review`, it sends you a link, you click Approve / Request change / Reject and then **Save decisions**, and come back to say you saved. No final cut leaves without this step.
 7. **Say who owns the material.** The agent records the usage conditions from what you tell it. You are the one answering for those conditions; it only records what was said and where each file came from.
 8. **Receive.** The cuts land in `entrega/`, one folder per shot, each with an `ORIGEM.md` naming its source.
 9. **Lost the thread?** Ask for `/getbrolls:get-brolls-status`: it tells you where things stand and what comes next.
@@ -288,7 +291,7 @@ The `review` command generates `brolls/review.html`: a local page where you can 
 
 The gallery remains static; animation runs only in the selected shot and respects reduced-motion preferences. An optional screenshot of the speaker provides context and remains static. To evaluate a finished composition using the same insert, set `GB_GIF_SCOPE=full` and provide `--full-preview-file`.
 
-Share the complete **`brolls/` folder** so that its images and GIFs remain accessible. To continue editing or regenerate previews, also preserve the originals and `.getbrolls-sources/`. [Review details.](docs/GUIDE.md#storyboard)
+To only show the Storyboard, share the minimal package: `brolls/review.html` with the `brolls/previews/` folder beside it, so the images and GIFs stay reachable. Do not send the whole `brolls/` folder: it holds logs and diagnostics. To continue editing or regenerate previews, also preserve the originals and `.getbrolls-sources/`. [Review details.](docs/GUIDE.md#storyboard)
 
 ## Sources
 

@@ -365,6 +365,7 @@ class ReuseValidityTests(unittest.TestCase):
             part = root / "p.mp4"
             part.write_bytes(b"not-really-media")
             with (
+                patch.object(ig.socket, "getaddrinfo", return_value=PUBLIC_DNS),
                 contextlib.redirect_stderr(io.StringIO()),
                 patch.object(ig.subprocess, "run", side_effect=subprocess.CalledProcessError(1, ["ffprobe"])),
                 self.assertRaises(ig.CollectError) as ctx,
@@ -386,7 +387,10 @@ class ReuseValidityTests(unittest.TestCase):
             conf.write_text('url = "https://example.org/v"\n', encoding="utf-8")
             part = root / "p.mp4"
             part.write_bytes(b"looks-fine")
-            with patch.object(ig.subprocess, "run", return_value=subprocess.CompletedProcess(["ffprobe"], 0)):
+            with (
+                patch.object(ig.socket, "getaddrinfo", return_value=PUBLIC_DNS),
+                patch.object(ig.subprocess, "run", return_value=subprocess.CompletedProcess(["ffprobe"], 0)),
+            ):
                 action = ig.download_or_reuse(
                     cfg_path=conf,
                     part_path=part,

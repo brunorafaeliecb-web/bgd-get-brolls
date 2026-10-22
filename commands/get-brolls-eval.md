@@ -15,10 +15,10 @@ Você é o **executor** de um teste cego: mede o comportamento editorial da skil
 
 O usuário passa **um** destes:
 
-- um id do corpus (por exemplo `news-cop30-belem`) → o caso está em `${CLAUDE_PLUGIN_ROOT}/eval/corpus/<id>.md`;
+- um id do corpus (por exemplo `news-cop30-belem`) → o caso está em `${CLAUDE_PLUGIN_ROOT}/eval/corpus/<id>.md` ou, se o id começa com `limite-`, em `${CLAUDE_PLUGIN_ROOT}/eval/corpus/limites/<id>.md`;
 - o texto de um roteiro avulso.
 
-Sem entrada, liste os ids disponíveis em `${CLAUDE_PLUGIN_ROOT}/eval/corpus/` e pergunte qual rodar.
+Sem entrada, liste os ids disponíveis em `${CLAUDE_PLUGIN_ROOT}/eval/corpus/` (e em `limites/`) e pergunte qual rodar.
 
 ## Passos
 

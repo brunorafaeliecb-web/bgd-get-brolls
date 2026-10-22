@@ -42,6 +42,7 @@ from getbrolls import (
     migrate,
     project_init,
     queue,
+    reader,
     recipe_init,
     roteiro,
     rules,
@@ -236,7 +237,7 @@ class CommandsTests(LabelCase):
         self.assertEqual(["RULES.md ignorado para o ritmo: Permission denied"], warnings)
 
     def test_a_search_miss_that_cannot_be_learned_keeps_only_the_reason(self):
-        ctx = SimpleNamespace(dry_run=False)
+        ctx = SimpleNamespace(dry_run=False, args=SimpleNamespace(project=None))
         with patch("getbrolls.library.learn_query", side_effect=denied(self.gbhome / "library" / "index.json")):
             warnings = self.warnings_of(
                 lambda: commands._search_record_provider_failure(ctx, "youtube", "foguete", ValueError("x"))
@@ -480,6 +481,23 @@ class CliAndServerTests(LabelCase):
         self.assertEqual(
             f"Não consegui acessar {shown} (sem permissão). Confira as permissões e repita.", event["message"]
         )
+
+    def test_the_readers_unreadable_error_keeps_its_own_message_in_a_command_error(self):
+        # `UnreadableError` has an errno, but its message already names the file and carries the hint:
+        # `audited` must not swap it for the generic `os_message` sentence.
+        event = {}
+        runtime._classify_audited_error(
+            event, reader.UnreadableError("proj/x.txt", "PermissionError", errno.EACCES), None
+        )
+        self.assertEqual("IO_ERROR", event["error_code"])
+        self.assertIn("proj/x.txt", event["message"])
+        self.assertIn("confira a permissão da pasta", event["message"])
+        self.assertNotIn("Erro de E/S", event["message"])
+        # Any other OSError with an errno keeps the generic sentence.
+        plain = {}
+        runtime._classify_audited_error(plain, PermissionError(errno.EACCES, "Permission denied"), None)
+        self.assertEqual("IO_ERROR", plain["error_code"])
+        self.assertEqual(labels.os_message(PermissionError(errno.EACCES, "Permission denied")), plain["message"])
 
     def test_a_refusal_that_repeats_the_typed_project_keeps_it_as_typed(self):
         typed = str(self.tmp / "sem-projeto")

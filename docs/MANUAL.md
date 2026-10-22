@@ -10,12 +10,12 @@ tags: [get-brolls, manual, tutorial, commands]
 
 Versão 2.6.0. Feito pra **videomaker que está começando a mexer com código**.
 
-Você pede o B-roll, vê a prévia, aprova, e **só o trecho aprovado** é baixado, com a fonte anotada.
+Você pede o B-roll, vê a prévia, aprova, e **só o trecho aprovado** vira corte final, com a fonte anotada. A prévia pode baixar antes uma mídia de trabalho temporária para dentro do projeto; a aprovação e o `permit` valem para o corte final, não para cada byte.
 
 ## ⚡ Se ler só isso, já dá pra usar
 
 - 💬 **No Claude Code, é só pedir:** `/get-brolls` + o que você precisa + a pasta do vídeo. O agente roda os comandos por você.
-- 🔒 **Nada é baixado sem duas coisas:** você **aprovar** o trecho e **registrar os direitos** de uso.
+- 🔒 **O corte final não sai sem duas coisas:** você **aprovar** o trecho e **registrar os direitos** de uso. A prévia pode buscar mídia de trabalho temporária antes disso (`--reference-only` evita).
 - 🧭 **Se perdeu?** Peça `/getbrolls:get-brolls-status` (ou rode o `status`). Ele diz o próximo passo.
 
 ## 📖 Dicionário rápido
@@ -420,7 +420,7 @@ getbrolls serve --stop --project /caminho/meu-video
 
 ## 5 ✅ Aprovar
 
-> É a **aprovação do cliente**. Primeira trava: sem ela, nada baixa.
+> É a **aprovação do cliente**. Primeira trava: sem ela, o corte final não sai.
 
 ```bash
 # ── import-review ───────────────────────────────────────────
@@ -575,19 +575,28 @@ getbrolls queue --action add --provider instagram --url "URL_DO_REEL" --project 
 # O QUE FAZ: entrega o próximo link, se já puder.
 # VOCÊ RECEBE: {"item": {...}} → pode baixar esse agora
 #          ou: {"item": null, "wait_seconds": 83} → espere 83 s e peça de novo
+#               (motivo `cooldown` = limite temporário: espere e volte; se o bloqueio voltar, pare)
+#          ou: erro "Fila de `instagram` parada" → recusa de acesso: pare e veja `queue resume` abaixo
 getbrolls queue --action next --provider instagram --project /caminho/meu-video
 
 # ── queue mark ──────────────────────────────────────────────
 # O QUE FAZ: diz à fila como foi o item que você pegou no next.
 # ✅ Baixou:
 getbrolls queue --action mark --id "<ID_DA_FILA>" --done --project /caminho/meu-video
-# ❌ Falhou (se o motivo tiver 403, 429 ou "login", a fila pausa de 30 min até 4 h):
+# ❌ Falhou: com 429 ou "rate limit" no motivo, a fila pausa de 30 min até 4 h (só ritmo);
+#    com 401, 403, "login", desafio ou CAPTCHA, a fila daquela fonte PARA, sem horário para voltar:
+#    esperar não libera nada. URL expirada confirmada: recapture pela mesma rota permitida.
 getbrolls queue --action mark --id "<ID_DA_FILA>" --failed --reason "Motivo da falha" --project /caminho/meu-video
 # ⏭️ Pulou:
 getbrolls queue --action mark --id "<ID_DA_FILA>" --skipped --reason "Motivo para pular" --project /caminho/meu-video
 
+# ── queue resume ────────────────────────────────────────────
+# O QUE FAZ: tira a parada de uma fonte. Só VOCÊ roda, depois de confirmar que o acesso voltou;
+#   AT é o `stopped.at` que o `status` mostra. O agente nunca roda isto por conta própria.
+getbrolls queue --action resume --provider instagram --by "SEU NOME" --phrase "SUA FRASE EXATA" --expect AT --project /caminho/meu-video
+
 # ── queue status ────────────────────────────────────────────
-# O QUE FAZ: mostra quantos faltam, quantos foram e se está em pausa.
+# O QUE FAZ: mostra quantos faltam, quantos foram e se está em pausa ou parada.
 getbrolls queue --action status --project /caminho/meu-video
 ```
 

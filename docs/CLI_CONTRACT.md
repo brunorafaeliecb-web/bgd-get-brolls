@@ -100,6 +100,7 @@ O caminho em cada campo é o do JSON da saída (`[]` é cada item de uma lista);
 | `queue add` | `queue` |
 | `queue mark` | `queue` |
 | `queue next` | `queue` |
+| `queue resume` | `queue` |
 | `queue status` | `queue` |
 | `recipe show` | `path` |
 | `reject` | `local_path` |
@@ -237,6 +238,77 @@ levantada dentro de um bloco que converte `ValueError` em erro de uso segue como
 | Motivo | Comando | Quando |
 |---|---|---|
 | `UNSAFE_INPUT` | todo comando que lê arquivo de fora pelo leitor único (a volta de um ambiente, um arquivo copiado para o projeto) | o arquivo ou uma pasta do caminho é link ou junção, não é arquivo comum, passa do teto, tem mais de um nome no disco (texto), tem nome recusado, não é texto UTF-8 ou não é um objeto JSON válido |
+
+## Fila (`queue`)
+
+`queue --action next` devolve `item`, `wait_seconds`, `resume_at` e `reason`. Só há `resume_at` quando o que
+segura a fila é ritmo; uma parada por recusa nunca traz horário, porque esperar não autoriza nada.
+
+| `reason` de `next` | O que é | O que fazer |
+|---|---|---|
+| `pace`, `max_per_hour`, `max_per_day` | Ritmo ou teto da fila. | Aguarde `wait_seconds` e chame `next` de novo. |
+| `cooldown` | Limite temporário da fonte (429, `rate limit`). É ritmo, não liberação: passar do `resume_at` não devolve acesso nenhum. | Aguarde e volte ao mesmo escopo; se o bloqueio voltar, pare. |
+| `active` | Já há um item entregue esperando `mark`. | Feche o item com `mark`. |
+| `empty` | Nada pendente. Um provedor parado sem pendentes também dá `empty`; com pendentes, `next` recusa (veja abaixo). | Nada a esperar. |
+
+`mark --failed` e `mark --skipped` leem o `--reason` em texto livre e o põem em um de três tipos. Uma recusa
+vence uma palavra de limite no mesmo texto: um 403 de causa desconhecida não vira "espere e volte".
+
+| `--reason` contém | Tipo | Efeito na fila |
+|---|---|---|
+| `429`, `rate limit`, `too many requests`, `limite de requisições` | limite de ritmo | Abre o cooldown de 30 min, dobrando até 4 h; `cooldown` no resultado, `resume_at` em `next`. |
+| `login`, `challenge`, `captcha`, `checkpoint`, `401`, `403`, `unauthorized`, `forbidden`, `access denied`, `acesso negado`, `sessão de acesso`, `bloqueou o IP`, `IP bloqueado` | recusa de acesso | Sem cooldown e sem `resume_at`: o resultado traz `cooldown: null` e `stop` (`kind: "access_refused"`, `class`, `at`), e a fila grava `providers.<provedor>.stopped` (`at`, `class`, `item`). |
+| qualquer outro texto | falha comum | Só o item falha; nada mais muda. |
+
+Com `stopped` gravado, `next` recusa em vez de esperar quando só restam pendentes desse provedor: sai com `1`,
+`error_code` `INVALID_DATA` e sem `reason_code`, com a mensagem "Fila de `<provedor>` parada em `<instante>`", e
+nenhum item é entregue desse provedor (nem um item que ficou `active` sob ele). Os outros provedores seguem; a
+espera de `next` que vale para um deles traz a chave `stopped` (a lista dos provedores parados) e diz na linha que
+a espera não cobre o parado. `status` mostra `providers.<provedor>.stopped` e a linha da fila diz que está parada.
+`classe` é um balde grosso (`http_403`, `http_401`, `challenge`, `login`, `ip_block`, `refused`), nunca o texto do
+motivo.
+
+A mensagem da recusa mostra só um modelo de retomada, com `NOME`, `"FRASE EXATA"` e `AT_DA_PARADA` por preencher,
+nunca um comando pronto. Quem limpa a parada é a pessoa, depois de confirmar no chat que o acesso voltou, com
+`queue --action resume --provider PROVEDOR --by NOME --phrase "FRASE EXATA" --expect AT`. Marca de gravação
+`P`: sem `--by`, `--phrase` (a frase exata da pessoa, guardada literalmente; não se chama `--statement` porque `--s` abrevia `--skipped` desde a 2.5) ou `--expect`, ou com um `--expect`
+que não é o `at` da parada que está gravada agora (o de `status`, em `providers.<provedor>.stopped.at`), recusa
+com `INVALID_DATA`, saída `1`, sem `reason_code` e sem mudar nada; assim um comando antigo ou repetido não limpa
+uma parada nova. Sem `--provider`, ou com um provedor que não está parado, recusa do mesmo jeito. A ação tira só a
+chave `stopped` desse provedor de `work/queue.json` (cooldown, contagens, ritmo e itens ficam como estavam),
+grava `providers.<provedor>.last_resume` (`at`, `by`, `statement` (a chave guardada se chama `statement`, embora a flag seja `--phrase`), `stopped_at`, `class`: quem limpou e com que
+frase, no `queue.json` privado) e, no log, `event=op` de `fs.write` e `event=queue_resume` com a classe e
+`statement_present=True`, nunca a frase. Devolve `action`, `provider`, `by`, `resumed` (`at`, `class`, `item` da
+parada que saiu) e `summary.do`, o `queue --action next` do mesmo provedor; `queue` (o caminho do
+`work/queue.json`) fica absoluto, como nas outras ações da fila. Nada disso é criptográfico: um agente poderia
+inventar a frase, e a regra é que o agente nunca a roda por conta própria; a diferença é que a violação deixa
+rastro (quem e com que palavras) em vez de um comando mudo.
+
+O que a parada fecha e o que não fecha. Ela é um registro no `work/queue.json` do projeto que segura o `next` e,
+com `--project`, o coletor `instagram_pairs.py` (que lê a fila, sem gravar, antes de qualquer pedido e sai com `1`,
+todos os stems `skipped` com motivo `aborted`). Não é uma trava:
+
+| Caminho | Situação |
+|---|---|
+| Esperar (nenhum `resume_at`), `mark --done` de outro item, `queue add` de um lote novo do mesmo provedor no mesmo projeto, um `stopped` corrompido | Fechado: a parada fica e `next` recusa (um `stopped` corrompido é fila inválida, nunca passe livre). |
+| `queue --action resume` | Fechado para quem não declara `--by`, `--phrase` e o `--expect` certo; aberto para quem inventa a frase (regra do agente, com rastro). |
+| Editar ou apagar o `work/queue.json` | Aberto: o `add` recria a fila sem a parada. O agente não faz isso. |
+| Outro projeto para o mesmo provedor | Aberto: a parada é por projeto. |
+| O coletor sem `--project` | Aberto: não há fila para ler, a parada nunca é gravada (só o aviso "parada não registrada"), e o lote sai fora dela. |
+
+O coletor `instagram_pairs.py` usa as mesmas três saídas para um `curl --fail` que volta 401, 403 ou 429, e a
+mensagem nunca leva a URL:
+
+| Resposta da CDN | Resultado | Lote | Fila |
+|---|---|---|---|
+| 429 | limite de ritmo | Para; `stopped_by` `cooldown`, o resto `skipped` com motivo `cooldown`. | Cooldown registrado. |
+| 403 com `oe` da URL assinada vencido há mais de 300 s | URL expirada: "recapture pela mesma rota autorizada" | Falha o item e, com `--continue-on-error`, para ali: `stopped_by` `recapture`, o resto `skipped` com motivo `recapture`, sem um pedido por item (sem a flag, termina como qualquer erro fatal). | Nada. |
+| 403 sem `oe`, com `oe` ilegível, repetido, zero, no futuro ou vencido há 300 s ou menos, ou 401 | recusa | Termina como qualquer erro fatal (o resto `skipped` com motivo `aborted`, saída `1`), com ou sem `--continue-on-error`. | Parada registrada, sem cooldown. |
+
+O `oe` é o instante de validade em hexadecimal, em segundos Unix. A expiração só vale quando ele é legível,
+único, diferente de zero e vencido há mais de 300 s (a margem cobre um relógio adiantado); sem isso o 403 é
+recusa, e a conclusão é parar e diagnosticar. Nenhum `error_code` nem
+`reason_code` novo.
 
 ## Avisos (`warnings`)
 
@@ -392,7 +464,7 @@ no projeto:
 | `capabilities` | Descreve o parser e os manifestos de plugin. |
 | `profile` | `trust`/`untrust` gravam só `$GB_HOME/trusted-profiles.json`. |
 | `rules` | Mostra as regras em vigor (`RULES.md` global e do projeto). |
-| `library` | `--search` consulta só a biblioteca pessoal (`$GB_HOME/library`). |
+| `library` | `--search` consulta só a biblioteca pessoal (`$GB_HOME/library`), pelo contexto do `--project`: num projeto com `client` no `project.json` (ou, sem `project.json`, o `cliente` do `ROTEIRO.md`; se ele não for um slug, `learn` recusa e a busca fica só no contexto da própria pessoa), a resposta traz `scope: "client:<slug>"` e só as entradas guardadas sob esse cliente ou sem cliente; sem `client`, a chave `scope` não aparece e só valem as entradas sem cliente. Entrada de outro cliente nunca aparece, nem em `library_hints` do `search`, nem nos contadores de `providers` (o contador gravado é só o das entradas sem cliente; o de um cliente é refeito das buscas dele). `learn` grava o `client` do projeto na entrada (e recusa um `project.json` ilegível, para a entrada não valer para todos). |
 | `references` | Lê as referências já decididas do projeto, sem recuperar pendência. |
 | `providers` | Lista as fontes e o que está configurado; não toca projeto. |
 | `environment` | `list` lê só o inventário das pontes oficiais (manifesto e pin), sem rodar código delas. |
@@ -548,6 +620,28 @@ fora aparece `disabled` com o motivo "desligado pelo perfil do workspace (getbro
 `plugins`)" e `plugins --action list` diz `"selection": "profile"`.
 `profile --action show` mostra cada valor com a origem (`env`, `env_file`, `profile`,
 `default`).
+
+### Proxy no `doctor`
+
+`doctor` traz `install.proxy`, uma chave aditiva e opcional: só aparece quando há variável de proxy no ambiente (quem lê ignora chave que não conhece):
+
+```json
+{"env": ["HTTPS_PROXY", "NO_PROXY"], "honored_by": ["curl", "yt-dlp", "browser"], "ignored_by": ["http"],
+ "hint": "curl e yt-dlp usam o proxy do ambiente nas transferências HTTPS; o navegador segue o proxy do sistema, não o do ambiente; o transporte HTTP interno conecta direto"}
+```
+
+- `env` lista, em ordem alfabética, os nomes postos (e não vazios) entre `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` e
+  `NO_PROXY`, na grafia em que estão no ambiente (`https_proxy` também vale para o `curl` e o `yt-dlp`). Nunca traz o
+  valor, que pode levar usuário e senha. Sem nenhuma dessas variáveis, a chave `install.proxy` não existe.
+- `honored_by` e `ignored_by` são fixos: o `curl`, o `yt-dlp` e o navegador, que o getbrolls só dispara, são quem pode
+  usar um proxy; o transporte HTTP interno (`http`, o das APIs de fonte) ignora o do ambiente de propósito e conecta
+  direto ao endereço que conferiu. A lista não promete que cada um use a variável posta: o `curl` e o `yt-dlp` só
+  aplicam `HTTPS_PROXY` e `ALL_PROXY` (em qualquer caixa) às transferências HTTPS do getbrolls, e `HTTP_PROXY` só vale
+  para endereços `http://`; o navegador segue o proxy do sistema, não o do ambiente.
+- `hint` só existe quando `HTTPS_PROXY` ou `ALL_PROXY` (em qualquer caixa) está posto; `HTTP_PROXY` e `NO_PROXY`, sozinhos,
+  aparecem em `env` sem o aviso.
+
+O proxy não muda `ready`, `summary` nem o código de saída do `doctor`, e não cria `error_code` nem `warnings`.
 
 ## Deprecação
 

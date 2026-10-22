@@ -70,7 +70,9 @@ if __name__ == "__main__":
 class RemotePreviewTests(unittest.TestCase):
     def test_local_ytdlp_accepts_windows_and_posix_virtualenv_layouts(self):
 
-        with tempfile.TemporaryDirectory() as tmp:
+        # A suíte fixa `GB_YTDLP_PATH` num yt-dlp de mentira (`_isolation`); aqui é a descoberta pela venv que se testa.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ):
+            os.environ.pop("GB_YTDLP_PATH", None)
             root = Path(tmp)
             windows = root / ".venv/Scripts/yt-dlp.exe"
             windows.parent.mkdir(parents=True)

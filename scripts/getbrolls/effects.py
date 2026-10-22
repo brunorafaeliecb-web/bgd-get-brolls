@@ -50,7 +50,8 @@ installation log takes `try_lock` around each line, and a lock that stays busy a
 socket of the pinned HTTPS opener (whose request `net.get`/`net.download` already logs).
 """
 
-# pylint: disable=broad-exception-caught,too-many-arguments,cyclic-import
+# pylint: disable=broad-exception-caught,too-many-arguments,cyclic-import,too-many-lines
+# `too-many-lines`: every side effect of the package has its helper here, by design.
 # `broad-exception-caught`: logging must never break the operation (the exception of the
 # operation itself is always re-raised). The cycle getbrolls.effects <-> getbrolls.runtime
 # is broken at run time: `runtime` imports this module late (inside a function).
@@ -284,6 +285,7 @@ def _new_salt_file(path):
     """A temporary file next to `path` with a fresh salt, 0600; returns its path."""
     temp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    runtime.make_private(temp, record=False)  # silent: a line here would recurse into the salt (`_set_aside`)
     with os.fdopen(fd, "w", encoding="ascii", newline="\n") as stream:
         stream.write(secrets.token_hex(32) + "\n")
     return temp
@@ -294,6 +296,7 @@ def _create_in_place(path):
     so only one process creates it; a reader that comes in the middle reads again."""
     with contextlib.suppress(FileExistsError):
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        runtime.make_private(path, record=False)  # silent, as in `_new_salt_file`
         with os.fdopen(fd, "w", encoding="ascii", newline="\n") as stream:
             stream.write(secrets.token_hex(32) + "\n")
 
@@ -309,7 +312,10 @@ def _create_salt(path, *, swap=False, wait_s=_SALT_LOCK_WAIT_S):
     its own. A lock not taken (still busy after the wait, or on Windows a lock file that does not open or lock):
     POSIX repairs anyway; Windows (a rename moves whatever is at `path`) leaves the file alone and returns
     `("malformed", None)` for the caller to read again, so with a lock file that cannot be used it never repairs."""
+    existed = path.parent.is_dir()  # lenient: only a folder made here gets the ACL, not a chosen GB_HOME
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not existed:
+        runtime.make_private(path.parent, record=False)  # silent too
     if not swap:
         return _link_new_salt(path)
     # POSIX: `flock` on `$GB_HOME` itself; without it (Windows), a lock file of its own there, the way
@@ -805,6 +811,11 @@ def kill(pid, sig, *, target):
 # --- files and folders -------------------------------------------------------------------
 
 
+def make_private(path, *, record=True):
+    """`runtime.make_private` (the private ACL on Windows, a no-op elsewhere) for modules that import `effects`."""
+    runtime.make_private(path, record=record)
+
+
 def replace(src, dst, *, operation="fs.replace", target=None, fallback=()):
     """`Path(src).replace(dst)`; the target is `dst` unless the caller names another one."""
     with op(operation, dst if target is None else target, fallback=fallback):
@@ -849,7 +860,7 @@ def rmtree(path, *, ignore_errors=False, operation="fs.rmtree", target=None):
 
 
 def mkdir(path, *, mode=0o777, parents=False, exist_ok=False, target=None):
-    """`Path(path).mkdir(...)`; a folder that already exists logs nothing."""
+    """`Path(path).mkdir(...)`; a folder that already exists logs nothing. A private `mode` (`0o700`): ACL too."""
     path = Path(path)
     if path.is_dir():  # lenient: existing folder is a no-op mkdir; the real call raises
         # Nothing to create: `exist_ok` returns, and without it `FileExistsError` goes up as it
@@ -858,6 +869,8 @@ def mkdir(path, *, mode=0o777, parents=False, exist_ok=False, target=None):
         return path
     with op("fs.mkdir", path if target is None else target):
         path.mkdir(mode=mode, parents=parents, exist_ok=exist_ok)
+    if not mode & 0o077:
+        make_private(path)  # the Windows ACL of a 0700 folder, where it was made
     return path
 
 

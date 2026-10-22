@@ -2284,7 +2284,7 @@
       ]
     },
     "queue": {
-      "help": "Enfileirar URLs sociais e ditar o ritmo do lote (add, next, mark, status)",
+      "help": "Enfileirar URLs sociais e ditar o ritmo do lote (add, next, mark, status, resume)",
       "options": [
         {
           "action": "_HelpAction",
@@ -2341,11 +2341,12 @@
             "add",
             "mark",
             "next",
+            "resume",
             "status"
           ],
           "default": null,
           "dest": "action",
-          "help": "add: enfileirar URLs; next: próximo item ou tempo de espera; mark: registrar resultado; status: contagens e cooldown",
+          "help": "add: enfileirar URLs; next: próximo item ou tempo de espera; mark: registrar resultado; status: contagens, cooldown e paradas; resume: com --provider, --by, --phrase e --expect, limpa a parada de um provedor depois que a pessoa confirmou, no chat, que o acesso voltou",
           "nargs": null,
           "option_strings": [
             "--action"
@@ -2361,7 +2362,7 @@
           ],
           "default": null,
           "dest": "provider",
-          "help": "Fonte das URLs em add; em next, limita a fila a essa fonte",
+          "help": "Fonte das URLs em add; em next, limita a fila a essa fonte; em resume, o provedor a retomar",
           "nargs": null,
           "option_strings": [
             "--provider"
@@ -2419,7 +2420,7 @@
           "choices": null,
           "default": false,
           "dest": "failed",
-          "help": "mark: item falhou; motivo com 403/429, challenge/login, 'rate limit'/'too many requests' ou as mensagens de bloqueio da própria skill (sessão de acesso, IP bloqueado, limite de requisições) abre cooldown",
+          "help": "mark: item falhou; motivo com 429, 'rate limit', 'too many requests' ou 'limite de requisições' abre cooldown (ritmo); motivo com login, challenge, captcha, 401/403 ou as mensagens de bloqueio da própria skill (sessão de acesso, IP bloqueado) para a fila do provedor, sem cooldown e sem horário para voltar",
           "nargs": 0,
           "option_strings": [
             "--failed"
@@ -2447,6 +2448,42 @@
           "nargs": null,
           "option_strings": [
             "--reason"
+          ],
+          "required": false
+        },
+        {
+          "action": "_StoreAction",
+          "choices": null,
+          "default": null,
+          "dest": "by",
+          "help": "resume: nome de quem confirmou, no chat, que o acesso voltou",
+          "nargs": null,
+          "option_strings": [
+            "--by"
+          ],
+          "required": false
+        },
+        {
+          "action": "_StoreAction",
+          "choices": null,
+          "default": null,
+          "dest": "statement",
+          "help": "resume: frase exata dita por essa pessoa, registrada literalmente",
+          "nargs": null,
+          "option_strings": [
+            "--phrase"
+          ],
+          "required": false
+        },
+        {
+          "action": "_StoreAction",
+          "choices": null,
+          "default": null,
+          "dest": "expect",
+          "help": "resume: o instante `at` da parada que a pessoa viu (status: stopped.at)",
+          "nargs": null,
+          "option_strings": [
+            "--expect"
           ],
           "required": false
         }

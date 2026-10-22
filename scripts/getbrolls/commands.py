@@ -896,7 +896,7 @@ def library_command(args):
     if args.command == "library":
         if not 1 <= args.limit <= 20:  # noqa: PLR2004 - matches the "--limit entre 1 e 20" message below
             raise ValueError("Use --limit entre 1 e 20.")
-        return library.search(args.search, limit=args.limit)
+        return library.search(args.search, limit=args.limit, project=args.project)
     given = [
         flag
         for flag, value in (
@@ -912,9 +912,9 @@ def library_command(args):
             '--outcome), --preference "frase" ou --from-candidate ID.'
         )
     if args.query:
-        return library.learn_query(args.query, args.provider, args.outcome, note=args.note)
+        return library.learn_query(args.query, args.provider, args.outcome, note=args.note, project=args.project)
     if args.preference:
-        return library.learn_preference(args.preference, by=args.by)
+        return library.learn_preference(args.preference, by=args.by, project=args.project)
     return library.learn_from_candidate(args.project, args.from_candidate, shot=args.shot)
 
 
@@ -2722,6 +2722,13 @@ def _warn_old_env_names() -> None:
         )
 
 
+def _doctor_proxy(install):
+    """`install.proxy` só quando há variável de proxy no ambiente (o `doctor` sem proxy é o de antes)."""
+    from getbrolls import http
+
+    install.update(http.proxy_install_entry())
+
+
 def _doctor_report(config, providers_result, live, env_flag=None):
     """Monta o relatório completo de `doctor`: executáveis, engine social, plugins e instalação."""
     from getbrolls import profile
@@ -2733,6 +2740,8 @@ def _doctor_report(config, providers_result, live, env_flag=None):
     install["app_log"] = str(logs.home_log_path())
     # A chave dos hashes do `event=op` (`$GB_HOME/.log-salt`): `missing` até a primeira linha que a usa.
     install["log_salt"] = effects.salt_state()
+    # Só com variável de proxy no ambiente: o transporte interno a ignora, `curl`/`yt-dlp`/navegador não.
+    _doctor_proxy(install)
     install["profile"] = profile.report()
     # A pasta pessoal que valeu e de onde veio (`env`, `env_file`, `profile` ou `default`).
     install["gb_home_source"] = install["profile"]["values"]["home"]["source"]
@@ -3073,7 +3082,7 @@ def _search_record_provider_failure(ctx, name, query, exc):
     if ctx.dry_run:
         return
     try:
-        library.learn_query(query, name, "miss", note=str(exc), auto=True)
+        library.learn_query(query, name, "miss", note=str(exc), auto=True, project=ctx.args.project)
     except (ValueError, OSError) as failure:
         record_warning("LIBRARY_WRITE_FAILED", labels.reason(failure))
 
@@ -3201,7 +3210,7 @@ def _build_search_result(ctx, outcome):
         )
     # Pistas da biblioteca são memória editorial, não permissão: cada uma
     # repete `rights_not_transferable` e nenhuma toca no candidato.
-    found = library.hints(args.query)
+    found = library.hints(args.query, project=args.project)
     if found:
         result["library_hints"] = found
     return result

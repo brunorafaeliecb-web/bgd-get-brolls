@@ -1,10 +1,10 @@
-"""Servidor HTTP local, somente leitura, para abrir o Storyboard (brolls/review.html) no navegador.
+"""Servidor HTTP local para abrir o Storyboard (brolls/review.html) no navegador.
 
-Serve apenas `<project>/brolls/`, vinculado a 127.0.0.1 (nunca 0.0.0.0): nada aqui é
-exposto fora desta máquina. Sem cache — o Storyboard e suas prévias podem mudar a
-qualquer revisão local. Não cria a árvore do projeto nem toma a trava exclusiva
-(comando somente leitura, como `status`); se `brolls/review.html` não existir, falha
-cedo com uma mensagem clara em vez de servir um diretório vazio.
+Serve `<project>/brolls/` somente leitura, vinculado a 127.0.0.1 (nunca 0.0.0.0), e aceita uma
+única escrita por HTTP, `POST /__save`, restrita ao token da sessão, que grava as decisões da
+revisão dentro do projeto. Sem cache: o Storyboard e suas prévias podem mudar a qualquer revisão
+local. Não cria a árvore do projeto nem toma a trava exclusiva; se `brolls/review.html` não
+existir, falha cedo com uma mensagem clara em vez de servir um diretório vazio.
 """
 
 # pylint: disable=missing-function-docstring,invalid-name,too-many-return-statements
@@ -33,6 +33,7 @@ from typing import cast
 
 from . import _paths, effects, labels, logs, runtime
 from .config import SECRET_ENV_SUFFIXES as _SECRET_ENV_SUFFIXES
+from .config import SERVE_CHILD_ENV, SERVE_CHILD_TOKEN
 from .sdk.files import refuse_link
 
 DEFAULT_PORT = 8767
@@ -399,7 +400,7 @@ class _NoCacheHandler(SimpleHTTPRequestHandler):
 # Quem sobe o servidor de fundo (`start_background`) põe isto no ambiente do filho: o que ele escreve em
 # `.serve.log` (stdout e stderr do Python: o traceback de uma falha, um aviso, a linha com as URLs) passa por
 # `filter_output`. O processo em primeiro plano não leva isto: a saída dele é da pessoa, no terminal dela.
-CHILD_ENV = "GETBROLLS_SERVE_LOG_FILTER"
+CHILD_ENV = SERVE_CHILD_ENV
 
 
 def clean_line(line) -> str:
@@ -499,6 +500,7 @@ def _write_private_text(path, text):
         refuse_link(path)
         handle = os.open(path, flags, 0o600)
         try:
+            effects.make_private(path)  # inside: Ctrl-C during the wait still closes the handle
             Path(path).chmod(0o600)
         except BaseException:
             os.close(handle)
@@ -559,6 +561,7 @@ def save_review(directory, data):
                 ) from exc
             try:
                 with effects.owned_stream(handle) as stream:
+                    effects.make_private(path)  # inside: Ctrl-C during the wait closes it and removes it
                     stream.write(body)
             except BaseException:
                 # Disk full or interrupted mid-write: no truncated decisions file is left behind, and a
@@ -763,6 +766,7 @@ def _rotate_log(log):
             refuse_link(rotated)
             handle = os.open(rotated, flags, 0o600)
             with effects.owned_stream(handle) as stream:
+                effects.make_private(rotated)
                 stream.write(kept)
     # lenient: log rotation is optional: a failure keeps the current log as it is
     except OSError:
@@ -786,7 +790,7 @@ def _child_environment(source_env, scripts):
         # só poderia pôr outro `getbrolls` (ou um módulo com o mesmo nome) na frente dele.
         environment.pop("PYTHONPATH", None)
     environment["PYTHONIOENCODING"] = "utf-8"
-    environment[CHILD_ENV] = "1"
+    environment[CHILD_ENV] = SERVE_CHILD_TOKEN
     return environment
 
 
