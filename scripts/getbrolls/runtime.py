@@ -115,52 +115,111 @@ def _icacls_exe():
     return str(path)
 
 
-def _owner_only_argv(path):
+def _owner_only_argv(path, folder):
     """`icacls <path> /grant:r <SID>:(F)… /inheritance:r /L`; a folder gets `(OI)(CI)(F)`, so what is made in
     it later is private too. The grant comes before `/inheritance:r`: should the grant fail, the object is
-    never left with an empty ACL. `/L` acts on a link itself, never on what it points at, and a link found
-    here (symbolic or junction) is refused before `icacls` runs."""
-    info = os.lstat(path)
-    # A symbolic link or a junction; any other reparse point (a OneDrive placeholder) is a file like the rest.
-    if stat.S_ISLNK(info.st_mode) or getattr(info, "st_reparse_tag", 0) in _LINK_TAGS:
-        raise OSError(errno.EPERM, "not restricting a link")
-    rights = "(OI)(CI)(F)" if stat.S_ISDIR(info.st_mode) else "(F)"
+    never left with an empty ACL. `/L` acts on a link itself, never on what it points at."""
+    rights = "(OI)(CI)(F)" if folder else "(F)"
     grants = [f"{principal}:{rights}" for principal in _PRINCIPALS]
     return [_icacls_exe(), os.fspath(path), "/grant:r", *grants, "/inheritance:r", "/L"]
 
 
+def _owner_only_acl(name, folder):
+    """What `icacls /restore` reads: the name (relative to the folder of the object), then the whole DACL in
+    SDDL, in UTF-16 LE with no BOM and CRLF, as `icacls /save` writes it. The DACL is protected (`P`) and holds
+    exactly the three SIDs of `_PRINCIPALS`, full access (`FA`), inheritable (`OICI`) on a folder."""
+    flags = "OICI" if folder else ""
+    aces = "".join(f"(A;{flags};FA;;;{principal.removeprefix('*')})" for principal in _PRINCIPALS)
+    # `surrogatepass`: an NTFS name may hold a lone surrogate, and the text must name that same object
+    return f"{name}\r\nD:PAI{aces}\r\n".encode("utf-16-le", "surrogatepass")
+
+
+def _scratch_folder():
+    """`%LOCALAPPDATA%\\Temp`, the temporary folder of the profile (the account, SYSTEM and Administrators only).
+
+    Never `TEMP`/`TMP`: they may point at a folder other accounts can write (`C:\\Temp`), where one of them could
+    rewrite the text `/restore` applies before `icacls` reads it."""
+    base = os.environ.get("LOCALAPPDATA")
+    folder = Path(base, "Temp") if base else None
+    # lenient: no profile temporary folder is the logged failure of the restore step; the grant already ran
+    if folder is None or not folder.is_absolute() or not folder.is_dir():
+        raise OSError(errno.ENOENT, "no temporary folder in the profile")
+    return folder
+
+
+@contextlib.contextmanager
+def _owner_only_steps(path):
+    """The two `icacls` runs of `make_private`, one at a time and in order: the grant (`_owner_only_argv`),
+    then `icacls <folder> /restore <file> /L`, which writes the DACL of `_owner_only_acl` over the whole ACL.
+
+    The grant leaves in place any other explicit entry (the account that created the object, say) and
+    `/restore` drops it, so only the three SIDs remain; it replaces the DACL in one write, never leaving it
+    empty. A link (symbolic or junction) is refused before either runs. The file `/restore` reads is made
+    only after the grant ran, in `_scratch_folder`, and is removed on the way out; with no such folder the
+    restore is a failure (the grant stays)."""
+    from . import effects  # local: effects imports this module
+
+    info = os.lstat(path)
+    # A symbolic link or a junction; any other reparse point (a OneDrive placeholder) is a file like the rest.
+    if stat.S_ISLNK(info.st_mode) or getattr(info, "st_reparse_tag", 0) in _LINK_TAGS:
+        raise OSError(errno.EPERM, "not restricting a link")
+    folder = stat.S_ISDIR(info.st_mode)
+    grant = _owner_only_argv(path, folder)
+    path = Path(path)
+
+    with contextlib.ExitStack() as stack:
+
+        def steps():
+            yield grant
+            acl = stack.enter_context(
+                # pylint: disable-next=protected-access  # the scratch file exists for this caller only
+                effects._scratch_file(
+                    _owner_only_acl(path.name, folder), folder=_scratch_folder(), prefix="gb-acl-", suffix=".txt"
+                )
+            )
+            yield [grant[0], os.fspath(path.parent), "/restore", acl, "/L"]
+
+        yield steps()
+
+
 def make_private(path, *, record=True):
     """The Windows counterpart of `chmod 0600/0700`: only the owner, SYSTEM and Administrators keep access to
-    `path`, nothing is inherited (the same ACL CPython gives `os.mkdir(path, 0o700)`).
+    `path`, nothing is inherited and no other entry stays (the same ACL CPython gives `os.mkdir(path, 0o700)`).
 
     Called at creation, wherever the code asks for 0600 (file) or 0700 (folder), before any content is
     written. A no-op off Windows, where the `chmod` already did it, with no process and no log line. On
-    Windows it runs `icacls` from System32 as a list, with no shell, as `proc.run` in the usual `event=op`
-    line (the target is the tool's name, never a path). A failure (no `icacls`, a link, a timeout, a
-    non-zero exit) is that line with `outcome=error` and never raises: the command goes on with the default
-    ACL of the folder.
+    Windows it runs `icacls` from System32 twice (`_owner_only_steps`), as a list, with no shell, under one
+    `proc.run` in the usual `event=op` line (the target is the tool's name, never a path; `exit` is the one of
+    the run that failed, or of the last one). A failure (no `icacls`, a link, a timeout, a non-zero exit) is
+    that line with `outcome=error` and never raises: the command goes on with the ACL the object has then.
 
     `record=False` is for the log handler's own folder and file and for the log salt: they are made while a
-    line is being written or redacted, and a line about them would recurse. They run the same argv; a failure
-    there is silent.
+    line is being written or redacted, and a line about them would recurse. They run the same steps; a
+    failure there is silent.
     """
     if not _is_windows():
         return
     if not record:
-        with contextlib.suppress(OSError, subprocess.SubprocessError):
-            _run_icacls(_owner_only_argv(path), check=True, capture_output=True, timeout=_ICACLS_TIMEOUT_S)
+        with contextlib.suppress(OSError, subprocess.SubprocessError), _owner_only_steps(path) as steps:
+            for argv in steps:
+                _run_icacls(argv, check=True, capture_output=True, timeout=_ICACLS_TIMEOUT_S)
         return
     from . import effects  # local: effects imports this module
 
     # The line of `effects.run`, with `_run_icacls` (bound at import) as the process.
-    with contextlib.suppress(OSError, subprocess.SubprocessError), effects.op("proc.run", [_ICACLS]) as handle:
-        argv = _owner_only_argv(path)
-        try:
-            completed = _run_icacls(argv, check=True, capture_output=True, timeout=_ICACLS_TIMEOUT_S)
-        except subprocess.CalledProcessError as exc:
-            handle.set(exit=exc.returncode)
-            raise
-        handle.set(exit=completed.returncode)
+    with (
+        contextlib.suppress(OSError, subprocess.SubprocessError),
+        effects.op("proc.run", [_ICACLS]) as handle,
+        _owner_only_steps(path) as steps,
+    ):
+        returncode = None
+        for argv in steps:
+            try:
+                returncode = _run_icacls(argv, check=True, capture_output=True, timeout=_ICACLS_TIMEOUT_S).returncode
+            except subprocess.CalledProcessError as exc:
+                handle.set(exit=exc.returncode)
+                raise
+        handle.set(exit=returncode)
 
 
 def _ensure_private_file(path):

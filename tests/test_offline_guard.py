@@ -19,6 +19,25 @@ TESTS = ROOT / "tests"
 GUARDED_FILES = ("test_cli.py", "test_permit_presets.py", "test_inspect.py", "test_social_recovery.py")
 
 
+def run_child(argv, env, timeout=600):
+    """`(código, cauda da saída)` de um processo filho, sem quebrar com a saída que não é UTF-8.
+
+    No Windows o filho escreve na página de código do console (cp1252), e a cauda só serve para o
+    diagnóstico: o byte inválido vira U+FFFD em vez de derrubar a leitura e deixar `stdout` vazio."""
+    done = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        cwd=str(ROOT),
+        check=False,
+        timeout=timeout,
+    )
+    return done.returncode, ((done.stdout or "") + (done.stderr or ""))[-1500:]
+
+
 def import_isolation(env):
     """O que `import _isolation` deixa em `GB_YTDLP_PATH` e `GB_YTDLP_SLEEP` num processo novo com `env` extra."""
     clean = {k: v for k, v in os.environ.items() if k not in ("GB_YTDLP_PATH", "GB_YTDLP_SLEEP", "GB_EVAL_NETWORK")}
@@ -88,21 +107,31 @@ class DnsGuardTests(unittest.TestCase):
             socket.getaddrinfo("www.youtube.com", 443)
 
 
+class RunChildTests(unittest.TestCase):
+    """A leitura da saída do filho aguenta a página de código do console do Windows."""
+
+    def test_a_child_writing_cp1252_bytes_keeps_its_code_and_a_readable_tail(self):
+        script = "import sys; sys.stdout.buffer.write('ação OK\\n'.encode('cp1252')); sys.stderr.write('fim')"
+        code, tail = run_child([sys.executable, "-c", script], dict(os.environ), timeout=60)
+        self.assertEqual(0, code, tail)
+        self.assertEqual("a\ufffd\ufffdo OK\nfim", tail)
+
+    def test_a_failing_child_with_no_output_keeps_its_code(self):
+        code, tail = run_child([sys.executable, "-c", "raise SystemExit(3)"], dict(os.environ), timeout=60)
+        self.assertEqual((3, ""), (code, tail))
+
+    def test_the_tail_keeps_only_the_last_characters(self):
+        code, tail = run_child([sys.executable, "-c", "print('x' * 2000 + 'END')"], dict(os.environ), timeout=60)
+        self.assertEqual(0, code)
+        self.assertEqual(1500, len(tail))
+        self.assertTrue(tail.endswith("END\n"))
+
+
 class FourFilesOfflineTests(unittest.TestCase):
     """Os quatro arquivos passam com a rede "desligada" e nenhum deles pede um nome ao DNS."""
 
     def run_file(self, name, env):
-        done = subprocess.run(
-            [sys.executable, "-m", "unittest", "discover", "-s", str(TESTS), "-p", name],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            env=env,
-            cwd=str(ROOT),
-            check=False,
-            timeout=600,
-        )
-        return done.returncode, (done.stdout + done.stderr)[-1500:]
+        return run_child([sys.executable, "-m", "unittest", "discover", "-s", str(TESTS), "-p", name], env)
 
     def test_the_guarded_files_pass_with_dns_refused_and_never_look_a_name_up(self):
         with tempfile.TemporaryDirectory() as tmp:

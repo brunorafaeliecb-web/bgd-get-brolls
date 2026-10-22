@@ -267,12 +267,42 @@ def _mask_venv_key(text, venv_key=None):
     return json.dumps(record, ensure_ascii=False, indent=1) + "\n"
 
 
+# No Windows, `runtime.make_private` registra cada ACL privada como uma linha `proc.run` do `icacls` (fica no log por
+# rastreabilidade); o ouro foi gravado no POSIX, onde ela não existe. Só essa forma, inteira e bem-sucedida, sai da
+# comparação, e só das linhas acrescentadas a um `getbrolls.log`: qualquer outra linha `proc.run` (outra ferramenta,
+# outro desfecho, um campo a mais) continua contando.
+ICACLS_OP_LINE = re.compile(
+    r"level=INFO logger=getbrolls\.effects event=op operation=proc\.run target=icacls outcome=ok "
+    r"duration_ms=<MS> error_code=- error=- command=[a-z_]+ exit=0"
+)
+
+
+def _drop_icacls_lines(text):
+    """`text` sem as linhas `ICACLS_OP_LINE` em `appends` de um `getbrolls.log`; sem nenhuma, o próprio `text`."""
+    try:
+        record = json.loads(text)
+    except ValueError:
+        return text
+    appends = record.get("appends") if isinstance(record, dict) else None
+    if not isinstance(appends, dict):
+        return text
+    changed = False
+    for rel, lines in appends.items():
+        if not rel.endswith("getbrolls.log") or not isinstance(lines, list):
+            continue
+        kept = [line for line in lines if not (isinstance(line, str) and ICACLS_OP_LINE.fullmatch(line))]
+        if len(kept) != len(lines):
+            appends[rel] = kept
+            changed = True
+    return json.dumps(record, ensure_ascii=False, indent=1, sort_keys=True) + "\n" if changed else text
+
+
 def comparable(text, venv_key=None):
-    """O texto do ouro como a comparação o vê: `bytes=` e `sha256_prefix=` do `event=fetch` viram marcadores, e a
-    chave da venv do `doctor` vira `<VENV_KEY>` (ver `_mask_venv_key`). Vale para os dois lados (o arquivo do ouro e o
-    registro serializado); nada mais é mascarado."""
+    """O texto do ouro como a comparação o vê: `bytes=` e `sha256_prefix=` do `event=fetch` viram marcadores, a
+    chave da venv do `doctor` vira `<VENV_KEY>` (ver `_mask_venv_key`) e a linha do `icacls` do Windows sai (ver
+    `ICACLS_OP_LINE`). Vale para os dois lados (o arquivo do ouro e o registro serializado); nada mais é mascarado."""
     text = _FETCH_LINE.sub(lambda line: _CLIP_FIELDS.sub("bytes=<N> sha256_prefix=<SHA>", line.group(0)), text)
-    return _mask_venv_key(text, venv_key)
+    return _mask_venv_key(_drop_icacls_lines(text), venv_key)
 
 
 def fetch_lines_without_clip_fields(text):

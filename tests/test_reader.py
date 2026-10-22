@@ -238,6 +238,9 @@ class UnreadableHintsTests(ReaderCase):
         self.write("x.txt", b"abc")
         for by_fd in (True, False):
             with self.subTest(by_fd=by_fd):
+                if by_fd and not reader._BY_FD:
+                    # sem `dir_fd` (Windows) a descida por descritor não existe: ligar a chave só abriria a pasta
+                    self.skipTest("descida por descritor só onde há dir_fd (POSIX)")
                 with (
                     mock.patch.object(reader, "_BY_FD", by_fd),
                     mock.patch.object(reader.os, "fstat", side_effect=OSError(errno.EIO, "Input/output error")),
@@ -440,6 +443,7 @@ class ListUnderTests(ReaderCase):
             reader.list_under(self.root)
         self.assertEqual("a", caught.exception.rel)
 
+    @unittest.skipUnless(reader._BY_FD, "a pasta abre por `os.open` só na descida por descritor (POSIX)")
     def test_a_descriptor_shortage_is_unreadable_with_its_hint_and_leaves_nothing_open(self):
         (self.root / "a" / "b").mkdir(parents=True)
         real_open = os.open
@@ -456,6 +460,7 @@ class ListUnderTests(ReaderCase):
         ):
             reader.list_under(self.root)
         self.assertEqual(("a", errno.EMFILE), (caught.exception.rel, caught.exception.errno))
+        self.assertIn("limite de arquivos abertos", str(caught.exception))
         if before is not None:
             self.assertEqual(before, len(list(FD_DIR.iterdir())))
 
@@ -541,6 +546,36 @@ class WithoutDirFdTests(ReaderCase):
 
         with mock.patch.object(reader, "_lstat", side_effect=swapped):
             self.refused("changed", reader.open_under, self.root, "project/a.txt", max_bytes=10)
+
+    def test_a_descriptor_shortage_listing_a_subfolder_is_unreadable_with_its_hint(self):
+        (self.root / "a" / "b").mkdir(parents=True)
+        real_scandir = os.scandir
+
+        def short(where):
+            if isinstance(where, Path) and where.name == "a":
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real_scandir(where)
+
+        before = len(list(FD_DIR.iterdir())) if FD_DIR.exists() else None
+        with (
+            mock.patch.object(reader.os, "scandir", side_effect=short),
+            self.assertRaises(reader.UnreadableError) as caught,
+        ):
+            reader.list_under(self.root)
+        self.assertEqual(("a", errno.EMFILE), (caught.exception.rel, caught.exception.errno))
+        self.assertIn("limite de arquivos abertos", str(caught.exception))
+        if before is not None:
+            self.assertEqual(before, len(list(FD_DIR.iterdir())))
+
+    def test_a_failed_fstat_after_the_open_is_unreadable_with_its_rel(self):
+        self.write("x.txt", b"abc")
+        with (
+            mock.patch.object(reader.os, "fstat", side_effect=OSError(errno.EIO, "Input/output error")),
+            self.assertRaises(reader.UnreadableError) as caught,
+        ):
+            reader.open_under(self.root, "x.txt", max_bytes=10)
+        self.assertEqual(("x.txt", errno.EIO), (caught.exception.rel, caught.exception.errno))
+        self.assertIn("disco", str(caught.exception))
 
     def test_a_leaf_swapped_between_lstat_and_open_is_changed(self):
         self.write("a.txt", b"x")

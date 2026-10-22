@@ -124,6 +124,73 @@ class GoldenOnAnotherDayTests(unittest.TestCase):
                     assert_matches_golden(self, scenario, record)
 
 
+class IcaclsLineMaskTests(unittest.TestCase):
+    """A linha `proc.run` do `icacls` (só no Windows) sai da comparação; nenhuma outra linha sai."""
+
+    LOG = "work/proj/brolls/getbrolls.log"
+    ICACLS = (
+        "level=INFO logger=getbrolls.effects event=op operation=proc.run target=icacls outcome=ok "
+        "duration_ms=<MS> error_code=- error=- command={command} exit=0"
+    )
+
+    @staticmethod
+    def golden():
+        return json.loads((_golden.EXPECTED / "fluxo" / "resolve_file.json").read_text(encoding="utf-8"))
+
+    def with_line(self, line, rel=None):
+        record = self.golden()
+        lines = record["appends"].setdefault(rel or self.LOG, [])
+        lines.insert(len(lines) - 1, line)
+        return record
+
+    def assert_masked(self, record):
+        golden = (_golden.EXPECTED / "fluxo" / "resolve_file.json").read_text(encoding="utf-8")
+        self.assertEqual(_golden.comparable(golden), _golden.comparable(_golden.serialize(record)))
+
+    def assert_not_masked(self, record):
+        golden = (_golden.EXPECTED / "fluxo" / "resolve_file.json").read_text(encoding="utf-8")
+        self.assertNotEqual(_golden.comparable(golden), _golden.comparable(_golden.serialize(record)))
+
+    def test_the_icacls_line_of_any_command_compares_equal_and_the_golden_file_is_untouched(self):
+        for command in ("resolve", "learn", "queue"):
+            with self.subTest(command=command):
+                self.assert_masked(self.with_line(self.ICACLS.format(command=command)))
+        self.assertFalse(any("target=icacls" in line for line in self.golden()["appends"][self.LOG]))
+
+    def test_two_icacls_lines_compare_equal_on_both_sides(self):
+        record = self.with_line(self.ICACLS.format(command="resolve"))
+        record["appends"][self.LOG].insert(1, self.ICACLS.format(command="resolve"))
+        self.assert_masked(record)
+        self.assertEqual(_golden.comparable(_golden.serialize(record)), _golden.comparable(_golden.serialize(record)))
+
+    def test_another_proc_run_line_still_fails(self):
+        line = self.ICACLS.format(command="resolve")
+        others = (
+            ("another tool", line.replace("target=icacls", "target=ffprobe")),
+            ("a failed icacls", line.replace("outcome=ok", "outcome=error")),
+            ("another exit", line.replace("exit=0", "exit=5")),
+            ("a field more", line + " count=2"),
+            ("another level", line.replace("level=INFO", "level=WARNING")),
+            ("another operation", line.replace("operation=proc.run", "operation=fs.write")),
+            ("a path as target", line.replace("target=icacls", "target=C:/Windows/System32/icacls.exe")),
+        )
+        for label, other in others:
+            with self.subTest(label):
+                self.assert_not_masked(self.with_line(other))
+
+    def test_the_line_counts_outside_the_appends_of_a_getbrolls_log(self):
+        line = self.ICACLS.format(command="resolve")
+        self.assert_not_masked(self.with_line(line, rel="work/proj/brolls/diagnostics.jsonl"))
+        record = self.golden()
+        record["stderr"] = {"text": [line]}
+        self.assert_not_masked(record)
+
+    def test_a_text_that_is_not_a_record_is_left_as_it_is(self):
+        for text in ("not json", "[1, 2]\n", '{"appends": []}\n'):
+            with self.subTest(text=text):
+                self.assertEqual(text, _golden.comparable(text))
+
+
 class VenvKeyMaskTests(unittest.TestCase):
     """A chave da venv do `doctor` (sha do `requirements.txt`) é a única diferença que os dois lados podem ter."""
 

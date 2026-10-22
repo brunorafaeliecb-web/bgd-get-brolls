@@ -1,13 +1,14 @@
 """Arquivos e pastas "privados" (0600/0700 no POSIX) ganham a ACL equivalente no Windows.
 
 `runtime.make_private(path)` roda `%SystemRoot%\\System32\\icacls.exe <caminho> /grant:r *S-1-3-4:(F)
-*S-1-5-18:(F) *S-1-5-32-544:(F) /inheritance:r /L` (pasta: `(OI)(CI)(F)`): o dono (OWNER RIGHTS), SYSTEM e
-Administradores, o mesmo que o CPython dá a `os.mkdir(caminho, 0o700)`, por SID e nunca por nome. Uma lista
-de argumentos, sem shell, e nada no POSIX, onde o `chmod` já rodou. O ramo do Windows roda aqui em qualquer
-sistema com `runtime._is_windows` ligado e `runtime._run_icacls` trocado por um gravador: o argv é conferido
-letra por letra. Uma falha vira uma linha `event=op` com `outcome=error` (o esquema de sempre, sem código
-novo) e nunca derruba o comando. O teste de verdade (`RealWindowsAclTests`) só roda no Windows e lê a ACL de
-volta em SDDL com `icacls /save`.
+*S-1-5-18:(F) *S-1-5-32-544:(F) /inheritance:r /L` (pasta: `(OI)(CI)(F)`) e, depois dela, `icacls <pasta>
+/restore <arquivo> /L`, que grava a DACL inteira em SDDL: só o dono (OWNER RIGHTS), SYSTEM e Administradores,
+o mesmo que o CPython dá a `os.mkdir(caminho, 0o700)`, por SID e nunca por nome, sem a entrada explícita de
+quem criou o arquivo. Listas de argumentos, sem shell, e nada no POSIX, onde o `chmod` já rodou. O ramo do
+Windows roda aqui em qualquer sistema com `runtime._is_windows` ligado e `runtime._run_icacls` trocado por um
+gravador: o argv é conferido letra por letra. Uma falha vira uma linha `event=op` com `outcome=error` (o
+esquema de sempre, sem código novo) e nunca derruba o comando. O teste de verdade (`RealWindowsAclTests`) só
+roda no Windows e lê a ACL de volta em SDDL com `icacls /save`.
 """
 
 import ast
@@ -83,6 +84,8 @@ class WindowsCase(unittest.TestCase):
         self.recorder = Recorder()
         # O tamanho de cada caminho na hora do `icacls`: a ACL chega antes do primeiro byte.
         self.sizes = {}
+        # `(argv, bytes do arquivo que /restore lê)`, guardados na hora da chamada: o arquivo some depois dela.
+        self.restored = []
         self.icacls = mock.MagicMock(side_effect=self._icacls)
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
@@ -91,9 +94,21 @@ class WindowsCase(unittest.TestCase):
         stack.enter_context(mock.patch.object(logs, "event", self.recorder))
         stack.enter_context(mock.patch.object(effects._logger, "isEnabledFor", return_value=True))
         stack.enter_context(mock.patch.dict(logs._state, {"project": None, "command": None}))
-        self.environ = stack.enter_context(mock.patch.dict(os.environ, {"SYSTEMROOT": str(system_root)}))
+        # A pasta temporária do perfil, onde nasce o texto do `/restore` (nunca a do `TEMP`).
+        (self.local / "Temp").mkdir(parents=True)
+        self.environ = stack.enter_context(
+            mock.patch.dict(os.environ, {"SYSTEMROOT": str(system_root), "LOCALAPPDATA": str(self.local)})
+        )
+
+    @property
+    def local(self):
+        """`%LOCALAPPDATA%` do Windows simulado."""
+        return self.tmp / "AppData" / "Local"
 
     def _icacls(self, argv, **_kwargs):
+        if "/restore" in argv:
+            self.restored.append((list(argv), Path(argv[argv.index("/restore") + 1]).read_bytes()))
+            return _finished()
         target = Path(argv[1])
         self.sizes[str(target)] = target.stat().st_size if target.is_file() else None
         return _finished()
@@ -101,8 +116,13 @@ class WindowsCase(unittest.TestCase):
     def _clean(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def argvs(self):
+    def calls(self):
+        """Todo argv pedido ao `icacls`, na ordem: a concessão e o `/restore` de cada objeto."""
         return [call.args[0] for call in self.icacls.call_args_list]
+
+    def argvs(self):
+        """Só as concessões (`/grant:r`), na ordem."""
+        return [argv for argv in self.calls() if "/grant:r" in argv]
 
     def granted(self, path):
         """Quantas vezes o `icacls` foi pedido para exatamente `path`."""
@@ -134,12 +154,14 @@ class ArgvTests(WindowsCase):
         path = self.tmp / "private.json"
         path.write_text("{}", encoding="utf-8")
         runtime.make_private(path)
-        (call,) = self.icacls.call_args_list
-        self.assertIsInstance(call.args[0], list)
-        self.assertFalse(call.kwargs.get("shell", False))
-        self.assertIs(call.kwargs.get("check"), True)
-        self.assertIs(call.kwargs.get("capture_output"), True)
-        self.assertIn(call.kwargs["timeout"], range(1, 121))
+        self.assertEqual(2, self.icacls.call_count)
+        for call in self.icacls.call_args_list:
+            with self.subTest(argv=call.args[0]):
+                self.assertIsInstance(call.args[0], list)
+                self.assertFalse(call.kwargs.get("shell", False))
+                self.assertIs(call.kwargs.get("check"), True)
+                self.assertIs(call.kwargs.get("capture_output"), True)
+                self.assertIn(call.kwargs["timeout"], range(1, 121))
 
     def test_the_grant_comes_before_the_inheritance_is_removed(self):
         path = self.tmp / "a"
@@ -164,9 +186,10 @@ class ArgvTests(WindowsCase):
         path = self.tmp / "a"
         path.write_text("", encoding="utf-8")
         runtime.make_private(path)
-        (argv,) = self.argvs()
-        self.assertEqual(argv[0], self.exe)
-        self.assertTrue(Path(argv[0]).is_absolute())
+        self.assertEqual(2, len(self.calls()))
+        for argv in self.calls():
+            self.assertEqual(argv[0], self.exe)
+            self.assertTrue(Path(argv[0]).is_absolute())
 
     def test_without_systemroot_it_is_the_default_windows_folder(self):
         del self.environ["SYSTEMROOT"]
@@ -796,6 +819,28 @@ class RealWindowsAclTests(unittest.TestCase):
                 _flags, aces = _parsed(self._dacl(path))
                 self.assertTrue(aces, "an empty DACL locks everybody out")
                 self.assertEqual(path.read_text(encoding="utf-8"), "{}")
+
+    def test_an_explicit_entry_of_another_account_is_dropped(self):
+        """What `/grant:r` keeps (an explicit entry of another account, as the one of the account that created
+        the object on Python 3.11) is gone after `make_private`: Everyone (`WD`) read, granted by hand."""
+        path = self._new_file()
+        subprocess.run([self.icacls, str(path), "/grant", "*S-1-1-0:(R)"], check=True, capture_output=True)
+        self.assertIn("WD", self._dacl(path))
+        runtime.make_private(path)
+        self.assert_private(path, set())
+
+    def test_a_name_with_spaces_and_accents_and_its_folder_keep_only_the_same_three(self):
+        parent = Path(tempfile.mkdtemp(prefix="gb-acl-"))
+        self.addCleanup(shutil.rmtree, parent, True)
+        folder = parent / "Pasta com espaço"
+        folder.mkdir()
+        path = folder / "decisão final.json"
+        path.write_text("{}", encoding="utf-8")
+        runtime.make_private(folder)
+        runtime.make_private(path)
+        self.assert_private(folder, {"OI", "CI"})
+        self.assert_private(path, set())
+        self.assertEqual(path.read_text(encoding="utf-8"), "{}")
 
     def test_a_failure_to_set_the_acl_never_breaks_the_caller(self):
         runtime.make_private(Path(tempfile.gettempdir()) / "gb-acl-never-created-file")

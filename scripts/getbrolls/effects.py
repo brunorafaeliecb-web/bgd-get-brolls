@@ -816,6 +816,22 @@ def make_private(path, *, record=True):
     runtime.make_private(path, record=record)
 
 
+@contextlib.contextmanager
+def _scratch_file(data, *, folder, prefix, suffix) -> Iterator[str]:
+    """A new file in `folder` holding `data`, for a child process to read; removed on the way out.
+
+    Unlogged on purpose: only `runtime.make_private` uses it, for the text `icacls /restore` reads, and its
+    `proc.run` line is the record (with `record=False`, made for the log itself, a line would recurse)."""
+    handle, path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=folder)
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(data)
+        yield path
+    finally:
+        with contextlib.suppress(OSError):
+            Path(path).unlink()
+
+
 def replace(src, dst, *, operation="fs.replace", target=None, fallback=()):
     """`Path(src).replace(dst)`; the target is `dst` unless the caller names another one."""
     with op(operation, dst if target is None else target, fallback=fallback):
