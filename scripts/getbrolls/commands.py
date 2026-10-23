@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__, logs
+from . import __version__, logs, venv_check
 from .config import CAP_EPSILON
 from .guidance import blocked_beats_question, next_action
 from .ledger import Ledger, digest
@@ -81,11 +81,12 @@ def doctor_resolved(overrides):
     resolved = {}
     for name in PROBED_EXECUTABLES:
         found = overrides.get(TOOL_PATH_KEYS.get(name) or "") or shutil.which(name)
-        if not found and name == "yt-dlp":
+        if name == "yt-dlp":
+            # A mesma ordem de `social.command()`: pin, venv, e só então o PATH.
             from .social import local_ytdlp
 
             try:
-                found = local_ytdlp()
+                found = local_ytdlp() or shutil.which(name)
             except ValueError:
                 found = None
         if not found and name == "playwright-cli":
@@ -1366,7 +1367,13 @@ def execute(args):  # noqa: C901, PLR0911, PLR0912, PLR0915 - existing size; shr
             }
             executables["yt-dlp"] = social["installed"]
             executables["playwright-cli"] = bool(_local_playwright() or shutil.which("playwright-cli"))
-            summary = doctor_summary(executables, pin_problems)
+            # A venv que o runtime usa contra os pinos: código novo sobre venv antiga não passa por "ok".
+            venv = venv_check.venv_report()
+            summary = doctor_summary(executables, [*pin_problems, *venv_check.missing_entries(venv, INSTALLER)])
+            if venv["status"] == "ok":
+                summary["ok"] = sorted([*summary["ok"], "venv"])
+            if any(entry["item"] == "venv" for entry in summary["missing"]):
+                summary["do"] = f"Rode o instalador de novo: {INSTALLER}; depois confira com doctor."
             sheet = doctor_contact_sheet(executables.get("ffmpeg"))
             summary["optional"] += sheet["optional"]
             result = {
@@ -1379,6 +1386,7 @@ def execute(args):  # noqa: C901, PLR0911, PLR0912, PLR0915 - existing size; shr
                 "tool_paths": overrides,
                 "executables": executables,
                 "resolved": resolved,
+                "venv": venv,
                 "providers": result,
                 "social": social,
             }

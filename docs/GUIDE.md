@@ -78,7 +78,7 @@ O instalador usa `.venv\Scripts\python.exe` e o launcher `.cmd` do Playwright; n
 
 Linux continua compatível como plataforma secundária. Em Ubuntu/Debian, instale `python3`, `python3-venv`, `ffmpeg` e `curl`, além de Node 22+, e use `scripts/install.sh` como no macOS.
 
-`doctor` lista executáveis e transporte; não certifica login, acesso a cada site ou extração ao vivo. `doctor --live` faz buscas remotas explicitamente e pode consumir quota dos bancos configurados.
+`doctor` lista executáveis e transporte e confere a `.venv` que a CLI usa contra os pinos de `requirements.txt` e `requirements-bootstrap.txt`: venv ausente, quebrada ou com versão diferente (por exemplo, código atualizado por `git pull` ou `/plugin update` sem rodar o instalador de novo) aparece em `summary.missing` como `venv`, e `summary.do` manda rodar o instalador. Não certifica login, acesso a cada site ou extração ao vivo. `doctor --live` faz buscas remotas explicitamente e pode consumir quota dos bancos configurados.
 
 ### Navegador / Instagram
 
