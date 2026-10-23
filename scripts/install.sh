@@ -29,6 +29,11 @@ if [ "${1:-}" = "--check" ]; then
 fi
 python3 -m venv "$ROOT/.venv"
 python_version="$("$ROOT/.venv/bin/python" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')"
+# The interpreter's bundled pip vendors an older certifi; upgrade it before it downloads anything else.
+if ! "$ROOT/.venv/bin/python" -m pip install --upgrade 'pip>=26.2.2'; then
+  printf 'Falha ao atualizar o pip da venv para 26.2.2 ou mais novo.\n' >&2
+  exit 1
+fi
 if ! "$ROOT/.venv/bin/python" -m pip install -r "$ROOT/requirements.txt"; then
   printf 'Falha ao instalar as dependências Python: seu Python é %s; o conjunto fixado foi validado em Python 3.11–3.13.\n' "$python_version" >&2
   printf 'Crie a venv com um interpretador dessa faixa ou atualize requirements.txt como um conjunto revisado.\n' >&2

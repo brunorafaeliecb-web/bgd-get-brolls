@@ -49,6 +49,8 @@ if ($Check) {
 Invoke-Native -Label 'Criação da venv' -File 'python' -Arguments @('-m', 'venv', (Join-Path $Root '.venv'))
 $VenvPython = Join-Path $Root '.venv\Scripts\python.exe'
 $PythonVersion = (& $VenvPython -c 'import sys; print(''%d.%d.%d'' % sys.version_info[:3])').Trim()
+# The interpreter's bundled pip vendors an older certifi; upgrade it before it downloads anything else.
+Invoke-Native -Label 'Atualização do pip' -File $VenvPython -Arguments @('-m', 'pip', 'install', '--upgrade', 'pip>=26.2.2')
 try {
     Invoke-Native -Label 'Instalação Python' -File $VenvPython -Arguments @('-m', 'pip', 'install', '-r', (Join-Path $Root 'requirements.txt'))
 } catch {
