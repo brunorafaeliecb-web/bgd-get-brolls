@@ -184,7 +184,7 @@ class InstallerHashEnforcementTests(unittest.TestCase):
 
     WRONG = "0" * 64
 
-    def run_installer(self, bootstrap_hash=None, runtime_hash=None):
+    def run_installer(self, bootstrap_hash=None, runtime_hash=None, runtime_line=None):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         (tmp / "scripts").mkdir()
@@ -197,7 +197,7 @@ class InstallerHashEnforcementTests(unittest.TestCase):
             f"gbbootstrap==1.0 --hash=sha256:{bootstrap_hash or bootstrap}\n", encoding="utf-8"
         )
         (tmp / "requirements.txt").write_text(
-            f"gbruntime==1.0 --hash=sha256:{runtime_hash or runtime}\n", encoding="utf-8"
+            runtime_line or f"gbruntime==1.0 --hash=sha256:{runtime_hash or runtime}\n", encoding="utf-8"
         )
         # Só o Python é de verdade; o resto do sistema que o instalador confere é stub.
         bindir = tmp / "bin"
@@ -255,6 +255,13 @@ class InstallerHashEnforcementTests(unittest.TestCase):
         self.assertIn("Falha ao instalar as dependências Python", result.stderr)
         self.assertEqual(["gbbootstrap"], self.installed(venv))
         self.assertNotIn("yt-dlp e EJS importados", result.stdout)
+
+    def test_a_requirement_without_a_hash_is_refused(self):
+        # Sem nenhum `--hash` no arquivo o pip não liga o modo de hash sozinho: só a opção do instalador recusa.
+        result, venv = self.run_installer(runtime_line="gbruntime==1.0\n")
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertIn("Hashes are required in --require-hashes mode", result.stdout + result.stderr)
+        self.assertEqual(["gbbootstrap"], self.installed(venv))
 
 
 if __name__ == "__main__":
