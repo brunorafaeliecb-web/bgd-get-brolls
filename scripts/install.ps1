@@ -52,12 +52,39 @@ $PythonVersion = (& $VenvPython -c 'import sys; print(''%d.%d.%d'' % sys.version
 # The interpreter's bundled pip vendors an older certifi: the first thing it downloads is the pip in
 # requirements-bootstrap.txt, refused unless its sha256 matches. Both steps install wheels only, since
 # pip does not hash-check the build tools an sdist pulls in.
-Invoke-Native -Label 'Instalação do pip (requirements-bootstrap.txt, com hash)' -File $VenvPython -Arguments @('-m', 'pip', 'install', '--require-hashes', '--only-binary', ':all:', '-r', (Join-Path $Root 'requirements-bootstrap.txt'))
+$PipLog = Join-Path $Root '.venv\pip-install.log'
+# Name the cause the pip log shows (network, hash, Python range) instead of one guess for every failure.
+function Write-PipFailure {
+    param(
+        [string]$Message,
+        [string]$File
+    )
+    Write-Host $Message
+    $Log = ''
+    if (Test-Path -LiteralPath $PipLog) { $Log = [string](Get-Content -LiteralPath $PipLog -Raw) }
+    # Hash first: it is the final error, and a retried connection earlier in the same log must not hide it.
+    if ($Log -match 'DO NOT MATCH THE HASHES|Hashes are required') {
+        Write-Host "Causa: um arquivo baixado não confere com o sha256 fixado em $File. Não instale por fora: atualize o get-brolls (git pull ou /plugin update) e rode o instalador de novo; se repetir, algo na rede pode estar alterando os downloads."
+    } elseif ($Log -match 'NewConnectionError|Failed to establish a new connection|Max retries exceeded|ConnectTimeout|Read timed out|ProxyError|Temporary failure in name resolution|getaddrinfo failed|SSLError|CERTIFICATE_VERIFY_FAILED|Connection refused|Network is unreachable') {
+        Write-Host 'Causa: o pip não alcançou o índice de pacotes (rede, proxy, VPN, firewall ou PIP_INDEX_URL). Confira a conexão e rode o instalador de novo.'
+    } elseif ($Log -match 'No matching distribution|requires a different Python|Could not find a version') {
+        Write-Host "Causa provável: seu Python é $PythonVersion; o conjunto fixado foi validado em Python 3.11-3.13. Crie a venv com um interpretador dessa faixa e rode o instalador de novo."
+    } else {
+        Write-Host "Veja a mensagem do pip acima; o registro completo está em $PipLog."
+    }
+}
+Set-Content -LiteralPath $PipLog -Value ''
 try {
-    Invoke-Native -Label 'Instalação Python' -File $VenvPython -Arguments @('-m', 'pip', 'install', '--require-hashes', '--only-binary', ':all:', '-r', (Join-Path $Root 'requirements.txt'))
+    Invoke-Native -Label 'Instalação do pip (requirements-bootstrap.txt, com hash)' -File $VenvPython -Arguments @('-m', 'pip', 'install', '--require-hashes', '--only-binary', ':all:', '-r', (Join-Path $Root 'requirements-bootstrap.txt'), '--log', $PipLog)
 } catch {
-    Write-Host "Falha ao instalar as dependências Python: seu Python é $PythonVersion; o conjunto fixado foi validado em Python 3.11-3.13."
-    Write-Host 'Crie a venv com um interpretador dessa faixa ou atualize requirements.txt como um conjunto revisado.'
+    Write-PipFailure -Message 'Falha ao instalar o pip da venv (requirements-bootstrap.txt, com hash).' -File 'requirements-bootstrap.txt'
+    throw
+}
+Set-Content -LiteralPath $PipLog -Value ''
+try {
+    Invoke-Native -Label 'Instalação Python' -File $VenvPython -Arguments @('-m', 'pip', 'install', '--require-hashes', '--only-binary', ':all:', '-r', (Join-Path $Root 'requirements.txt'), '--log', $PipLog)
+} catch {
+    Write-PipFailure -Message 'Falha ao instalar as dependências Python (requirements.txt, com hash).' -File 'requirements.txt'
     throw
 }
 Invoke-Native -Label 'Importação yt-dlp/EJS' -File $VenvPython -Arguments @('-c', 'import yt_dlp, yt_dlp_ejs; print(''yt-dlp e EJS importados'')')

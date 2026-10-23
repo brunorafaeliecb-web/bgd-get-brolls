@@ -11,6 +11,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from typing import ClassVar
 
 import _isolation  # noqa: F401  (efeito de import: define GB_HOME)
 from _paths import ROOT
@@ -158,6 +159,23 @@ class InstallerHashFlagsTests(unittest.TestCase):
             self.assertLess(script.index(bootstrap), script.index(install), name)
             self.assertNotIn("--upgrade", script, f"{name}: pip sem hash voltou")
 
+    def test_both_installers_name_the_cause_from_the_pip_log(self):
+        # O `install.ps1` não roda fora do Windows: as mesmas causas, pelo mesmo log, ficam conferidas no texto.
+        for name in ("scripts/install.sh", "scripts/install.ps1"):
+            script = (ROOT / name).read_text(encoding="utf-8")
+            self.assertEqual(2, script.count("--log"), name)
+            # O erro de hash é a falha final: um retry de rede no mesmo log não pode escondê-lo.
+            self.assertLess(script.index("DO NOT MATCH THE HASHES"), script.index("Failed to establish"), name)
+            for marker in (
+                "pip-install.log",
+                "Failed to establish a new connection",
+                "o pip não alcançou o índice de pacotes",
+                "DO NOT MATCH THE HASHES",
+                "não confere com o sha256 fixado",
+                "No matching distribution",
+            ):
+                self.assertIn(marker, script, f"{name}: {marker}")
+
 
 def build_wheel(folder, project, modules):
     """Roda pura mínima `<project>-1.0-py3-none-any.whl` com um `__init__.py` por módulo; devolve (caminho, sha256)."""
@@ -184,7 +202,7 @@ class InstallerHashEnforcementTests(unittest.TestCase):
 
     WRONG = "0" * 64
 
-    def run_installer(self, bootstrap_hash=None, runtime_hash=None, runtime_line=None):
+    def run_installer(self, bootstrap_hash=None, runtime_hash=None, runtime_line=None, **pip_env):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         (tmp / "scripts").mkdir()
@@ -222,6 +240,10 @@ class InstallerHashEnforcementTests(unittest.TestCase):
             "PIP_CONFIG_FILE": os.devnull,
             "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         }
+        # `PIP_NO_INDEX=None` tira a variável: o pip passa a procurar no índice de `PIP_INDEX_URL`.
+        env.update({key: value for key, value in pip_env.items() if value is not None})
+        for key in [key for key, value in pip_env.items() if value is None]:
+            env.pop(key, None)
         result = subprocess.run(
             ["/bin/bash", str(tmp / "scripts/install.sh")],
             env=env,
@@ -262,6 +284,45 @@ class InstallerHashEnforcementTests(unittest.TestCase):
         self.assertEqual(1, result.returncode, result.stdout)
         self.assertIn("Hashes are required in --require-hashes mode", result.stdout + result.stderr)
         self.assertEqual(["gbbootstrap"], self.installed(venv))
+
+    # F02 do QA da 2.5.1: a mensagem diz a causa que o log do pip mostra, não a faixa do Python por padrão.
+    UNREACHABLE: ClassVar[dict] = {
+        "PIP_NO_INDEX": None,
+        "PIP_INDEX_URL": "http://127.0.0.1:9/simple",
+        "PIP_RETRIES": "0",
+        "PIP_TIMEOUT": "3",
+    }
+    NETWORK = "o pip não alcançou o índice de pacotes"
+    HASH = "não confere com o sha256 fixado"
+    PYTHON_RANGE = "validado em Python 3.11–3.13"
+
+    def test_an_unreachable_index_at_the_bootstrap_says_network(self):
+        result, _venv = self.run_installer(PIP_FIND_LINKS=None, **self.UNREACHABLE)
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertIn("Falha ao instalar o pip da venv", result.stderr)
+        self.assertIn(self.NETWORK, result.stderr)
+        self.assertNotIn(self.PYTHON_RANGE, result.stderr)
+
+    def test_an_unreachable_index_at_the_requirements_says_network(self):
+        # O bootstrap acha a roda local; o runtime pede um pacote que só existiria no índice inacessível.
+        result, venv = self.run_installer(runtime_line=f"gbausente==1.0 --hash=sha256:{'1' * 64}\n", **self.UNREACHABLE)
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertEqual(["gbbootstrap"], self.installed(venv))
+        self.assertIn("Falha ao instalar as dependências Python", result.stderr)
+        self.assertIn(self.NETWORK, result.stderr)
+        self.assertNotIn(self.PYTHON_RANGE, result.stderr)
+
+    def test_a_hash_mismatch_says_hash(self):
+        result, _venv = self.run_installer(runtime_hash=self.WRONG)
+        self.assertIn(self.HASH, result.stderr)
+        self.assertNotIn(self.PYTHON_RANGE, result.stderr)
+        self.assertNotIn(self.NETWORK, result.stderr)
+
+    def test_no_distribution_without_network_errors_names_the_python_range(self):
+        result, _venv = self.run_installer(runtime_line=f"gbausente==1.0 --hash=sha256:{'1' * 64}\n")
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertIn(self.PYTHON_RANGE, result.stderr)
+        self.assertNotIn(self.NETWORK, result.stderr)
 
 
 if __name__ == "__main__":

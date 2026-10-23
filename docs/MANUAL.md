@@ -8,7 +8,7 @@ tags: [get-brolls, manual, tutorial, commands]
 
 # 🎬 Get B-rolls: manual + tutorial
 
-Versão 2.5.1. Feito pra **videomaker que está começando a mexer com código**.
+Versão 2.5.2. Feito pra **videomaker que está começando a mexer com código**.
 
 Você pede o B-roll, vê a prévia, aprova, e **só o trecho aprovado** é baixado, com a fonte anotada.
 
@@ -114,7 +114,8 @@ Consulte quando precisar. Cada bloco é um passo do caminho.
 python3 scripts/gb.py providers
 
 # ── doctor ──────────────────────────────────────────────────
-# O QUE FAZ: confere se FFmpeg, Node, yt-dlp e o resto estão instalados.
+# O QUE FAZ: confere se FFmpeg, Node, yt-dlp e o resto estão instalados, e se a .venv
+#   bate com as versões fixadas (item "venv" em missing: rode o instalador de novo).
 # VOCÊ RECEBE: o que está ok e o que falta, com o nome do que instalar.
 # QUANDO USAR: na primeira vez e sempre que algo der erro.
 # DEU CERTO QUANDO: "summary.missing" vem vazio: [].
