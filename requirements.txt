@@ -1,13 +1,14 @@
-# Versions installed successfully by the v2.3.7 macOS/Windows CI (2026-09-16).
+# Versions resolved for 2.5.1 on Python 3.11 and 3.14 (2026-10-22): certifi 2026.10.19
+# drops the distrusted emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2).
 # Update as a reviewed set and rerun the installers and provider smoke tests.
-yt-dlp[default]==2026.8.19
+yt-dlp[default]==2026.10.21
 yt-dlp-ejs==0.8.0
-brotli==1.2.0
-certifi==2026.7.22
-charset-normalizer==3.5.1
+brotli==1.2.1
+certifi==2026.10.19
+charset-normalizer==3.5.2
 idna==3.20
 mutagen==1.48.1
-pycryptodomex==3.23.0
+pycryptodomex==3.24.1
 requests==2.34.2
 urllib3==2.8.0
-websockets==17.1
+websockets==17.3
