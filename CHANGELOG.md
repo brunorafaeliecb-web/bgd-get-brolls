@@ -2,7 +2,7 @@
 type: documentation
 status: current
 created: 2026-09-15
-updated: 2026-10-22
+updated: 2026-10-23
 tags: [get-brolls]
 ---
 
@@ -10,7 +10,7 @@ tags: [get-brolls]
 
 ## Unreleased
 
-## 2.5.2 — 2026-10-22
+## 2.5.2 — 2026-10-23
 
 ### Segurança
 
