@@ -33,14 +33,28 @@ python_version="$("$ROOT/.venv/bin/python" -c 'import sys; print("%d.%d.%d" % sy
 # The interpreter's bundled pip vendors an older certifi: the first thing it downloads is the pip in
 # requirements-bootstrap.txt, refused unless its sha256 matches. Both steps install wheels only, since
 # pip does not hash-check the build tools an sdist pulls in.
-if ! "$ROOT/.venv/bin/python" -m pip install --require-hashes --only-binary :all: -r "$ROOT/requirements-bootstrap.txt"; then
-  printf 'Falha ao instalar o pip da venv (requirements-bootstrap.txt, com hash).\n' >&2
+pip_log="$ROOT/.venv/pip-install.log"
+# Name the cause the pip log shows (network, hash, Python range) instead of one guess for every failure.
+pip_failure() {
+  printf '%s\n' "$1" >&2
+  if grep -qE 'NewConnectionError|Failed to establish a new connection|Max retries exceeded|ConnectTimeout|Read timed out|ProxyError|Temporary failure in name resolution|nodename nor servname|Name or service not known|getaddrinfo failed|SSLError|CERTIFICATE_VERIFY_FAILED|Connection refused|Network is unreachable' "$pip_log" 2>/dev/null; then
+    printf 'Causa: o pip não alcançou o índice de pacotes (rede, proxy, VPN, firewall ou PIP_INDEX_URL). Confira a conexão e rode o instalador de novo.\n' >&2
+  elif grep -qE 'DO NOT MATCH THE HASHES|Hashes are required' "$pip_log" 2>/dev/null; then
+    printf 'Causa: um arquivo baixado não confere com o sha256 fixado em %s. Não instale por fora: atualize o get-brolls (git pull ou /plugin update) e rode o instalador de novo; se repetir, algo na rede pode estar alterando os downloads.\n' "$2" >&2
+  elif grep -qE 'No matching distribution|requires a different Python|Could not find a version' "$pip_log" 2>/dev/null; then
+    printf 'Causa provável: seu Python é %s; o conjunto fixado foi validado em Python 3.11–3.13. Crie a venv com um interpretador dessa faixa e rode o instalador de novo.\n' "$python_version" >&2
+  else
+    printf 'Veja a mensagem do pip acima; o registro completo está em %s.\n' "$pip_log" >&2
+  fi
   exit 1
+}
+: > "$pip_log"
+if ! "$ROOT/.venv/bin/python" -m pip install --require-hashes --only-binary :all: -r "$ROOT/requirements-bootstrap.txt" --log "$pip_log"; then
+  pip_failure 'Falha ao instalar o pip da venv (requirements-bootstrap.txt, com hash).' requirements-bootstrap.txt
 fi
-if ! "$ROOT/.venv/bin/python" -m pip install --require-hashes --only-binary :all: -r "$ROOT/requirements.txt"; then
-  printf 'Falha ao instalar as dependências Python: seu Python é %s; o conjunto fixado foi validado em Python 3.11–3.13.\n' "$python_version" >&2
-  printf 'Crie a venv com um interpretador dessa faixa ou atualize requirements.txt como um conjunto revisado.\n' >&2
-  exit 1
+: > "$pip_log"
+if ! "$ROOT/.venv/bin/python" -m pip install --require-hashes --only-binary :all: -r "$ROOT/requirements.txt" --log "$pip_log"; then
+  pip_failure 'Falha ao instalar as dependências Python (requirements.txt, com hash).' requirements.txt
 fi
 "$ROOT/.venv/bin/python" -c 'import yt_dlp, yt_dlp_ejs; print("yt-dlp e EJS importados")'
 # Install the reviewed dependency tree locally, without global npm changes.
