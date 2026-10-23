@@ -8,7 +8,7 @@ tags: [get-brolls, manual, tutorial, commands]
 
 # 🎬 Get B-rolls: manual + tutorial
 
-Versão 2.5.0. Feito pra **videomaker que está começando a mexer com código**.
+Versão 2.5.1. Feito pra **videomaker que está começando a mexer com código**.
 
 Você pede o B-roll, vê a prévia, aprova, e **só o trecho aprovado** é baixado, com a fonte anotada.
 
