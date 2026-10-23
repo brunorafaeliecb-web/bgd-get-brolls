@@ -15,7 +15,8 @@ tags: [get-brolls]
 ### Segurança
 
 - **certifi 2026.7.22 → 2026.10.19.** A versão anterior ainda trazia no pacote de certificados a raiz `emSign ECC Root CA - G3`, descontinuada por chaves fracas: com ela, alguém na mesma rede pode apresentar um certificado falso que o Python aceita. Advisory [GHSA-6q48-6c7w-9gw2](https://github.com/advisories/GHSA-6q48-6c7w-9gw2) / PYSEC-2026-4320.
-- **pip da venv.** O pip que o Python cria na venv carrega o próprio certifi. `scripts/install.sh` e `scripts/install.ps1` passam a atualizar o pip da venv para `>=26.2.2` antes de instalar o `requirements.txt`; `--check`/`-Check` continuam só conferindo os pré-requisitos.
+- **pip da venv.** O pip que o Python cria na venv carrega o próprio certifi. `scripts/install.sh` e `scripts/install.ps1` passam a instalar primeiro `pip==26.2.2` de `requirements-bootstrap.txt`, com os sha256 que o PyPI publica: mesmo com o certifi antigo, quem estiver no meio da conexão não consegue trocar o pacote. `--check`/`-Check` continuam só conferindo os pré-requisitos.
+- **Instalação com hash.** `requirements.txt` passa a ter o sha256 de todos os arquivos de cada pacote, transitivos incluídos (rodas de Linux, macOS e Windows do Python 3.11 ao 3.14), gerado de `requirements.in` com `uv pip compile --generate-hashes`. Os instaladores usam `--require-hashes --only-binary :all:`: arquivo com hash diferente é recusado e nenhum sdist é construído (o pip não confere o hash das ferramentas de construção). A receita de regeneração está no `CONTRIBUTING.md`.
 - **O que fazer:** rode o instalador de novo (`bash scripts/install.sh` ou `./scripts/install.ps1`). Fora do get-brolls, vale atualizar o pip das outras venvs (`python -m pip install --upgrade pip`) e o uv (`uv self update`, 0.13.4 ou mais nova, GHSA-hq85-5cpj-mr62).
 
 ### Também nesta versão

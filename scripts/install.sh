@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Dependencies are installed from PyPI/npm on the recipient's computer, never vendored.
+# Python ones with --require-hashes (every file must match a sha256 listed in the requirements files).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 case "${1:-}" in ''|--check) ;; *) printf 'Uso: bash scripts/install.sh [--check]\n'; exit 2;; esac
@@ -29,12 +30,14 @@ if [ "${1:-}" = "--check" ]; then
 fi
 python3 -m venv "$ROOT/.venv"
 python_version="$("$ROOT/.venv/bin/python" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')"
-# The interpreter's bundled pip vendors an older certifi; upgrade it before it downloads anything else.
-if ! "$ROOT/.venv/bin/python" -m pip install --upgrade 'pip>=26.2.2'; then
-  printf 'Falha ao atualizar o pip da venv para 26.2.2 ou mais novo.\n' >&2
+# The interpreter's bundled pip vendors an older certifi: the first thing it downloads is the pip in
+# requirements-bootstrap.txt, refused unless its sha256 matches. Both steps install wheels only, since
+# pip does not hash-check the build tools an sdist pulls in.
+if ! "$ROOT/.venv/bin/python" -m pip install --require-hashes --only-binary :all: -r "$ROOT/requirements-bootstrap.txt"; then
+  printf 'Falha ao instalar o pip da venv (requirements-bootstrap.txt, com hash).\n' >&2
   exit 1
 fi
-if ! "$ROOT/.venv/bin/python" -m pip install -r "$ROOT/requirements.txt"; then
+if ! "$ROOT/.venv/bin/python" -m pip install --require-hashes --only-binary :all: -r "$ROOT/requirements.txt"; then
   printf 'Falha ao instalar as dependências Python: seu Python é %s; o conjunto fixado foi validado em Python 3.11–3.13.\n' "$python_version" >&2
   printf 'Crie a venv com um interpretador dessa faixa ou atualize requirements.txt como um conjunto revisado.\n' >&2
   exit 1

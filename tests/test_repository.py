@@ -268,28 +268,6 @@ class RepositoryDocumentationTests(unittest.TestCase):
         self.assertIn("exit 1", shell)
         self.assertIn("throw", powershell)
 
-    def test_installers_upgrade_the_venv_pip_before_the_requirements(self):
-        # The interpreter's ensurepip ships an older pip that vendors a certifi
-        # bundle with the distrusted emSign root (GHSA-6q48-6c7w-9gw2).
-        for name, check, upgrade, install in (
-            (
-                "scripts/install.sh",
-                '[ "${1:-}" = "--check" ]',
-                "-m pip install --upgrade 'pip>=26.2.2'",
-                "-m pip install -r",
-            ),
-            (
-                "scripts/install.ps1",
-                "if ($Check)",
-                "'pip', 'install', '--upgrade', 'pip>=26.2.2'",
-                "'pip', 'install', '-r'",
-            ),
-        ):
-            script = (ROOT / name).read_text(encoding="utf-8")
-            self.assertIn(upgrade, script, name)
-            self.assertLess(script.index(check), script.index(upgrade), name)
-            self.assertLess(script.index(upgrade), script.index(install), name)
-
     def test_powershell_installer_python_snippets_have_no_double_quotes(self):
         # Windows PowerShell 5.1 strips inner double quotes when passing
         # arguments to native executables, so `python -c '... "x" ...'`

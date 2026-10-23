@@ -41,7 +41,7 @@ A prévia pode baixar mídia de trabalho para mostrar o movimento. A entrega fin
 
 ## Atualizações
 
-- **2.5.1** Segurança: `certifi` 2026.10.19 tira a raiz emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2) e os instaladores atualizam o pip da venv para 26.2.2 ou mais novo. Rode o instalador de novo. Dependências atualizadas como um conjunto revisado.
+- **2.5.1** Segurança: `certifi` 2026.10.19 tira a raiz emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2) e os instaladores instalam o pip 26.2.2 e todas as dependências Python conferindo o sha256 de cada arquivo (`--require-hashes`). Rode o instalador de novo. Dependências atualizadas como um conjunto revisado.
 - **2.5.0** Log por projeto em `brolls/getbrolls.log` (`GB_LOG_LEVEL`, `GB_LOG_STDERR`): comandos, trilha de aprovação, subprocessos e rede, sem nomes, frases de aprovação nem URLs. `reject` zera o `output`, `verify` confere todos os clipes e desmarca o que foi alterado, e `deliver` pula clipe rejeitado ou reprovado e lista em `skipped`. Storyboard local endurecido (só `review.html`, `previews/` e `clips/`, cabeçalhos contra embutir a página). `~/.getbrolls/RULES.md` ilegível passa a parar o comando em vez de ser ignorado.
 - **2.4.3** Portão único de release (`scripts/preflight.sh`), versão escrita numa passada (`scripts/bump_version.py`) e espelho do SKILL.md gerado (`scripts/gen_skill_mirror.py`). `GB_CACHE_DIR` passa a valer no `.env`; `GETBROLLS_CACHE_DIR` continua funcionando. Sem mudança no fluxo de coleta.
 - **2.4.2** Frontmatter do SKILL.md válido como YAML (a `description` ganha aspas; o GitHub não renderizava o arquivo).

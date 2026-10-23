@@ -31,7 +31,7 @@ A preview may download working media so you can see the motion. Final delivery r
 
 ## Updates
 
-- **2.5.1.** Security: `certifi` 2026.10.19 drops the emSign ECC Root CA - G3 root (GHSA-6q48-6c7w-9gw2) and the installers upgrade the venv's pip to 26.2.2 or newer. Re-run the installer. Dependencies updated as a reviewed set.
+- **2.5.1.** Security: `certifi` 2026.10.19 drops the emSign ECC Root CA - G3 root (GHSA-6q48-6c7w-9gw2) and the installers install pip 26.2.2 and every Python dependency checking each file's sha256 (`--require-hashes`). Re-run the installer. Dependencies updated as a reviewed set.
 - **2.5.0.** Per-project log at `brolls/getbrolls.log` (`GB_LOG_LEVEL`, `GB_LOG_STDERR`): commands, the approval trail, subprocesses and network, with no names, approval statements or URLs. `reject` clears `output`, `verify` checks every clip and unmarks altered ones, and `deliver` skips rejected or failed clips and lists them under `skipped`. Hardened local Storyboard server (only `review.html`, `previews/` and `clips/`, anti-framing headers). An unreadable `~/.getbrolls/RULES.md` now stops the command instead of being ignored.
 - **2.4.3.** Single release gate (`scripts/preflight.sh`), one-pass version bump (`scripts/bump_version.py`) and a generated SKILL.md mirror (`scripts/gen_skill_mirror.py`). `GB_CACHE_DIR` now works from `.env`; `GETBROLLS_CACHE_DIR` keeps working. No change to the collection flow.
 - **2.4.2.** SKILL.md frontmatter is valid YAML again (quoted `description`; GitHub failed to render the file).

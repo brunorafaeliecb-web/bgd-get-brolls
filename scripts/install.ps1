@@ -49,10 +49,12 @@ if ($Check) {
 Invoke-Native -Label 'Criação da venv' -File 'python' -Arguments @('-m', 'venv', (Join-Path $Root '.venv'))
 $VenvPython = Join-Path $Root '.venv\Scripts\python.exe'
 $PythonVersion = (& $VenvPython -c 'import sys; print(''%d.%d.%d'' % sys.version_info[:3])').Trim()
-# The interpreter's bundled pip vendors an older certifi; upgrade it before it downloads anything else.
-Invoke-Native -Label 'Atualização do pip' -File $VenvPython -Arguments @('-m', 'pip', 'install', '--upgrade', 'pip>=26.2.2')
+# The interpreter's bundled pip vendors an older certifi: the first thing it downloads is the pip in
+# requirements-bootstrap.txt, refused unless its sha256 matches. Both steps install wheels only, since
+# pip does not hash-check the build tools an sdist pulls in.
+Invoke-Native -Label 'Instalação do pip (requirements-bootstrap.txt, com hash)' -File $VenvPython -Arguments @('-m', 'pip', 'install', '--require-hashes', '--only-binary', ':all:', '-r', (Join-Path $Root 'requirements-bootstrap.txt'))
 try {
-    Invoke-Native -Label 'Instalação Python' -File $VenvPython -Arguments @('-m', 'pip', 'install', '-r', (Join-Path $Root 'requirements.txt'))
+    Invoke-Native -Label 'Instalação Python' -File $VenvPython -Arguments @('-m', 'pip', 'install', '--require-hashes', '--only-binary', ':all:', '-r', (Join-Path $Root 'requirements.txt'))
 } catch {
     Write-Host "Falha ao instalar as dependências Python: seu Python é $PythonVersion; o conjunto fixado foi validado em Python 3.11-3.13."
     Write-Host 'Crie a venv com um interpretador dessa faixa ou atualize requirements.txt como um conjunto revisado.'
