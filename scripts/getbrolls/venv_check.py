@@ -24,10 +24,10 @@ CERTIFI_NOTE = (
     "a correção só vale depois do instalador"
 )
 
-# Lista nome → versão de tudo que o `importlib.metadata` do Python da venv enxerga.
+# Pares [nome, versão] de tudo que o `importlib.metadata` do Python da venv enxerga, duplicados inclusive.
 _LIST_SNIPPET = (
     "import importlib.metadata as m, json; "
-    "print(json.dumps({d.metadata['Name']: d.version for d in m.distributions() if d.metadata['Name']}))"
+    "print(json.dumps([[d.metadata['Name'], d.version] for d in m.distributions() if d.metadata['Name']]))"
 )
 _PIN = re.compile(r"([A-Za-z0-9_.\-]+)(?:\[[^\]]*\])?==([^\s;\\]+)\s*(;)?")
 
@@ -69,25 +69,26 @@ def venv_python(base):
     """Python da venv (layout do Windows ou do Unix), ou None quando não há nenhum."""
     for relative in PYTHON_LAYOUTS:
         candidate = Path(base) / relative
-        if candidate.is_file():
+        # Link quebrado (o Python do sistema foi atualizado e sumiu) conta: a venv existe e está quebrada.
+        if candidate.is_file() or candidate.is_symlink():
             return candidate
     return None
 
 
 def runtime_venv():
     """`(pasta, motivo)` da venv que o runtime usaria; pasta None quando o yt-dlp não vem de venv nenhuma."""
-    if executable_override("GB_YTDLP_PATH"):
-        return None, "pinned"
     try:
+        if executable_override("GB_YTDLP_PATH"):
+            return None, "pinned"
         base = venv_override()
     except ValueError:
-        # Pin inválido já entra em `missing` pelo próprio GB_VENV_PATH.
+        # Pin inválido (GB_YTDLP_PATH ou GB_VENV_PATH) já entra em `missing` pelo próprio pino.
         return None, "skipped"
     return (base if base is not None else ROOT / ".venv"), None
 
 
 def installed_versions(python):
-    """`{nome: versão}` instalados na venv; levanta OSError/ValueError quando o Python dela não roda."""
+    """`{nome: [versões]}` instalados na venv; levanta OSError/ValueError quando o Python dela não roda."""
     done = subprocess.run(
         [str(python), "-I", "-c", _LIST_SNIPPET],
         capture_output=True,
@@ -97,8 +98,15 @@ def installed_versions(python):
         check=False,
     )
     if done.returncode != 0:
-        raise ValueError(f"saiu com código {done.returncode}")
-    return {normalize_name(name): version for name, version in json.loads(done.stdout).items()}
+        tail = done.stderr.strip().splitlines()[-1:] or [""]
+        raise ValueError(f"saiu com código {done.returncode}: {tail[0][:200]}".rstrip(": "))
+    rows = json.loads(done.stdout)
+    if not isinstance(rows, list) or not all(isinstance(row, list) and len(row) == 2 for row in rows):  # noqa: PLR2004 - par [nome, versão]
+        raise ValueError("a listagem de pacotes não veio no formato esperado")
+    found = {}
+    for name, version in rows:
+        found.setdefault(normalize_name(str(name)), []).append(str(version))
+    return found
 
 
 def venv_report(base=None, root=None):
@@ -121,13 +129,18 @@ def venv_report(base=None, root=None):
         report["error"] = str(exc)
         return report
     for name, pinned in sorted(pinned_versions(root).items()):
-        found = installed.get(name)
-        if found is None:
+        versions = installed.get(name)
+        if not versions:
             report["differences"].append(f"{name} ausente (fixado {pinned})")
-        elif normalize_version(found) != normalize_version(pinned):
-            report["differences"].append(f"{name} {found} (fixado {pinned})")
-    certifi = installed.get("certifi")
-    report["certifi_distrusted_root"] = certifi is None or _version_key(certifi) < _version_key(CERTIFI_FLOOR)
+        elif len(versions) > 1:
+            # Qual o `import` acha depende da ordem do disco: dois `.dist-info` nunca passam por "ok".
+            report["differences"].append(f"{name} duplicado ({', '.join(sorted(versions))})")
+        elif normalize_version(versions[0]) != normalize_version(pinned):
+            report["differences"].append(f"{name} {versions[0]} (fixado {pinned})")
+    certifi = installed.get("certifi") or []
+    report["certifi_distrusted_root"] = not certifi or any(
+        _version_key(version) < _version_key(CERTIFI_FLOOR) for version in certifi
+    )
     if report["differences"]:
         report["status"] = "stale"
     return report

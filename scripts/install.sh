@@ -37,10 +37,11 @@ pip_log="$ROOT/.venv/pip-install.log"
 # Name the cause the pip log shows (network, hash, Python range) instead of one guess for every failure.
 pip_failure() {
   printf '%s\n' "$1" >&2
-  if grep -qE 'NewConnectionError|Failed to establish a new connection|Max retries exceeded|ConnectTimeout|Read timed out|ProxyError|Temporary failure in name resolution|nodename nor servname|Name or service not known|getaddrinfo failed|SSLError|CERTIFICATE_VERIFY_FAILED|Connection refused|Network is unreachable' "$pip_log" 2>/dev/null; then
-    printf 'Causa: o pip não alcançou o índice de pacotes (rede, proxy, VPN, firewall ou PIP_INDEX_URL). Confira a conexão e rode o instalador de novo.\n' >&2
-  elif grep -qE 'DO NOT MATCH THE HASHES|Hashes are required' "$pip_log" 2>/dev/null; then
+  # Hash first: it is the final error, and a retried connection earlier in the same log must not hide it.
+  if grep -qE 'DO NOT MATCH THE HASHES|Hashes are required' "$pip_log" 2>/dev/null; then
     printf 'Causa: um arquivo baixado não confere com o sha256 fixado em %s. Não instale por fora: atualize o get-brolls (git pull ou /plugin update) e rode o instalador de novo; se repetir, algo na rede pode estar alterando os downloads.\n' "$2" >&2
+  elif grep -qE 'NewConnectionError|Failed to establish a new connection|Max retries exceeded|ConnectTimeout|Read timed out|ProxyError|Temporary failure in name resolution|nodename nor servname|Name or service not known|getaddrinfo failed|SSLError|CERTIFICATE_VERIFY_FAILED|Connection refused|Network is unreachable' "$pip_log" 2>/dev/null; then
+    printf 'Causa: o pip não alcançou o índice de pacotes (rede, proxy, VPN, firewall ou PIP_INDEX_URL). Confira a conexão e rode o instalador de novo.\n' >&2
   elif grep -qE 'No matching distribution|requires a different Python|Could not find a version' "$pip_log" 2>/dev/null; then
     printf 'Causa provável: seu Python é %s; o conjunto fixado foi validado em Python 3.11–3.13. Crie a venv com um interpretador dessa faixa e rode o instalador de novo.\n' "$python_version" >&2
   else

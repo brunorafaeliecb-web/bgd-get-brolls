@@ -164,6 +164,8 @@ class InstallerHashFlagsTests(unittest.TestCase):
         for name in ("scripts/install.sh", "scripts/install.ps1"):
             script = (ROOT / name).read_text(encoding="utf-8")
             self.assertEqual(2, script.count("--log"), name)
+            # O erro de hash é a falha final: um retry de rede no mesmo log não pode escondê-lo.
+            self.assertLess(script.index("DO NOT MATCH THE HASHES"), script.index("Failed to establish"), name)
             for marker in (
                 "pip-install.log",
                 "Failed to establish a new connection",

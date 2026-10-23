@@ -121,11 +121,49 @@ class VenvReportTests(unittest.TestCase):
         [entry] = venv_check.missing_entries(report, "INSTALLER")
         self.assertIn("não roda", entry["note"])
 
+    def test_two_versions_of_one_package_are_stale_whatever_the_listing_order(self):
+        # Dois `.dist-info` do certifi: qual o `import` acha depende da ordem do disco; o doctor não aposta.
+        base = make_venv(self.tmp, self.pins)
+        purelib = next(base.glob("lib/python*/site-packages")) if os.name != "nt" else base / "Lib" / "site-packages"
+        old = purelib / "certifi-2026.7.22.dist-info"
+        old.mkdir()
+        (old / "METADATA").write_text("Metadata-Version: 2.1\nName: certifi\nVersion: 2026.7.22\n", encoding="utf-8")
+        report = venv_check.venv_report(base, ROOT)
+        self.assertEqual("stale", report["status"])
+        self.assertIn("certifi duplicado (2026.10.19, 2026.7.22)", report["differences"])
+        self.assertTrue(report["certifi_distrusted_root"])
+
+    @unittest.skipIf(os.name == "nt", "symlink")
+    def test_a_dangling_python_symlink_is_broken_not_absent(self):
+        # O caso do Homebrew: a venv aponta para um Python que o upgrade removeu.
+        base = self.tmp / ".venv"
+        (base / "bin").mkdir(parents=True)
+        (base / "bin" / "python").symlink_to(self.tmp / "python-que-sumiu")
+        report = venv_check.venv_report(base, ROOT)
+        self.assertEqual("broken", report["status"])
+
+    @unittest.skipIf(os.name == "nt", "stub de shell")
+    def test_a_python_that_prints_something_else_is_broken(self):
+        base = self.tmp / ".venv"
+        (base / "bin").mkdir(parents=True)
+        python = base / "bin" / "python"
+        python.write_text("#!/bin/sh\necho '[1, 2]'\necho detalhe >&2\n", encoding="utf-8")
+        python.chmod(0o755)
+        report = venv_check.venv_report(base, ROOT)
+        self.assertEqual("broken", report["status"])
+
+    def test_an_invalid_ytdlp_pin_skips_the_venv_instead_of_raising(self):
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"GB_YTDLP_PATH": str(self.tmp / "gb-inexistente-yt-dlp")}):
+            report = venv_check.venv_report()
+        self.assertEqual("skipped", report["status"])
+
 
 class DoctorVenvTests(unittest.TestCase):
     """O `doctor` de verdade, pela CLI, numa venv apontada por GB_VENV_PATH."""
 
-    def doctor(self, tmp, venv, path_ytdlp=True, cli=CLI):
+    def doctor(self, tmp, venv, path_ytdlp=True, cli=CLI, **extra):
         empty = Path(tmp) / "vazio.env"
         empty.write_text("", encoding="utf-8")
         decoy = Path(tmp) / "path-bin"
@@ -140,6 +178,7 @@ class DoctorVenvTests(unittest.TestCase):
         env.pop("GB_VENV_PATH", None)
         if venv is not None:
             env["GB_VENV_PATH"] = str(venv)
+        env.update(extra)
         done = subprocess.run(
             [sys.executable, str(cli), "--env-file", str(empty), "doctor"],
             capture_output=True,
@@ -196,6 +235,14 @@ class DoctorVenvTests(unittest.TestCase):
             payload, decoy = self.doctor(tmp, None, cli=root / "scripts" / "gb.py")
             self.assertEqual(str((decoy / "yt-dlp").resolve()), payload["resolved"]["yt-dlp"])
             self.assertIn("venv", {e["item"] for e in payload["summary"]["missing"]})
+
+    def test_an_invalid_ytdlp_pin_is_a_missing_entry_not_a_crash(self):
+        # Regressão achada na revisão adversarial da 2.5.2: na 2.5.1 isto já era um item de `missing`.
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(Path(tmp).resolve() / "gb-inexistente-yt-dlp")
+            payload, _decoy = self.doctor(tmp, None, GB_YTDLP_PATH=missing)
+            self.assertIn("GB_YTDLP_PATH", {e["item"] for e in payload["summary"]["missing"]})
+            self.assertEqual("skipped", payload["venv"]["status"])
 
 
 if __name__ == "__main__":

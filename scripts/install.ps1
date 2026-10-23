@@ -62,10 +62,11 @@ function Write-PipFailure {
     Write-Host $Message
     $Log = ''
     if (Test-Path -LiteralPath $PipLog) { $Log = [string](Get-Content -LiteralPath $PipLog -Raw) }
-    if ($Log -match 'NewConnectionError|Failed to establish a new connection|Max retries exceeded|ConnectTimeout|Read timed out|ProxyError|Temporary failure in name resolution|getaddrinfo failed|SSLError|CERTIFICATE_VERIFY_FAILED|Connection refused|Network is unreachable') {
-        Write-Host 'Causa: o pip não alcançou o índice de pacotes (rede, proxy, VPN, firewall ou PIP_INDEX_URL). Confira a conexão e rode o instalador de novo.'
-    } elseif ($Log -match 'DO NOT MATCH THE HASHES|Hashes are required') {
+    # Hash first: it is the final error, and a retried connection earlier in the same log must not hide it.
+    if ($Log -match 'DO NOT MATCH THE HASHES|Hashes are required') {
         Write-Host "Causa: um arquivo baixado não confere com o sha256 fixado em $File. Não instale por fora: atualize o get-brolls (git pull ou /plugin update) e rode o instalador de novo; se repetir, algo na rede pode estar alterando os downloads."
+    } elseif ($Log -match 'NewConnectionError|Failed to establish a new connection|Max retries exceeded|ConnectTimeout|Read timed out|ProxyError|Temporary failure in name resolution|getaddrinfo failed|SSLError|CERTIFICATE_VERIFY_FAILED|Connection refused|Network is unreachable') {
+        Write-Host 'Causa: o pip não alcançou o índice de pacotes (rede, proxy, VPN, firewall ou PIP_INDEX_URL). Confira a conexão e rode o instalador de novo.'
     } elseif ($Log -match 'No matching distribution|requires a different Python|Could not find a version') {
         Write-Host "Causa provável: seu Python é $PythonVersion; o conjunto fixado foi validado em Python 3.11-3.13. Crie a venv com um interpretador dessa faixa e rode o instalador de novo."
     } else {
