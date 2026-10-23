@@ -10,6 +10,18 @@ tags: [get-brolls]
 
 ## Unreleased
 
+## 2.5.2 — 2026-10-22
+
+### Segurança
+
+- **`doctor` detecta instalação incompleta.** Atualizar o código (`git pull`, `/plugin update`) sem rodar o instalador de novo, ou com um instalador que parou no meio, deixava a `.venv` com as versões antigas — inclusive o certifi que ainda confia na raiz `emSign ECC Root CA - G3` (GHSA-6q48-6c7w-9gw2) — e o `doctor` respondia que estava tudo pronto. Agora ele roda o Python da `.venv` que a CLI usa, compara cada pacote com `requirements.txt` e `requirements-bootstrap.txt` e, se a venv não existe, não roda ou tem versão diferente, põe `venv` em `summary.missing` com o que difere e `summary.do` com o comando do instalador. A saída ganha `venv` (`status`: `ok`, `stale`, `absent`, `broken`, `pinned`; `differences`). Com `GB_YTDLP_PATH` fixado a venv não é usada e não é cobrada.
+- **O que fazer:** rode `python3 scripts/gb.py doctor` (ou `/get-brolls-setup` no plugin). Se aparecer `venv` em `missing`, rode o instalador de novo.
+
+### Correções
+
+- `doctor`: `resolved["yt-dlp"]` passa a ser o yt-dlp que a CLI usa de fato (pino, depois a `.venv`, só então o `PATH`). Antes mostrava o primeiro do `PATH`, mesmo quando a CLI usava o da `.venv`.
+- Instaladores: quando o pip falha, a mensagem diz a causa que o registro do pip mostra — rede/índice inacessível, arquivo que não confere com o sha256 fixado, ou Python sem roda compatível — em vez de sempre sugerir trocar de Python. O registro fica em `.venv/pip-install.log`.
+
 ## 2.5.1 — 2026-10-22
 
 ### Segurança

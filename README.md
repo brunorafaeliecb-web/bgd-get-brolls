@@ -15,7 +15,7 @@
     <img src="https://img.shields.io/badge/Playwright-browser-2EAD33?style=flat-square" alt="Playwright para fontes que pedem navegador">
     <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="Licença MIT">
     <img src="https://img.shields.io/github/actions/workflow/status/engenheirodevideo/get-brolls/test.yml?branch=main&style=flat-square&label=tests" alt="Status dos testes">
-    <img src="https://img.shields.io/badge/version-2.5.1-blue?style=flat-square" alt="Versão 2.5.1">
+    <img src="https://img.shields.io/badge/version-2.5.2-blue?style=flat-square" alt="Versão 2.5.2">
   </p>
 </div>
 
@@ -41,6 +41,7 @@ A prévia pode baixar mídia de trabalho para mostrar o movimento. A entrega fin
 
 ## Atualizações
 
+- **2.5.2** O `doctor` passa a conferir a `.venv` contra as versões fixadas: código atualizado sem rodar o instalador de novo aparece em `summary.missing` (item `venv`). Mensagem do instalador diz se a falha foi rede, hash ou versão do Python.
 - **2.5.1** Segurança: `certifi` 2026.10.19 tira a raiz emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2) e os instaladores instalam o pip 26.2.2 e todas as dependências Python conferindo o sha256 de cada arquivo (`--require-hashes`). Rode o instalador de novo. Dependências atualizadas como um conjunto revisado.
 - **2.5.0** Log por projeto em `brolls/getbrolls.log` (`GB_LOG_LEVEL`, `GB_LOG_STDERR`): comandos, trilha de aprovação, subprocessos e rede, sem nomes, frases de aprovação nem URLs. `reject` zera o `output`, `verify` confere todos os clipes e desmarca o que foi alterado, e `deliver` pula clipe rejeitado ou reprovado e lista em `skipped`. Storyboard local endurecido (só `review.html`, `previews/` e `clips/`, cabeçalhos contra embutir a página). `~/.getbrolls/RULES.md` ilegível passa a parar o comando em vez de ser ignorado.
 - **2.4.3** Portão único de release (`scripts/preflight.sh`), versão escrita numa passada (`scripts/bump_version.py`) e espelho do SKILL.md gerado (`scripts/gen_skill_mirror.py`). `GB_CACHE_DIR` passa a valer no `.env`; `GETBROLLS_CACHE_DIR` continua funcionando. Sem mudança no fluxo de coleta.
