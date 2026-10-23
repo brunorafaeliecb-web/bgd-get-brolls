@@ -18,7 +18,7 @@ A revisão não autentica quem clicou: importação exige atribuição humana co
 
 | Momento | Destinos | O que trafega |
 |---|---|---|
-| Instalação | PyPI (conjunto fixado em `requirements.txt`), registro npm (`package-lock.json`), Chrome/navegador opcional em passo separado | Apenas download das dependências. `npm ci --ignore-scripts` não baixa navegador nem executa scripts de pacote. |
+| Instalação | PyPI (pip em `requirements-bootstrap.txt` e conjunto em `requirements.txt`, fixados por versão e sha256, instalados com `--require-hashes --only-binary :all:`), registro npm (`package-lock.json`), Chrome/navegador opcional em passo separado | Apenas download das dependências. `npm ci --ignore-scripts` não baixa navegador nem executa scripts de pacote. |
 | Execução | CDNs de YouTube, TikTok e Instagram via yt-dlp/curl; APIs de Pexels, Pixabay, Wikimedia Commons e NASA | URL solicitada, termos de busca e, quando existir, a chave do banco escolhido. |
 | Nunca sai | Projetos, originais importados, JSON de revisão, chaves, `.env`, sessões e pares CDN assinados | Permanecem no disco local; nenhuma dessas informações é enviada a terceiros pela skill. |
 

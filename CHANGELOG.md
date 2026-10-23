@@ -2,7 +2,7 @@
 type: documentation
 status: current
 created: 2026-09-15
-updated: 2026-09-19
+updated: 2026-10-22
 tags: [get-brolls]
 ---
 
@@ -10,6 +10,18 @@ tags: [get-brolls]
 
 ## Unreleased
 
+## 2.5.1 — 2026-10-22
+
+### Segurança
+
+- **certifi 2026.7.22 → 2026.10.19.** A versão anterior ainda trazia no pacote de certificados a raiz `emSign ECC Root CA - G3`, descontinuada por chaves fracas: com ela, alguém na mesma rede pode apresentar um certificado falso que o Python aceita. Advisory [GHSA-6q48-6c7w-9gw2](https://github.com/advisories/GHSA-6q48-6c7w-9gw2) / PYSEC-2026-4320.
+- **pip da venv.** O pip que o Python cria na venv carrega o próprio certifi. `scripts/install.sh` e `scripts/install.ps1` passam a instalar primeiro `pip==26.2.2` de `requirements-bootstrap.txt`, com os sha256 que o PyPI publica: mesmo com o certifi antigo, quem estiver no meio da conexão não consegue trocar o pacote. `--check`/`-Check` continuam só conferindo os pré-requisitos.
+- **Instalação com hash.** `requirements.txt` passa a ter o sha256 de todos os arquivos de cada pacote, transitivos incluídos (rodas de Linux, macOS e Windows do Python 3.11 ao 3.14), gerado de `requirements.in` com `uv pip compile --generate-hashes`. Os instaladores usam `--require-hashes --only-binary :all:`: arquivo com hash diferente é recusado e nenhum sdist é construído (o pip não confere o hash das ferramentas de construção). A receita de regeneração está no `CONTRIBUTING.md`.
+- **O que fazer:** rode o instalador de novo (`bash scripts/install.sh` ou `./scripts/install.ps1`). Fora do get-brolls, vale atualizar o pip das outras venvs (`python -m pip install --upgrade pip`) e o uv (`uv self update`, 0.13.4 ou mais nova, GHSA-hq85-5cpj-mr62).
+
+### Também nesta versão
+
+- Dependências, como um conjunto revisado e sem vulnerabilidade conhecida: `yt-dlp` 2026.8.19 → 2026.10.21, `brotli` 1.2.0 → 1.2.1, `charset-normalizer` 3.5.1 → 3.5.2, `pycryptodomex` 3.23.0 → 3.24.1, `websockets` 17.1 → 17.3, `@playwright/cli` 0.1.21 → 0.1.22 (com a referência no `docs/GUIDE.md`) e `actions/setup-node` 7.0.0 → 7.1.0 fixado por SHA. `ruff` fica em 0.16.8: a 0.17 liga uma regra nova e entra na 2.6. Fecha #90 e #91 e substitui os PRs #86, #88 e #89 do Dependabot.
 - Docs: `docs/MANUAL.md`, manual + tutorial em português para quem está chegando — tutorial do zero à `entrega/`, todos os subcomandos agrupados nos 8 passos do fluxo com explicação dentro de cada bloco, as três rotas do `permit`, como ler `summary.line`/`summary.do`/erros/códigos de saída, `BRIEF.md`, `RULES.md` e `.env` campo a campo, e receitas de automação com `jq`. Ligado no README, no README.en e no AGENTS. Fecha #80.
 - READMEs: os diagramas `assets/flow*.svg` e `assets/formats*.svg` passam a mostrar o fluxo atual — brief, análise da fonte, direitos como segundo portão, verificação e `entrega/` por beat — e a árvore de pastas ganha `BRIEF.md`, `entrega/`, `getbrolls.log` e `reviews/`. Eram da 2.3.x e apontavam `clips/` como lugar dos arquivos finais.
 - READMEs: badges de FFmpeg, yt-dlp e Playwright no topo, ao lado de Python e Node, para mostrar o que a instalação coloca na máquina.
